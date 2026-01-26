@@ -2,3 +2,56 @@
 # Data files
 data/*.parquet
 
+# --- Python junk ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.ipynb_checkpoints/
+
+# --- venvs (THIS is your current pain) ---
+.venv/
+venv/
+env/
+
+# --- local IDE/editor ---
+.vscode/
+.idea/
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+
+# --- project outputs (customize names) ---
+runs/
+run/
+outputs/
+output/
+artifacts/
+logs/
+tmp/
+temp/
+data/
+
+
+# If you generate grids / sweeps
+grids/
+grid/
+sweeps/
+sweep/
+
+# Data (if you have it locally)
+data/
+*.parquet
+*.csv
+*.pkl
+*.npz
+
+# Secrets
+.env
+*.key
+*.pem

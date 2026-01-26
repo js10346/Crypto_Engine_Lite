@@ -598,6 +598,94 @@ def _build_performance_stats(df: pd.DataFrame, eq_df: pd.DataFrame) -> Dict[str,
         "total_log_return": float(total_log),
     }
 
+def _build_cashflow_performance_stats(
+    df: pd.DataFrame, eq_df: pd.DataFrame
+) -> Dict[str, Any]:
+    """
+    Cashflow-aware performance stats (spot/DCA).
+
+    Assumes cashflows are applied at the *start* of each bar (bar open),
+    and equity is recorded at bar close.
+
+    We compute a TWR index:
+      ratio_t = equity_t / (equity_{t-1} + cashflow_t)
+      idx_t = idx_{t-1} * ratio_t
+    """
+    if eq_df is None or eq_df.empty or "equity" not in eq_df.columns:
+        return {}
+
+    eq = pd.to_numeric(eq_df["equity"], errors="coerce").fillna(0.0).astype(float)
+    cf = (
+        pd.to_numeric(eq_df.get("cashflow", 0.0), errors="coerce")
+        .fillna(0.0)
+        .astype(float)
+    )
+
+    bar_sec = _infer_bar_seconds(df)
+    if bar_sec is None or bar_sec <= 0:
+        bar_sec = 86_400.0
+
+    bars_per_year = SECONDS_PER_YEAR / float(bar_sec)
+    period_sec = max(1.0, float(bar_sec) * max(1, len(eq) - 1))
+
+    # Build TWR ratios/log returns
+    ratios = np.ones(len(eq), dtype=np.float64)
+    logrets = np.zeros(len(eq), dtype=np.float64)
+    idx = np.ones(len(eq), dtype=np.float64)
+
+    e = eq.to_numpy(dtype=np.float64)
+    c = cf.to_numpy(dtype=np.float64)
+
+    for t in range(1, len(e)):
+        denom = float(e[t - 1] + c[t])
+        if denom <= 1e-12 or (not math.isfinite(denom)):
+            ratios[t] = 1.0
+            logrets[t] = 0.0
+            idx[t] = idx[t - 1]
+            continue
+
+        r = float(e[t] / denom)
+        if (not math.isfinite(r)) or r <= 0:
+            r = 1.0
+        ratios[t] = r
+        logrets[t] = math.log(r)
+        idx[t] = idx[t - 1] * r
+
+    twr_total_log = float(logrets.sum())
+    twr_total_return = float(idx[-1] - 1.0) if len(idx) else 0.0
+    ann_return = float(math.exp(twr_total_log * (SECONDS_PER_YEAR / period_sec)) - 1.0)
+
+    ann_vol = float(np.std(logrets, ddof=0) * math.sqrt(bars_per_year)) if len(logrets) else 0.0
+    downside = np.where(logrets < 0.0, logrets, 0.0)
+    downside_vol = float(np.std(downside, ddof=0) * math.sqrt(bars_per_year)) if len(downside) else 0.0
+
+    sharpe = (ann_return / ann_vol) if ann_vol > 1e-12 else 0.0
+    sortino = (ann_return / downside_vol) if downside_vol > 1e-12 else 0.0
+
+    # Drawdown on TWR index (deposit-neutral) + equity (for reference)
+    mdd_twr = _max_drawdown(pd.Series(idx))
+    mdd_eq = _max_drawdown(eq)
+    calmar = (
+        (ann_return / mdd_twr)
+        if mdd_twr > 1e-12
+        else (float("inf") if ann_return > 0 else 0.0)
+    )
+
+    return {
+        "bar_seconds": float(bar_sec),
+        "bars_per_year": float(bars_per_year),
+        "period_seconds": float(period_sec),
+        "cashflow_total": float(c.sum()) if len(c) else 0.0,
+        "twr_total_return": float(twr_total_return),
+        "max_drawdown": float(mdd_twr),
+        "max_drawdown_equity": float(mdd_eq),
+        "annualized_return": float(ann_return),
+        "annualized_vol": float(ann_vol),
+        "sharpe": float(sharpe),
+        "sortino": float(sortino),
+        "calmar": float(calmar) if math.isfinite(calmar) else float("inf"),
+        "total_log_return": float(twr_total_log),
+    }
 
 def _execution_breakdown(fills_df: pd.DataFrame) -> Dict[str, Any]:
     if fills_df is None or fills_df.empty:
@@ -740,7 +828,301 @@ class BacktestConfig:
     funding_jitter_max_frac: float = 0.10
 
     close_open_at_end: bool = True
+    market_mode: str = "perps" # "perps" (default) or "spot"
 
+class PaperSpotBroker:
+    """
+    Spot broker (long-only, no leverage).
+
+    - cash is quote currency (USD/USDT)
+    - pos_qty is base asset units
+    - equity = cash + pos_qty * mark_price
+    - buys are clamped to available cash (after fees)
+    """
+
+    def __init__(
+        self, starting_cash: float, constraints: EngineConstraints, cfg: BacktestConfig
+    ):
+        self.record_fills = True
+        self.record_equity_curve = True
+        self.cfg = cfg
+        self.constraints = constraints
+
+        self.cash = float(starting_cash)
+        self.pos_qty = 0.0
+        self.avg_entry = 0.0
+
+        self.realized_pnl = 0.0
+
+        self.fees_paid_total = 0.0
+        self.fees_paid_taker = 0.0
+        self.fees_paid_maker = 0.0
+
+        # Perps-compat fields (spot always 0.0)
+        self.funding_net = 0.0
+        self.funding_paid = 0.0
+        self.funding_received = 0.0
+        self.funding_penalty = 0.0
+
+        self.rejected_min_notional = 0
+        self.rejected_qty_step = 0
+        self.price_tick_rounds = 0
+
+        self.fills: List[Dict[str, Any]] = []
+        self.equity_curve: List[Dict[str, Any]] = []
+
+    def set_recording(self, *, record_fills: bool, record_equity_curve: bool) -> None:
+        self.record_fills = bool(record_fills)
+        self.record_equity_curve = bool(record_equity_curve)
+
+    def unrealized_pnl(self, mark_price: float) -> float:
+        if abs(self.pos_qty) < 1e-12:
+            return 0.0
+        return (mark_price - self.avg_entry) * self.pos_qty
+
+    def equity(self, mark_price: float) -> float:
+        return float(self.cash + self.pos_qty * mark_price)
+
+    def _apply_fill(
+        self,
+        dt: str,
+        delta_qty: float,
+        fill_price: float,
+        fee_rate: float,
+        order_type: str,
+        slip_bps: float,
+        spread_bps: float,
+        liq_mult: float,
+    ) -> float:
+        if abs(delta_qty) < 1e-12:
+            return 0.0
+
+        fee = abs(delta_qty) * fill_price * fee_rate
+
+        old_qty = self.pos_qty
+        new_qty = old_qty + delta_qty
+
+        if delta_qty > 0:
+            # BUY: pay notional + fee from cash
+            notional = delta_qty * fill_price
+            self.cash -= (notional + fee)
+
+            # Avg entry update (weighted)
+            if abs(old_qty) < 1e-12:
+                self.avg_entry = fill_price
+            else:
+                total = old_qty + delta_qty
+                if total > 1e-12:
+                    self.avg_entry = (old_qty * self.avg_entry + delta_qty * fill_price) / total
+            self.pos_qty = new_qty
+        else:
+            # SELL: receive notional - fee into cash
+            sell_qty = abs(delta_qty)
+            proceeds = sell_qty * fill_price
+            self.cash += (proceeds - fee)
+
+            # Realized pnl tracking (for reporting)
+            realized = (fill_price - self.avg_entry) * sell_qty
+            self.realized_pnl += realized
+
+            self.pos_qty = new_qty
+            if self.pos_qty <= 1e-12:
+                self.pos_qty = 0.0
+                self.avg_entry = 0.0
+
+        self.fees_paid_total += fee
+        if order_type == "market":
+            self.fees_paid_taker += fee
+        else:
+            self.fees_paid_maker += fee
+
+        side = "buy" if delta_qty > 0 else "sell"
+        if self.record_fills:
+            self.fills.append(
+                {
+                    "dt": str(dt),
+                    "side": side,
+                    "qty": float(delta_qty),
+                    "price": float(fill_price),
+                    "fee": float(fee),
+                    "fee_rate": float(fee_rate),
+                    "order_type": str(order_type),
+                    "slip_bps": float(slip_bps),
+                    "spread_bps": float(spread_bps),
+                    "liq_mult": float(liq_mult),
+                    "pos_qty": float(self.pos_qty),
+                    "avg_entry": float(self.avg_entry),
+                    "realized_pnl": float(self.realized_pnl),
+                    "equity": float(self.equity(fill_price)),
+                    "cash": float(self.cash),
+                }
+            )
+
+        return float(fee)
+
+    def trade_to_target_qty(
+        self,
+        dt: str,
+        target_qty: float,
+        ref_price: float,
+        order_type: OrderType,
+        slip_bps: float,
+        spread_bps: float,
+        liq_mult: float,
+        force_close: bool = False,
+    ) -> ExecutionResult:
+        if ref_price <= 0:
+            return ExecutionResult(attempted=True, filled=False, reject_reason="bad_price")
+
+        # Long-only spot: clamp target >= 0
+        target_qty = max(0.0, float(target_qty))
+
+        delta = (-self.pos_qty) if (force_close and abs(target_qty) < 1e-12) else (
+            target_qty - self.pos_qty
+        )
+        if abs(delta) < 1e-12:
+            return ExecutionResult(attempted=True, filled=False, reject_reason="no_change")
+
+        # Never sell more than position (spot)
+        if delta < 0:
+            delta = max(delta, -self.pos_qty)
+
+        fee_rate = self.cfg.fee_taker if order_type == OrderType.MARKET else self.cfg.fee_maker
+        side_sign = 1 if delta > 0 else -1
+
+        applied_spread_bps = 0.0
+        applied_slip_bps = 0.0
+        price_rounded = False
+
+        if order_type == OrderType.LIMIT:
+            pre = ref_price
+            ticked, price_rounded = round_price_to_tick(
+                pre, self.constraints.price_tick, side_sign
+            )
+            if price_rounded:
+                self.price_tick_rounds += 1
+            fill_price = ticked
+        else:
+            applied_spread_bps = float(spread_bps)
+            applied_slip_bps = float(slip_bps)
+
+            half_spread = 0.5 * bps_to_frac(applied_spread_bps)
+            spread_price = (
+                ref_price * (1.0 + half_spread)
+                if side_sign > 0
+                else ref_price * (1.0 - half_spread)
+            )
+
+            slip = bps_to_frac(applied_slip_bps)
+            pre = (
+                spread_price * (1.0 + slip)
+                if side_sign > 0
+                else spread_price * (1.0 - slip)
+            )
+
+            ticked, price_rounded = round_price_to_tick(
+                pre, self.constraints.price_tick, side_sign
+            )
+            if price_rounded:
+                self.price_tick_rounds += 1
+            fill_price = ticked
+
+        # Clamp buys to available cash (after fees)
+        buy_clamped = False
+        if delta > 0:
+            denom = float(fill_price) * (1.0 + float(fee_rate))
+            if denom > 0:
+                max_buy_qty = float(self.cash) / denom
+                if max_buy_qty < delta:
+                    delta = max_buy_qty
+                    buy_clamped = True
+
+        qty_rounded = False
+        if not (force_close and abs(target_qty) < 1e-12):
+            delta_q, qty_rounded = quantize_delta_to_step(delta, self.constraints.qty_step)
+            if abs(delta_q) < 1e-12:
+                self.rejected_qty_step += 1
+                return ExecutionResult(
+                    attempted=True,
+                    filled=False,
+                    reject_reason="qty_step",
+                    qty_rounded_to_step=qty_rounded,
+                    price_rounded_to_tick=price_rounded,
+                )
+            delta = delta_q
+
+            if abs(delta) * fill_price < self.constraints.min_notional_usdt:
+                self.rejected_min_notional += 1
+                return ExecutionResult(
+                    attempted=True,
+                    filled=False,
+                    reject_reason="min_notional",
+                    qty_rounded_to_step=qty_rounded,
+                    price_rounded_to_tick=price_rounded,
+                )
+
+        # For sells, ensure we still don't exceed pos after rounding.
+        if delta < 0:
+            delta = max(delta, -self.pos_qty)
+
+        # For buys, after rounding, re-check affordability (should be safe due to floor)
+        if delta > 0:
+            denom = float(fill_price) * (1.0 + float(fee_rate))
+            if denom > 0:
+                max_buy_qty = float(self.cash) / denom
+                if delta > max_buy_qty + 1e-12:
+                    delta = max_buy_qty
+                    buy_clamped = True
+
+        fee = self._apply_fill(
+            dt=str(dt),
+            delta_qty=float(delta),
+            fill_price=float(fill_price),
+            fee_rate=float(fee_rate),
+            order_type=str(order_type.value),
+            slip_bps=float(applied_slip_bps),
+            spread_bps=float(applied_spread_bps),
+            liq_mult=float(liq_mult),
+        )
+
+        return ExecutionResult(
+            attempted=True,
+            filled=True,
+            reject_reason=None,
+            leverage_clamped=bool(buy_clamped),
+            qty_rounded_to_step=qty_rounded,
+            price_rounded_to_tick=price_rounded,
+            delta_qty=float(delta),
+            fill_price=float(fill_price),
+            fee_paid=float(fee),
+        )
+
+    def mark(self, dt: str, mark_price: float):
+        if self.record_equity_curve:
+            eq = self.equity(mark_price)
+            self.equity_curve.append(
+                {
+                    "dt": str(dt),
+                    "price": float(mark_price),
+                    "equity": float(eq),
+                    "cashflow": float(getattr(self, "cashflow_this_bar", 0.0) or 0.0),
+                    "cash": float(self.cash),
+                    "pos_qty": float(self.pos_qty),
+                    "avg_entry": float(self.avg_entry),
+                    "realized_pnl_gross": float(self.realized_pnl),
+                    "unrealized_pnl": float(self.unrealized_pnl(mark_price)),
+                    "fees_paid_total": float(self.fees_paid_total),
+                    "fees_paid_taker": float(self.fees_paid_taker),
+                    "fees_paid_maker": float(self.fees_paid_maker),
+                    "funding_net": float(self.funding_net),
+                    "funding_paid": float(self.funding_paid),
+                    "funding_received": float(self.funding_received),
+                    "funding_penalty": float(self.funding_penalty),
+                    "rej_min_notional": int(self.rejected_min_notional),
+                    "rej_qty_step": int(self.rejected_qty_step),
+                    "price_tick_rounds": int(self.price_tick_rounds),
+                }
+            )
 
 # ============================================================
 # Broker (pure accounting + exchange constraints)
@@ -1008,6 +1390,7 @@ class PaperPerpsBroker:
                     "dt": str(dt),
                     "price": float(mark_price),
                     "equity": float(eq),
+                    "cashflow": float(getattr(self, "cashflow_this_bar", 0.0) or 0.0),
                     "cash": float(self.cash),
                     "pos_qty": float(self.pos_qty),
                     "avg_entry": float(self.avg_entry),
@@ -1081,6 +1464,7 @@ def run_backtest_once(
 ) -> Tuple[Dict[str, Any], pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
     rng = random.Random(int(seed))
 
+    is_spot = str(getattr(cfg, "market_mode", "perps")).lower() =="spot"
     # --- PATCH: FEATURE STORE INTEGRATION ---
     # 1. Enrich data with indicators (skip if already done by batch runner)
     if not features_ready:
@@ -1125,14 +1509,14 @@ def run_backtest_once(
     has_mark = all(
         c in df.columns for c in ("mark_open", "mark_high", "mark_low", "mark_close")
     )
-    if not has_mark:
+    if (not is_spot) and (not has_mark):
         warnings.warn(
             "mark_* columns not found; falling back to last OHLC for mark-to-market, "
             "stops, liquidation. This is not perp-realistic."
         )
 
     has_funding = "funding_rate" in df.columns
-    if cfg.use_real_funding and (not has_funding):
+    if (not is_spot) and cfg.use_real_funding and (not has_funding):
         warnings.warn(
             "cfg.use_real_funding=True but funding_rate column not found; falling "
             "back to synthetic funding model."
@@ -1180,11 +1564,18 @@ def run_backtest_once(
             .to_numpy(dtype="datetime64[ns]")
         )
 
-    broker = PaperPerpsBroker(
-        starting_equity=float(starting_equity),
-        constraints=constraints,
-        cfg=cfg,
-    )
+    if is_spot:
+        broker = PaperSpotBroker(
+            starting_cash=float(starting_equity),
+            constraints=constraints,
+            cfg=cfg,
+        )
+    else:
+        broker = PaperPerpsBroker(
+            starting_equity=float(starting_equity),
+            constraints=constraints,
+            cfg=cfg,
+        )
     broker.set_recording(record_fills=record_fills, record_equity_curve=record_equity_curve)
 
     active_plan: Optional[TradePlan] = None
@@ -1220,6 +1611,7 @@ def run_backtest_once(
     tp_limit_misses = 0
 
     liquidated = False
+    cashflow_this_bar = 0.0
 
     def account_state(mark_px: float) -> AccountState:
         return AccountState(
@@ -1231,7 +1623,11 @@ def run_backtest_once(
         )
 
     def position_state(mark_px: float) -> PositionState:
-        liq = liquidation_price(broker.cash, broker.avg_entry, broker.pos_qty, constraints.maint_margin_rate)
+        liq = None
+        if not is_spot:
+            liq = liquidation_price(
+                broker.cash, broker.avg_entry, broker.pos_qty, constraints.maint_margin_rate
+            )
         return PositionState(
             qty=float(broker.pos_qty),
             avg_entry=float(broker.avg_entry),
@@ -1241,6 +1637,8 @@ def run_backtest_once(
 
     def maybe_apply_funding(i: int, mark_price: float):
         nonlocal funding_events_real
+        if is_spot:
+            return
 
         # Prefer real funding if present.
         if cfg.use_real_funding and funding_rate_arr is not None:
@@ -1400,7 +1798,7 @@ def run_backtest_once(
         return 0.0
 
     def apply_plan_at_open(dt: str, o: float, h: float, l: float, vol_bps: float, liq_mult: float) -> ExecutionResult:
-        nonlocal active_plan, active_stop, tps, tps_hit, baseline_qty_abs, pending_bars_left
+        nonlocal active_plan, active_stop, tps, tps_hit, baseline_qty_abs, pending_bars_left, cashflow_this_bar
 
         if pending_update is None:
             return ExecutionResult(attempted=False, filled=False)
@@ -1434,6 +1832,13 @@ def run_backtest_once(
 
             active_plan = upd.plan
             pending_bars_left = active_plan.expires_after_bars
+
+            # Apply external cashflow at bar open (deposit/withdraw), independent of trade fill.
+            cd = float(getattr(active_plan, "cash_delta", 0.0) or 0.0)
+            if abs(cd) > 1e-12:
+                broker.cash += cd
+                nonlocal cashflow_this_bar
+                cashflow_this_bar += cd
 
             active_stop = float(active_plan.stop_price) if active_plan.stop_price is not None else None
             tps = list(active_plan.take_profits or [])
@@ -1588,6 +1993,9 @@ def run_backtest_once(
         liq_mult = float(liq_mult_arr[i])
         v = float(vols[i]) if vols is not None else None
 
+        cashflow_this_bar = 0.0
+        broker.cashflow_this_bar = 0.0
+
         dt_day = dt_dates[i]
         if current_day != dt_day:
             current_day = dt_day
@@ -1624,19 +2032,25 @@ def run_backtest_once(
         if in_trade and trades and trades[-1]["exit_dt"] is None:
             side = 1 if broker.pos_qty > 0 else -1
 
-            liq_px = liquidation_price(
-                broker.cash, broker.avg_entry, broker.pos_qty, constraints.maint_margin_rate
-            )
-            if liq_px is not None:
-                buf = float(cfg.liq_brutal_buffer_frac)
-                if side > 0:
-                    thresh = float(liq_px) * (1.0 + buf)
-                    liq_hit = (mo <= thresh) or (ml <= thresh)
-                    liq_ref = min(mo, thresh)
-                else:
-                    thresh = float(liq_px) * (1.0 - buf)
-                    liq_hit = (mo >= thresh) or (mh >= thresh)
-                    liq_ref = max(mo, thresh)
+            if not is_spot:
+                liq_px = None
+            if not is_spot:
+                liq_px = liquidation_price(
+                    broker.cash,
+                    broker.avg_entry,
+                    broker.pos_qty,
+                    constraints.maint_margin_rate,
+                )
+                if liq_px is not None:
+                    buf = float(cfg.liq_brutal_buffer_frac)
+                    if side > 0:
+                        thresh = float(liq_px) * (1.0 + buf)
+                        liq_hit = (mo <= thresh) or (ml <= thresh)
+                        liq_ref = min(mo, thresh)
+                    else:
+                        thresh = float(liq_px) * (1.0 - buf)
+                        liq_hit = (mo >= thresh) or (mh >= thresh)
+                        liq_ref = max(mo, thresh)
 
                 if liq_hit:
                     liquidated = True
@@ -1807,6 +2221,8 @@ def run_backtest_once(
                         force_close=True,
                     )
                     finalize_trade(exit_dt=dt, reason="kill")
+
+                broker.cashflow_this_bar = float(cashflow_this_bar)
                 broker.mark(dt, mc)
                 break
 
@@ -1842,14 +2258,25 @@ def run_backtest_once(
                 force_close=True,
             )
             finalize_trade(exit_dt=dt, reason="eod")
-
+        
+        broker.cashflow_this_bar = float(cashflow_this_bar)
         broker.mark(dt, mc)
 
         # --- PATCH: FeatureView (no per-bar dict allocation) ---
         feature_view.set_index(i)
 
         ctx = StrategyContext(
-            candle=Candle(dt=dt, open=o, high=h, low=l, close=c, volume=v, vol_bps=vol_bps, liq_mult=liq_mult),
+            candle=Candle(
+                dt=dt,
+                ts=int(ts[i]) if ts is not None else None,
+                open=o,
+                high=h,
+                low=l,
+                close=c,
+                volume=v,
+                vol_bps=vol_bps,
+                liq_mult=liq_mult,
+            ),
             account=account_state(mc),
             position=position_state(mc),
             constraints=constraints,
@@ -1896,13 +2323,37 @@ def run_backtest_once(
     final_eq = (
         float(eq_df["equity"].iloc[-1]) if len(eq_df) else broker.equity(float(mark_closes[-1]))
     )
-    total_return = final_eq / float(starting_equity) - 1.0 if starting_equity > 0 else 0.0
+    end_over_start_return = (
+        final_eq / float(starting_equity) - 1.0 if starting_equity > 0 else 0.0
+    )
+
+    cashflow_total = 0.0
+    if eq_df is not None and not eq_df.empty and "cashflow" in eq_df.columns:
+        cashflow_total = float(
+            pd.to_numeric(eq_df["cashflow"], errors="coerce").fillna(0.0).sum()
+        )
+
+    # Spot/DCA: total_return should be TWR (deposit-neutral) if available.
+    # Perps: keep end/start return semantics.
+    total_return = float(end_over_start_return)
+    if is_spot:
+        try:
+            perf_tmp = _build_cashflow_performance_stats(df, eq_df)
+            if isinstance(perf_tmp, dict) and "twr_total_return" in perf_tmp:
+                total_return = float(perf_tmp.get("twr_total_return", 0.0) or 0.0)
+        except Exception:
+            pass
+
+    net_profit_ex_cashflows = float(final_eq - float(starting_equity) - cashflow_total)
 
     metrics = {
         "equity": {
             "start": float(starting_equity),
             "end": float(final_eq),
             "total_return": float(total_return),
+            "end_over_start_return": float(end_over_start_return),
+            "cashflow_total": float(cashflow_total),
+            "net_profit_ex_cashflows": float(net_profit_ex_cashflows),
         },
         "guardrails": guardrail_stats,
         "execution": exec_stats,
@@ -2060,7 +2511,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     strategy = _import_strategy(args.strategy)
     constraints = _make_constraints()
-    cfg = BacktestConfig()
+    cfg = BacktestConfig(market_mode="spot")
 
     strat_tag = args.strategy.replace(":", "_").replace(".", "_")
     run_name = args.run_name or f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{strat_tag}"
@@ -2094,7 +2545,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         else "n/a"
     )
 
-    perf = _build_performance_stats(df, eq_df)
+    if str(getattr(cfg, "market_mode", "perps")).lower() == "spot":
+        perf = _build_cashflow_performance_stats(df, eq_df)
+    else:
+        perf = _build_performance_stats(df, eq_df)
     tstats = _trade_stats(trades_df)
     exits = _exit_counts(trades_df)
     tp_levels = _tp_level_counts(trades_df)
@@ -2157,10 +2611,22 @@ def main(argv: Optional[List[str]] = None) -> int:
                 if "net_pnl" in trades_df.columns
                 else 0.0
             )
+            cashflow_total = 0.0
+            if "cashflow" in eq_df.columns:
+                cashflow_total = float(
+                    pd.to_numeric(eq_df["cashflow"], errors="coerce").fillna(0.0).sum()
+                )
+
+            is_spot = str(getattr(cfg, "market_mode", "perps")).lower() == "spot"
+            diff = float(eq_delta - trade_sum)
+            if is_spot:
+                diff = float(eq_delta - cashflow_total - trade_sum)
+
             metrics["reconciliation"] = {
                 "equity_delta": float(eq_delta),
                 "sum_trade_net_pnl": float(trade_sum),
-                "diff": float(eq_delta - trade_sum),
+                "cashflow_total": float(cashflow_total),
+                "diff": float(diff),
             }
     except Exception:
         metrics["reconciliation"] = {"error": "failed_to_compute"}
@@ -2216,6 +2682,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         f"Equity:    {eq['start']:.2f} -> {eq['end']:.2f}  "
         f"(return {_format_pct(ret)})"
     )
+    # Spot/DCA: show deposits and net profit excluding deposits for interpretability.
+    if str(getattr(cfg, "market_mode", "perps")).lower() == "spot":
+        cashflow_total = float(eq.get("cashflow_total", 0.0) or 0.0)
+        eos_ret = float(eq.get("end_over_start_return", 0.0) or 0.0)
+        net_ex = float(eq.get("net_profit_ex_cashflows", 0.0) or 0.0)
+        summary_lines.append(
+            f"Deposits:  {_format_money(cashflow_total)}   "
+            f"End/Start: {_format_pct(eos_ret)}   "
+            f"Net(ex dep): {net_ex:+.2f}"
+        )
     summary_lines.append(f"Max DD:    {_format_pct(mdd)}")
     summary_lines.append(
         f"Ann Ret:   {_format_pct(ann_ret)}   Ann Vol: {_format_pct(ann_vol)}"

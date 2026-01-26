@@ -2,9 +2,36 @@
 import numpy as np
 import pandas as pd
 
+MS_1M = 60_000
 
 def _ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
+
+def _infer_bar_ms(df: pd.DataFrame) -> float:
+    if "ts" not in df.columns:
+        return float("nan")
+
+    ts = (
+        pd.to_numeric(df["ts"], errors="coerce")
+        .dropna()
+        .astype(np.int64)
+        .to_numpy()
+    )
+    if len(ts) < 3:
+        return float("nan")
+
+    diffs = np.diff(ts)
+    diffs = diffs[diffs > 0]
+    if len(diffs) == 0:
+        return float("nan")
+
+    return float(np.median(diffs))
+
+def _is_1m_bars(df: pd.DataFrame) -> bool:
+    bar_ms = _infer_bar_ms(df)
+    if not np.isfinite(bar_ms):
+        return False
+    return abs(bar_ms - MS_1M) <= 2_000 #tolerate small gaps/jitter
 
 def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
@@ -190,7 +217,7 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     # then SHIFT by 1 HTF bar and align back to 1m by key lookup.
     #
     # This ensures the 1m bar only sees completed HTF information.
-    if "ts" in df.columns:
+    if "ts" in df.columns and _is_1m_bars(df):
         ts = pd.to_numeric(df["ts"], errors="coerce").astype("Int64")
         if ts.isna().any():
             raise ValueError("ts has NaNs; cannot compute MTF features safely")

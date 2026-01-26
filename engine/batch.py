@@ -29,6 +29,7 @@ from engine.features import add_features
 
 from engine.backtester import (
     BacktestConfig,
+    _build_cashflow_performance_stats,
     _build_performance_stats,
     _efficiency_stats,
     _execution_breakdown,
@@ -483,9 +484,24 @@ def parse_strategy_config(
     if not isinstance(obj, dict):
         raise ConfigError(f"Line {line_no}: config must be an object")
 
+    # Strategy name first (needed to decide parsing mode)
+    strategy_name = obj.get("strategy_name", None)
+    if strategy_name is not None:
+        strategy_name = _as_str(strategy_name, line_no, "strategy_name")
+    else:
+        strategy_name = "universal"
+
+    params = obj.get("params", None)
+    if params is None:
+        params = {}
+    if not isinstance(params, dict):
+        raise ConfigError(f"Line {line_no}: 'params' must be an object if provided")
+
     side = _as_str(_require(obj, "side", line_no), line_no, "side").lower()
     if side not in {"long", "short"}:
         raise ConfigError(f"Line {line_no}: side must be 'long' or 'short'")
+
+    is_dca = str(strategy_name).strip().lower() in {"dca", "dca_swing"}
 
     # Entry logic (backward compatible):
     # - Legacy: "entry_conditions": [...] (AND)
@@ -493,26 +509,26 @@ def parse_strategy_config(
     entry_any: Optional[List[List[EntryCondition]]] = None
     entry_conditions: List[EntryCondition] = []
 
-    if "entry_any" in obj and obj.get("entry_any") is not None:
-        entry_any = _parse_entry_any(obj.get("entry_any"), line_no, "entry_any")
-        # When entry_any is provided, it defines entry logic. Keep legacy list empty.
-        entry_conditions = []
-    else:
-        entry_conditions = _parse_entry_conditions(
-            _require(obj, "entry_conditions", line_no),
-            line_no,
-            "entry_conditions",
-        )
+    if not is_dca:
+        if "entry_any" in obj and obj.get("entry_any") is not None:
+            entry_any = _parse_entry_any(obj.get("entry_any"), line_no, "entry_any")
+            entry_conditions = []
+        else:
+            entry_conditions = _parse_entry_conditions(
+                _require(obj, "entry_conditions", line_no),
+                line_no,
+                "entry_conditions",
+            )
 
     filters = _parse_filter_conditions(obj.get("filters", []), line_no, "filters")
-    risk = _parse_risk(_require(obj, "risk", line_no), line_no)
-    guardrails = _parse_guardrails(obj.get("guardrails", None), line_no)
 
-    strategy_name = obj.get("strategy_name", None)
-    if strategy_name is not None:
-        strategy_name = _as_str(strategy_name, line_no, "strategy_name")
+    # DCA strategies don't need risk/entry parsing, but StrategyConfig requires RiskConfig.
+    if is_dca:
+        risk = RiskConfig()
     else:
-        strategy_name = "universal"
+        risk = _parse_risk(_require(obj, "risk", line_no), line_no)
+
+    guardrails = _parse_guardrails(obj.get("guardrails", None), line_no)
 
     normalized = {
         "strategy_name": strategy_name,
@@ -526,6 +542,7 @@ def parse_strategy_config(
         "filters": [asdict(x) for x in filters],
         "risk": asdict(risk),
         "guardrails": asdict(guardrails) if guardrails is not None else None,
+        "params": params,
     }
     cfg_id = _hash_config(normalized)
 
@@ -537,6 +554,7 @@ def parse_strategy_config(
         filters=filters,
         risk=risk,
         guardrails=guardrails,
+        params=params,
     )
     return cfg_id, cfg, normalized
 
@@ -805,7 +823,7 @@ def _chunked(xs: List[Any], n: int) -> List[List[Any]]:
     return [xs[i : i + n] for i in range(0, len(xs), n)]
 
 
-def _worker_init(df_feat_path: str, template_dotted: str) -> None:
+def _worker_init(df_feat_path: str, template_dotted: str, market_mode: str) -> None:
     """
     Worker initializer (runs once per process).
     Loads df_feat and imports the strategy template class.
@@ -815,7 +833,7 @@ def _worker_init(df_feat_path: str, template_dotted: str) -> None:
     _WORKER_DF_FEAT = pd.read_parquet(df_feat_path)
     _WORKER_TEMPLATE_CLS = _import_symbol(template_dotted)
     _WORKER_CONSTRAINTS = _make_constraints()
-    _WORKER_ENGINE_CFG = BacktestConfig()
+    _WORKER_ENGINE_CFG = BacktestConfig(market_mode=str(market_mode).lower())
 
 
 def _eval_sweep_row(
@@ -841,6 +859,12 @@ def _eval_sweep_row(
     if df_feat is None or template_cls is None or constraints is None or engine_cfg is None:
         raise RuntimeError("Worker context not initialized (df/template/constraints/cfg).")
 
+    is_spot = str(getattr(engine_cfg, "market_mode", "perps")).lower() == "spot"
+
+    # Spot/DCA: we must record equity curve to compute cashflow-aware performance (TWR).
+    rec_eq = True if is_spot else (False if fast_sweep else True)
+    rec_fills = False if fast_sweep else True
+
     strategy = _instantiate_template(template_cls, cfg)
     t1 = time.time()
     metrics, fills_df, eq_df, trades_df, _guard = _run_once(
@@ -852,8 +876,8 @@ def _eval_sweep_row(
         engine_cfg=engine_cfg,
         show_progress=False,
         features_ready=True,
-        record_equity_curve=(False if fast_sweep else True),
-        record_fills=(False if fast_sweep else True),
+        record_equity_curve=rec_eq,
+        record_fills=rec_fills,
     )
     elapsed = time.time() - t1
 
@@ -863,7 +887,10 @@ def _eval_sweep_row(
     dominance = _best_trade_dominance(trades_df)
 
     # These may be empty in fast sweep (no eq_df/fills_df)
-    perf = _build_performance_stats(df_feat, eq_df)
+    if is_spot:
+        perf = _build_cashflow_performance_stats(df_feat, eq_df)
+    else:
+        perf = _build_performance_stats(df_feat, eq_df)
     exits = _exit_counts(trades_df)
     tp_levels = _tp_level_counts(trades_df)
     stop_moves = _stop_move_stats(trades_df)
@@ -894,7 +921,17 @@ def _eval_sweep_row(
             trade_sum = float(
                 pd.to_numeric(trades_df["net_pnl"], errors="coerce").fillna(0.0).sum()
             )
-            recon_diff = float(eq_delta - trade_sum)
+            cashflow_total = 0.0
+            if "cashflow" in eq_df.columns:
+                cashflow_total = float(
+                    pd.to_numeric(eq_df["cashflow"], errors="coerce")
+                    .fillna(0.0)
+                    .sum()
+                )
+            if is_spot:
+                recon_diff = float(eq_delta - cashflow_total - trade_sum)
+            else:
+                recon_diff = float(eq_delta - trade_sum)
     except Exception:
         recon_diff = float("nan")
 
@@ -1018,9 +1055,10 @@ def _save_artifacts_for_config(
     template_cls: Any,
     seed: int,
     starting_equity: float,
+    market_mode: str,
 ) -> None:
     constraints = _make_constraints()
-    engine_cfg = BacktestConfig()
+    engine_cfg = BacktestConfig(market_mode=str(market_mode).lower())
 
     strategy = _instantiate_template(template_cls, cfg_obj["__parsed__"])
 
@@ -1126,6 +1164,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--starting-equity", type=float, default=1000.0)
     ap.add_argument("--vol-window", type=int, default=60)
     ap.add_argument("--out", default="runs", help="Output root folder")
+
+    ap.add_argument(
+        "--market-mode",
+        default="spot",
+        choices=["spot", "perps"],
+        help="Engine market mode (spot for DCA lab, perps for perp strategies).",
+    )
+
     ap.add_argument(
         "--features-ready",
         action="store_true",
@@ -1311,7 +1357,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     _write_jsonl(out_dir / "configs_resolved.jsonl", resolved_rows)
 
     constraints = _make_constraints()
-    engine_cfg = BacktestConfig()
+    engine_cfg = BacktestConfig(market_mode=str(args.market_mode).lower())
 
     supports = _supports_fast_flags()
     if args.fast_sweep and (not supports["record_equity_curve"] or not supports["record_fills"]):
@@ -1340,7 +1386,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         _WORKER_DF_FEAT = df_feat
         _WORKER_TEMPLATE_CLS = template_cls
         _WORKER_CONSTRAINTS = constraints
-        _WORKER_ENGINE_CFG = engine_cfg
+        _WORKER_ENGINE_CFG = BacktestConfig(market_mode=str(args.market_mode).lower())
 
         it: Any = parsed_configs
         if not args.no_progress:
@@ -1398,7 +1444,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         with ProcessPoolExecutor(
             max_workers=jobs,
             initializer=_worker_init,
-            initargs=(str(df_feat_path), str(args.template)),
+            initargs=(str(df_feat_path), str(args.template), str(args.market_mode)),
         ) as ex:
             futs = [
                 ex.submit(
@@ -1440,6 +1486,26 @@ def main(argv: Optional[List[str]] = None) -> int:
     df_sweep = pd.DataFrame(rows_sweep)
     df_pass_sweep = df_sweep[df_sweep["gates.passed"].astype(bool)].copy()
     df_pass_sweep.to_csv(out_dir / "results_passed.csv", index=False)
+
+    # If nothing passed gates, stop gracefully (common for DCA if min-trades defaults are high).
+    if df_pass_sweep.empty:
+        _write_csv(out_dir / "results_full.csv", [])
+        _write_csv(out_dir / "results_full_passed.csv", [])
+        meta = {
+            "data": args.data,
+            "grid": args.grid,
+            "template": args.template,
+            "market_mode": str(args.market_mode),
+            "seed": int(args.seed),
+            "starting_equity": float(args.starting_equity),
+            "configs_total": int(len(parsed_configs)),
+            "errors_total": int(len(errors)),
+            "note": "No configs passed gates. Try --min-trades 0 for DCA sweeps.",
+            "out_dir": str(out_dir),
+        }
+        (out_dir / "batch_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        print(f"\nBatch complete (no passing configs). Output: {out_dir}")
+        return 0
 
     # Choose which configs to rerun fully
     rerun_n = int(max(args.top_k, args.rerun_n))
@@ -1516,7 +1582,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         with ProcessPoolExecutor(
             max_workers=rerun_jobs,
             initializer=_worker_init,
-            initargs=(str(df_feat_path), str(args.template)),
+            initargs=(str(df_feat_path), str(args.template), str(args.market_mode)),
         ) as ex:
             futs2 = [
                 ex.submit(
@@ -1554,6 +1620,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     _write_csv(out_dir / "results_full.csv", rows_full)
     df_full = pd.DataFrame(rows_full)
     df_full_pass = df_full[df_full["gates.passed"].astype(bool)].copy()
+    if df_full.empty or "gates.passed" not in df_full.columns:
+        df_full_pass = pd.DataFrame([])
+    else:
+        df_full_pass = df_full[df_full["gates.passed"].astype(bool)].copy()
     df_full_pass.to_csv(out_dir / "results_full_passed.csv", index=False)
 
     # Final ranking based on full metrics
@@ -1591,6 +1661,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 template_cls=template_cls,
                 seed=int(args.seed),
                 starting_equity=float(args.starting_equity),
+                market_mode=str(args.market_mode),
             )
 
     meta = {
@@ -1602,6 +1673,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "vol_window": int(args.vol_window),
         "feature_compute_sec": float(feat_sec),
         "features_ready": bool(args.features_ready),
+        "market_mode": str(args.market_mode),
         "configs_total": int(len(parsed_configs)),
         "errors_total": int(len(errors)),
         "fast_sweep": bool(args.fast_sweep),

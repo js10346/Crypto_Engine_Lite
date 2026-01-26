@@ -13,11 +13,13 @@ class OrderType(str, Enum):
 
 @dataclass
 class Candle:
+    
     dt: str
     open: float
     high: float
     low: float
     close: float
+    ts: Optional[int] = None # candle open time in ms (if available)
     volume: Optional[float] = None
     vol_bps: float = 0.0
     liq_mult: float = 1.0
@@ -86,6 +88,7 @@ class TradePlan:
     exit_policy: Optional[ExitPolicy] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
     expires_after_bars: Optional[int] = None
+    cash_delta: float = 0.0 # external desposit(+)/withdrawl(-) applied at bar open
 
 
 class PlanAction(str, Enum):
@@ -217,3 +220,6 @@ class StrategyConfig:
     
     risk: RiskConfig = field(default_factory=RiskConfig)
     guardrails: Optional[GuardrailsSpec] = None
+
+    #Artbitrary template-specific parameters (e.g., DCA/Swing lab).
+    params: Dict[str, Any] = field(default_factory=dict)

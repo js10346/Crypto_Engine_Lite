@@ -1,0 +1,345 @@
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+# --- Make repo root importable when running as a script (Windows-friendly) ---
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+# ---------------------------------------------------------------------------
+
+from engine.backtester import (  # noqa: E402
+    BacktestConfig,
+    _build_cashflow_performance_stats,
+    run_backtest_once,
+)
+from engine.batch import (
+    _ensure_vol_bps,
+    _import_symbol,
+    _instantiate_template,
+    _load_ohlcv,
+    _make_constraints,
+    _normalize_columns,
+)  # noqa: E402
+from engine.contracts import StrategyConfig  # noqa: E402
+from engine.features import add_features  # noqa: E402
+
+
+def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    with open(path, "r", encoding="utf-8-sig") as f:
+        for line in f:
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            out.append(json.loads(s))
+    return out
+
+
+def _load_configs(
+    run_dir: Path, config_ids: List[str]
+) -> List[Tuple[str, StrategyConfig, Dict[str, Any]]]:
+    resolved = run_dir / "configs_resolved.jsonl"
+    if not resolved.exists():
+        raise FileNotFoundError(f"Missing: {resolved}")
+
+    want = set(config_ids)
+    rows = _read_jsonl(resolved)
+
+    out: List[Tuple[str, StrategyConfig, Dict[str, Any]]] = []
+    for r in rows:
+        cid = str(r.get("config_id", ""))
+        if cid not in want:
+            continue
+        norm = r.get("normalized")
+        if not isinstance(norm, dict):
+            continue
+
+        cfg = StrategyConfig(
+            strategy_name=str(norm.get("strategy_name", "dca_swing")),
+            side=str(norm.get("side", "long")),
+            params=dict(norm.get("params") or {}),
+        )
+        out.append((cid, cfg, norm))
+
+    id_to = {cid: (cid, cfg, norm) for cid, cfg, norm in out}
+    return [id_to[cid] for cid in config_ids if cid in id_to]
+
+
+def _slice_stats(values: np.ndarray) -> Dict[str, Any]:
+    if values.size == 0:
+        return {"n": 0}
+    v = values[np.isfinite(values)]
+    if v.size == 0:
+        return {"n": 0}
+    return {
+        "n": int(v.size),
+        "p10": float(np.quantile(v, 0.10)),
+        "p50": float(np.quantile(v, 0.50)),
+        "p90": float(np.quantile(v, 0.90)),
+        "mean": float(np.mean(v)),
+        "min": float(np.min(v)),
+        "max": float(np.max(v)),
+    }
+
+def _max_underwater_days(eq: pd.Series) -> float:
+    """
+    Longest consecutive streak where equity is below its prior running peak.
+    Daily bars => days == bars (1 bar = 1 day).
+    """
+    if eq is None or len(eq) == 0:
+        return 0.0
+    e = pd.to_numeric(eq, errors="coerce").fillna(0.0).astype(float).to_numpy()
+    peak = -float("inf")
+    cur = 0
+    best = 0
+    for x in e:
+        if x > peak:
+            peak = x
+        if x < peak - 1e-12:
+            cur += 1
+            if cur > best:
+                best = cur
+        else:
+            cur = 0
+    return float(best)  # 1 bar = 1 day in daily mode
+
+
+def _util_mean(eq_df: pd.DataFrame) -> float:
+    """
+    Mean invested fraction over time:
+      util_t = (pos_qty * price) / equity
+    Clamped to [0,1] per bar; ignores bars with non-positive equity.
+    """
+    if eq_df is None or eq_df.empty:
+        return 0.0
+    if "pos_qty" not in eq_df.columns or "price" not in eq_df.columns or "equity" not in eq_df.columns:
+        return 0.0
+    pos = pd.to_numeric(eq_df["pos_qty"], errors="coerce").fillna(0.0).astype(float)
+    px = pd.to_numeric(eq_df["price"], errors="coerce").fillna(0.0).astype(float)
+    eq = pd.to_numeric(eq_df["equity"], errors="coerce").fillna(0.0).astype(float)
+    invested = (pos.clip(lower=0.0) * px).astype(float)
+    denom = eq.where(eq > 1e-9)
+    util = (invested / denom).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    util = util.clip(lower=0.0, upper=1.0)
+    return float(util.mean()) if len(util) else 0.0
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Rolling-start sensitivity (bar-step starts)")
+    ap.add_argument("--from-run", required=True, help="Batch run folder: runs/batch_...")
+    ap.add_argument(
+        "--template",
+        default="strategies.dca_swing:Strategy",
+        help="Strategy template used in that batch run",
+    )
+    ap.add_argument(
+        "--ids",
+        default=None,
+        help="Optional path to ids file (default: from-run/post/top_ids.txt)",
+    )
+    ap.add_argument("--top-n", type=int, default=50)
+    ap.add_argument("--start-step", type=int, default=30, help="Bars between start points")
+    ap.add_argument("--min-bars", type=int, default=365, help="Min bars per run")
+    ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--starting-equity", type=float, default=1000.0)
+    ap.add_argument("--out", default=None, help="Output folder (default: from-run/rolling_starts)")
+    ap.add_argument("--no-progress", action="store_true")
+    args = ap.parse_args()
+
+    run_dir = Path(args.from_run).resolve()
+    if not run_dir.exists():
+        raise FileNotFoundError(f"from-run not found: {run_dir}")
+
+    ids_path = Path(args.ids).resolve() if args.ids else (run_dir / "post" / "top_ids.txt")
+    if not ids_path.exists():
+        raise FileNotFoundError(f"Missing ids file: {ids_path}")
+
+    config_ids = [
+        x.strip()
+        for x in ids_path.read_text(encoding="utf-8").splitlines()
+        if x.strip()
+    ][: int(args.top_n)]
+    if not config_ids:
+        raise ValueError("No config IDs provided")
+
+    df_feat_path = run_dir / "df_feat.parquet"
+    if df_feat_path.exists():
+        df_feat = pd.read_parquet(df_feat_path)
+    else:
+        # Fallback: rebuild df_feat from batch_meta.json data path
+        meta_path = run_dir / "batch_meta.json"
+        if not meta_path.exists():
+            raise FileNotFoundError(
+                f"Missing df_feat.parquet and batch_meta.json: {df_feat_path} / {meta_path}"
+            )
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        data_path = str(meta.get("data") or "")
+        if not data_path:
+            raise ValueError(
+                "batch_meta.json missing 'data'. Provide a run folder created by engine.batch "
+                "or rerun batch with --jobs > 1 to emit df_feat.parquet."
+            )
+
+        vol_window = int(meta.get("vol_window", 60))
+        features_ready = bool(meta.get("features_ready", False))
+
+        df = _load_ohlcv(data_path)
+        df = _normalize_columns(df)
+        df = _ensure_vol_bps(df, window=vol_window)
+        if "liq_mult" not in df.columns:
+            df["liq_mult"] = 1.0
+        else:
+            df["liq_mult"] = pd.to_numeric(df["liq_mult"], errors="coerce").fillna(1.0)
+
+        df_feat = df if features_ready else add_features(df)
+
+        # Cache for next runs (even if batch was jobs=1)
+        try:
+            df_feat.to_parquet(df_feat_path, index=False)
+        except Exception:
+            pass
+
+    cfgs = _load_configs(run_dir, config_ids)
+
+    template_cls = _import_symbol(str(args.template))
+    constraints = _make_constraints()
+    engine_cfg = BacktestConfig(market_mode="spot")
+
+    out_dir = Path(args.out).resolve() if args.out else (run_dir / "rolling_starts")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    n = int(len(df_feat))
+    step = int(max(1, args.start_step))
+    min_bars = int(max(1, args.min_bars))
+
+    starts = [i for i in range(0, n - min_bars + 1, step)]
+    if not starts:
+        raise ValueError("No start points available; reduce --min-bars or --start-step.")
+
+    # Progress bar (optional)
+    it_cfgs = cfgs
+    if not args.no_progress:
+        try:
+            from tqdm import tqdm
+
+            it_cfgs = tqdm(cfgs, total=len(cfgs), desc="RollingStarts", unit="cfg")
+        except Exception:
+            pass
+
+    details: List[Dict[str, Any]] = []
+    summaries: List[Dict[str, Any]] = []
+
+    for cid, cfg, _norm in it_cfgs:
+        rows_for_cfg: List[Dict[str, Any]] = []
+
+        for s in starts:
+            df_w = df_feat.iloc[s:]
+            if len(df_w) < min_bars:
+                continue
+
+            # IMPORTANT: new strategy instance per window (no state leakage)
+            strategy = _instantiate_template(template_cls, cfg)
+
+            metrics, _fills, eq_df, _trades, _guard = run_backtest_once(
+                df=df_w,
+                strategy=strategy,
+                seed=int(args.seed),
+                starting_equity=float(args.starting_equity),
+                constraints=constraints,
+                cfg=engine_cfg,
+                show_progress=False,
+                features_ready=True,
+                record_fills=False,
+                record_equity_curve=True,
+            )
+
+            eq = metrics.get("equity", {}) if isinstance(metrics, dict) else {}
+            perf = _build_cashflow_performance_stats(df_w, eq_df)
+
+            uw_days = _max_underwater_days(eq_df["equity"]) if (eq_df is not None and "equity" in eq_df.columns) else 0.0
+            util_mean = _util_mean(eq_df)
+
+            row = {
+                "config_id": str(cid),
+                "start_i": int(s),
+                "start_dt": str(df_feat["dt"].iloc[s]) if "dt" in df_feat.columns else "",
+                "bars": int(len(df_w)),
+                "equity.end": float(eq.get("end", np.nan)),
+                "equity.cashflow_total": float(eq.get("cashflow_total", np.nan)),
+                "equity.net_profit_ex_cashflows": float(
+                    eq.get("net_profit_ex_cashflows", np.nan)
+                ),
+                "performance.twr_total_return": float(perf.get("twr_total_return", np.nan)),
+                "performance.annualized_return": float(perf.get("annualized_return", np.nan)),
+                "performance.max_drawdown_equity": float(
+                    perf.get("max_drawdown_equity", np.nan)
+                ),
+                "uw_max_days": float(uw_days),
+                "util_mean": float(util_mean),
+            }
+            rows_for_cfg.append(row)
+            details.append(row)
+
+        df_rows = pd.DataFrame(rows_for_cfg)
+        if df_rows.empty:
+            continue
+
+        prof = pd.to_numeric(
+            df_rows["equity.net_profit_ex_cashflows"], errors="coerce"
+        ).to_numpy(dtype=float)
+        twr = pd.to_numeric(
+            df_rows["performance.twr_total_return"], errors="coerce"
+        ).to_numpy(dtype=float)
+        dd = pd.to_numeric(
+            df_rows["performance.max_drawdown_equity"], errors="coerce"
+        ).to_numpy(dtype=float)
+
+        uw = pd.to_numeric(df_rows["uw_max_days"], errors="coerce").to_numpy(dtype=float)
+        util = pd.to_numeric(df_rows["util_mean"], errors="coerce").to_numpy(dtype=float)
+
+        prof_s = _slice_stats(prof)
+        twr_s = _slice_stats(twr)
+        dd_s = _slice_stats(dd)
+        uw_s = _slice_stats(uw)
+        util_s = _slice_stats(util)
+
+        summaries.append(
+            {
+                "config_id": str(cid),
+                "windows": int(len(df_rows)),
+                "profit_p10": prof_s.get("p10", np.nan),
+                "profit_p50": prof_s.get("p50", np.nan),
+                "profit_p90": prof_s.get("p90", np.nan),
+                "twr_p10": twr_s.get("p10", np.nan),
+                "twr_p50": twr_s.get("p50", np.nan),
+                "twr_p90": twr_s.get("p90", np.nan),
+                "dd_p10": dd_s.get("p10", np.nan),
+                "dd_p50": dd_s.get("p50", np.nan),
+                "dd_p90": dd_s.get("p90", np.nan),
+                "uw_p50_days": uw_s.get("p50", np.nan),
+                "uw_p90_days": uw_s.get("p90", np.nan),
+                "util_p50": util_s.get("p50", np.nan),
+                "util_p90": util_s.get("p90", np.nan),
+                # Simple robustness: median TWR minus penalty for high drawdowns
+                "robustness_score": float(twr_s.get("p50", 0.0))
+                - 0.5 * float(dd_s.get("p90", 0.0)),
+            }
+        )
+
+    pd.DataFrame(details).to_csv(out_dir / "rolling_starts_detail.csv", index=False)
+    pd.DataFrame(summaries).to_csv(out_dir / "rolling_starts_summary.csv", index=False)
+
+    print(f"Wrote: {out_dir / 'rolling_starts_detail.csv'}")
+    print(f"Wrote: {out_dir / 'rolling_starts_summary.csv'}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
