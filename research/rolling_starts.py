@@ -89,6 +89,74 @@ def _slice_stats(values: np.ndarray) -> Dict[str, Any]:
         "max": float(np.max(v)),
     }
 
+def _summarize_from_detail(df_detail: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build rolling-start summary from detail rows (config_id x start).
+    """
+    if df_detail is None or df_detail.empty:
+        return pd.DataFrame([])
+
+    def q(series: pd.Series, p: float) -> float:
+        s = pd.to_numeric(series, errors="coerce").dropna().astype(float)
+        if len(s) == 0:
+            return float("nan")
+        return float(np.quantile(s.to_numpy(dtype=float), p))
+
+    out_rows: List[Dict[str, Any]] = []
+    for cid, g in df_detail.groupby("config_id"):
+        out_rows.append(
+            {
+                "config_id": str(cid),
+                "windows": int(len(g)),
+                "profit_p10": q(g["equity.net_profit_ex_cashflows"], 0.10)
+                if "equity.net_profit_ex_cashflows" in g.columns
+                else float("nan"),
+                "profit_p50": q(g["equity.net_profit_ex_cashflows"], 0.50)
+                if "equity.net_profit_ex_cashflows" in g.columns
+                else float("nan"),
+                "profit_p90": q(g["equity.net_profit_ex_cashflows"], 0.90)
+                if "equity.net_profit_ex_cashflows" in g.columns
+                else float("nan"),
+                "twr_p10": q(g["performance.twr_total_return"], 0.10)
+                if "performance.twr_total_return" in g.columns
+                else float("nan"),
+                "twr_p50": q(g["performance.twr_total_return"], 0.50)
+                if "performance.twr_total_return" in g.columns
+                else float("nan"),
+                "twr_p90": q(g["performance.twr_total_return"], 0.90)
+                if "performance.twr_total_return" in g.columns
+                else float("nan"),
+                "dd_p10": q(g["performance.max_drawdown_equity"], 0.10)
+                if "performance.max_drawdown_equity" in g.columns
+                else float("nan"),
+                "dd_p50": q(g["performance.max_drawdown_equity"], 0.50)
+                if "performance.max_drawdown_equity" in g.columns
+                else float("nan"),
+                "dd_p90": q(g["performance.max_drawdown_equity"], 0.90)
+                if "performance.max_drawdown_equity" in g.columns
+                else float("nan"),
+                "uw_p50_days": q(g["uw_max_days"], 0.50)
+                if "uw_max_days" in g.columns
+                else float("nan"),
+                "uw_p90_days": q(g["uw_max_days"], 0.90)
+                if "uw_max_days" in g.columns
+                else float("nan"),
+                "util_p50": q(g["util_mean"], 0.50) if "util_mean" in g.columns else float("nan"),
+                "util_p90": q(g["util_mean"], 0.90) if "util_mean" in g.columns else float("nan"),
+            }
+        )
+
+    df_sum = pd.DataFrame(out_rows)
+    # Robustness score (keep consistent with your previous definition)
+    if "twr_p50" in df_sum.columns and "dd_p90" in df_sum.columns:
+        df_sum["robustness_score"] = pd.to_numeric(df_sum["twr_p50"], errors="coerce").fillna(
+            0.0
+        ) - 0.5 * pd.to_numeric(df_sum["dd_p90"], errors="coerce").fillna(0.0)
+    else:
+        df_sum["robustness_score"] = 0.0
+
+    return df_sum
+
 def _max_underwater_days(eq: pd.Series) -> float:
     """
     Longest consecutive streak where equity is below its prior running peak.
@@ -215,11 +283,53 @@ def main() -> int:
     out_dir = Path(args.out).resolve() if args.out else (run_dir / "rolling_starts")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    n = int(len(df_feat))
-    step = int(max(1, args.start_step))
+    # Accumulation: load prior results if they exist and parameters match
+    meta_path = out_dir / "rs_meta.json"
+    detail_path = out_dir / "rolling_starts_detail.csv"
+    summary_path = out_dir / "rolling_starts_summary.csv"
+
+    start_step = int(max(1, args.start_step))
     min_bars = int(max(1, args.min_bars))
 
-    starts = [i for i in range(0, n - min_bars + 1, step)]
+    meta_now = {
+        "template": str(args.template),
+        "seed": int(args.seed),
+        "starting_equity": float(args.starting_equity),
+        "start_step": int(start_step),
+        "min_bars": int(min_bars),
+        "note": "rolling-start stats are only comparable when these parameters match",
+    }
+
+    accumulate_ok = True
+    if meta_path.exists():
+        try:
+            meta_prev = json.loads(meta_path.read_text(encoding="utf-8"))
+            # Only allow accumulation if key params match
+            keys = ["template", "seed", "starting_equity", "start_step", "min_bars"]
+            for k in keys:
+                if meta_prev.get(k) != meta_now.get(k):
+                    accumulate_ok = False
+                    break
+        except Exception:
+            accumulate_ok = False
+
+    df_prev_detail = pd.DataFrame([])
+    if accumulate_ok and detail_path.exists():
+        try:
+            df_prev_detail = pd.read_csv(detail_path)
+        except Exception:
+            df_prev_detail = pd.DataFrame([])
+
+    already_done: set[str] = set()
+    if accumulate_ok and (not df_prev_detail.empty) and "config_id" in df_prev_detail.columns:
+        already_done = set(df_prev_detail["config_id"].astype(str).unique().tolist())
+    elif (not accumulate_ok) and (detail_path.exists() or summary_path.exists()):
+        print(
+            "Warning: rolling-start parameters changed; overwriting existing rolling-start outputs."
+        )
+
+    n = int(len(df_feat))
+    starts = [i for i in range(0, n - min_bars + 1, start_step)]
     if not starts:
         raise ValueError("No start points available; reduce --min-bars or --start-step.")
 
@@ -234,9 +344,10 @@ def main() -> int:
             pass
 
     details: List[Dict[str, Any]] = []
-    summaries: List[Dict[str, Any]] = []
 
     for cid, cfg, _norm in it_cfgs:
+        if accumulate_ok and str(cid) in already_done:
+            continue
         rows_for_cfg: List[Dict[str, Any]] = []
 
         for s in starts:
@@ -287,57 +398,31 @@ def main() -> int:
             rows_for_cfg.append(row)
             details.append(row)
 
-        df_rows = pd.DataFrame(rows_for_cfg)
-        if df_rows.empty:
-            continue
+        # No per-config summary here; we recompute summary from accumulated detail at end.
 
-        prof = pd.to_numeric(
-            df_rows["equity.net_profit_ex_cashflows"], errors="coerce"
-        ).to_numpy(dtype=float)
-        twr = pd.to_numeric(
-            df_rows["performance.twr_total_return"], errors="coerce"
-        ).to_numpy(dtype=float)
-        dd = pd.to_numeric(
-            df_rows["performance.max_drawdown_equity"], errors="coerce"
-        ).to_numpy(dtype=float)
+    df_new_detail = pd.DataFrame(details)
 
-        uw = pd.to_numeric(df_rows["uw_max_days"], errors="coerce").to_numpy(dtype=float)
-        util = pd.to_numeric(df_rows["util_mean"], errors="coerce").to_numpy(dtype=float)
+    # Combine with previous detail if accumulating
+    if accumulate_ok and (not df_prev_detail.empty):
+        df_all_detail = pd.concat([df_prev_detail, df_new_detail], ignore_index=True)
+    else:
+        df_all_detail = df_new_detail
 
-        prof_s = _slice_stats(prof)
-        twr_s = _slice_stats(twr)
-        dd_s = _slice_stats(dd)
-        uw_s = _slice_stats(uw)
-        util_s = _slice_stats(util)
+    if not df_all_detail.empty:
+        # Deduplicate on (config_id, start_i)
+        if "config_id" in df_all_detail.columns and "start_i" in df_all_detail.columns:
+            df_all_detail["config_id"] = df_all_detail["config_id"].astype(str)
+            df_all_detail["start_i"] = pd.to_numeric(df_all_detail["start_i"], errors="coerce").fillna(-1).astype(int)
+            df_all_detail = df_all_detail.drop_duplicates(subset=["config_id", "start_i"], keep="last")
 
-        summaries.append(
-            {
-                "config_id": str(cid),
-                "windows": int(len(df_rows)),
-                "profit_p10": prof_s.get("p10", np.nan),
-                "profit_p50": prof_s.get("p50", np.nan),
-                "profit_p90": prof_s.get("p90", np.nan),
-                "twr_p10": twr_s.get("p10", np.nan),
-                "twr_p50": twr_s.get("p50", np.nan),
-                "twr_p90": twr_s.get("p90", np.nan),
-                "dd_p10": dd_s.get("p10", np.nan),
-                "dd_p50": dd_s.get("p50", np.nan),
-                "dd_p90": dd_s.get("p90", np.nan),
-                "uw_p50_days": uw_s.get("p50", np.nan),
-                "uw_p90_days": uw_s.get("p90", np.nan),
-                "util_p50": util_s.get("p50", np.nan),
-                "util_p90": util_s.get("p90", np.nan),
-                # Simple robustness: median TWR minus penalty for high drawdowns
-                "robustness_score": float(twr_s.get("p50", 0.0))
-                - 0.5 * float(dd_s.get("p90", 0.0)),
-            }
-        )
+    df_sum = _summarize_from_detail(df_all_detail) if not df_all_detail.empty else pd.DataFrame([])
 
-    pd.DataFrame(details).to_csv(out_dir / "rolling_starts_detail.csv", index=False)
-    pd.DataFrame(summaries).to_csv(out_dir / "rolling_starts_summary.csv", index=False)
+    df_all_detail.to_csv(detail_path, index=False)
+    df_sum.to_csv(summary_path, index=False)
+    meta_path.write_text(json.dumps(meta_now, indent=2), encoding="utf-8")
 
-    print(f"Wrote: {out_dir / 'rolling_starts_detail.csv'}")
-    print(f"Wrote: {out_dir / 'rolling_starts_summary.csv'}")
+    print(f"Wrote: {detail_path}")
+    print(f"Wrote: {summary_path}")
     return 0
 
 

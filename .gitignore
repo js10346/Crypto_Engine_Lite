@@ -18,6 +18,12 @@ __pycache__/
 venv/
 env/
 
+# UI temp outputs
+.ui_tmp/
+
+# Random text junk
+New Text Document.txt
+
 # --- local IDE/editor ---
 .vscode/
 .idea/

@@ -828,7 +828,7 @@ class BacktestConfig:
     funding_jitter_max_frac: float = 0.10
 
     close_open_at_end: bool = True
-    market_mode: str = "perps" # "perps" (default) or "spot"
+    market_mode: str = "spot"  # "spot" (default) or "perps"
 
 class PaperSpotBroker:
     """
@@ -1464,7 +1464,7 @@ def run_backtest_once(
 ) -> Tuple[Dict[str, Any], pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
     rng = random.Random(int(seed))
 
-    is_spot = str(getattr(cfg, "market_mode", "perps")).lower() =="spot"
+    is_spot = str(getattr(cfg, "market_mode", "spot")).lower() == "spot"
     # --- PATCH: FEATURE STORE INTEGRATION ---
     # 1. Enrich data with indicators (skip if already done by batch runner)
     if not features_ready:
@@ -1837,7 +1837,6 @@ def run_backtest_once(
             cd = float(getattr(active_plan, "cash_delta", 0.0) or 0.0)
             if abs(cd) > 1e-12:
                 broker.cash += cd
-                nonlocal cashflow_this_bar
                 cashflow_this_bar += cd
 
             active_stop = float(active_plan.stop_price) if active_plan.stop_price is not None else None
@@ -2031,7 +2030,9 @@ def run_backtest_once(
         in_trade = abs(broker.pos_qty) >= 1e-12
         if in_trade and trades and trades[-1]["exit_dt"] is None:
             side = 1 if broker.pos_qty > 0 else -1
-
+            
+            liq_hit = False
+            liq_ref = float(mo)
             if not is_spot:
                 liq_px = None
             if not is_spot:

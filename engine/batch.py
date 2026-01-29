@@ -9,6 +9,7 @@ import json
 import math
 import time
 import os
+import re
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -45,6 +46,98 @@ from engine.backtester import (
 
 class ConfigError(Exception):
     pass
+
+# ============================================================
+# Naming helpers (readable IDs)
+# ============================================================
+
+
+def _slug(s: str, *, max_len: int = 140) -> str:
+    """
+    Filesystem-friendly slug. Keeps letters, digits, underscore, dash, dot.
+    """
+    s = str(s or "").strip()
+    if not s:
+        return "run"
+    s = s.replace(" ", "_")
+    s = re.sub(r"[^A-Za-z0-9_\-\.]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    if not s:
+        s = "run"
+    return s[: int(max_len)]
+
+
+def _freq_code(freq: Any) -> str:
+    f = str(freq or "").strip().lower()
+    if f in {"none", "off", "0", ""}:
+        return "0"
+    if f in {"daily", "day", "1d"}:
+        return "D"
+    if f in {"weekly", "week", "7d"}:
+        return "W"
+    if f in {"monthly", "month", "30d"}:
+        return "M"
+    return _slug(f, max_len=8)
+
+
+def _pct100(x: Any) -> str:
+    try:
+        v = float(x)
+        if not math.isfinite(v):
+            return "na"
+        return str(int(round(v * 100)))
+    except Exception:
+        return "na"
+
+
+def _money0(x: Any) -> str:
+    try:
+        v = float(x)
+        if not math.isfinite(v):
+            return "na"
+        return str(int(round(v)))
+    except Exception:
+        return "na"
+
+
+def _dca_label(params: Dict[str, Any]) -> str:
+    dep_f = _freq_code(params.get("deposit_freq", "none"))
+    dep_a = _money0(params.get("deposit_amount_usd", 0.0))
+    buy_f = _freq_code(params.get("buy_freq", "weekly"))
+    buy_a = _money0(params.get("buy_amount_usd", 0.0))
+
+    buy_filter = str(params.get("buy_filter", "none") or "none").strip().lower()
+    if buy_filter == "below_ema":
+        ema_len = int(params.get("ema_len", 200) or 200)
+        filt = f"fEMA{ema_len}"
+    elif buy_filter == "rsi_below":
+        rsi_thr = params.get("rsi_thr", 40.0)
+        filt = f"fRSI{_money0(rsi_thr)}"
+    else:
+        filt = "fNone"
+
+    alloc = f"a{_pct100(params.get('max_alloc_pct', 1.0))}"
+    sl = f"sl{_pct100(params.get('sl_pct', 0.0))}"
+    tp = f"tp{_pct100(params.get('tp_pct', 0.0))}"
+    sell = f"sell{_pct100(params.get('tp_sell_fraction', 1.0))}"
+    res = f"res{_pct100(params.get('reserve_frac_of_proceeds', 0.0))}"
+
+    # Full but still compact.
+    return _slug(
+        f"dep{dep_f}{dep_a}_buy{buy_f}{buy_a}_{filt}_{alloc}_{sl}_{tp}_{sell}_{res}",
+        max_len=180,
+    )
+
+
+def _config_label(cfg: StrategyConfig) -> str:
+    name = str(getattr(cfg, "strategy_name", "strategy") or "strategy").strip().lower()
+    params = dict(getattr(cfg, "params", {}) or {})
+    if name in {"dca", "dca_swing"}:
+        return _dca_label(params)
+    # Fallback: at least readable name + side.
+    side = str(getattr(cfg, "side", "") or "").strip().lower()
+    return _slug(f"{name}_{side}", max_len=80)
+
 
 
 # ============================================================
@@ -941,6 +1034,8 @@ def _eval_sweep_row(
             "line_no": int(line_no),
             "strategy_name": cfg.strategy_name,
             "side": cfg.side,
+            "label": _config_label(cfg),
+            "params": dict(getattr(cfg, "params", {}) or {}),
         },
         "complexity": _complexity_stats(cfg),
         "runtime": {"elapsed_sec": float(elapsed)},
@@ -1164,6 +1259,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--starting-equity", type=float, default=1000.0)
     ap.add_argument("--vol-window", type=int, default=60)
     ap.add_argument("--out", default="runs", help="Output root folder")
+    ap.add_argument(
+        "--run-name",
+        default=None,
+        help="Override run folder name (default: batch_YYYYmmdd_HHMMSS).",
+    )
 
     ap.add_argument(
         "--market-mode",
@@ -1192,7 +1292,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     ap.add_argument(
         "--artifact-progress",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=True,
         help="Show progress while saving top-k artifacts (can be slow).",
     )
@@ -1290,7 +1390,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = ap.parse_args(argv)
 
     run_tag = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    out_dir = (Path(args.out) / f"batch_{run_tag}").resolve()
+    run_name = (
+        _slug(str(args.run_name), max_len=180)
+        if args.run_name
+        else f"batch_{run_tag}"
+    )
+    out_dir = (Path(args.out) / str(run_name)).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Load  enrich once
@@ -1653,7 +1758,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             x = id_to_cfg.get(cfg_id)
             if x is None:
                 continue
-            cfg_folder = top_dir / f"{rank:04d}_{cfg_id}"
+            label = _config_label(x["__parsed__"])
+            cfg_folder = top_dir / f"{rank:04d}_{cfg_id}_{label}"
             _save_artifacts_for_config(
                 out_dir=cfg_folder,
                 cfg_obj=x,

@@ -46,6 +46,7 @@ def evaluate_constraints(
             v2 = get_metric_value(row, c.fallback_metric_id)
             if v2 == v2:
                 v = v2
+                used_fallback = True
                 used_fallback_any = True
                 metric_id_used = c.fallback_metric_id
 
@@ -74,7 +75,7 @@ def evaluate_constraints(
                 op=str(c.op),
                 threshold=float(c.threshold),
                 message=msg,
-                used_fallback=used_fallback,
+                used_fallback=bool(used_fallback),
             )
         )
 

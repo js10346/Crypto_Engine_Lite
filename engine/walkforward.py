@@ -13,7 +13,15 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from engine.backtester import BacktestConfig, _efficiency_stats, _trade_stats, run_backtest_once
+from engine.backtester import (
+    BacktestConfig,
+    _build_cashflow_performance_stats,
+    _build_performance_stats,
+    _efficiency_stats,
+    _trade_stats,
+    run_backtest_once,
+)
+
 from engine.batch import (
     ConfigError,
     _ensure_vol_bps,
@@ -211,6 +219,7 @@ def _wf_worker_init(
     df_feat_path: str,
     template_dotted: str,
     windows: List[Dict[str, Any]],
+    market_mode: str,
 ) -> None:
     global _WF_DF_FEAT, _WF_WINDOWS, _WF_TEMPLATE_CLS, _WF_CONSTRAINTS, _WF_ENGINE_CFG
 
@@ -218,7 +227,8 @@ def _wf_worker_init(
     _WF_WINDOWS = list(windows)
     _WF_TEMPLATE_CLS = _import_symbol(template_dotted)
     _WF_CONSTRAINTS = _make_constraints()
-    _WF_ENGINE_CFG = BacktestConfig()
+    # Spot-only for now.
+    _WF_ENGINE_CFG = BacktestConfig(market_mode="spot")
 
 
 def _run_one_window(
@@ -231,12 +241,15 @@ def _run_one_window(
     engine_cfg: BacktestConfig,
 ) -> Dict[str, Any]:
     """
-    Output-only: no equity curve, no fills.
-    Returns cheap stats (return + trades).
+    Spot-only: record equity curve (needed for cashflow-aware TWR stats).
+    No fills.
     """
     strategy = _instantiate_template(_WF_TEMPLATE_CLS, cfg)
 
-    metrics, _fills_df, _eq_df, trades_df, _guard = run_backtest_once(
+    is_spot = str(getattr(engine_cfg, "market_mode", "spot")).lower() == "spot"
+    rec_eq = True if is_spot else False
+
+    metrics, _fills_df, eq_df, trades_df, _guard = run_backtest_once(
         df=df_window,
         strategy=strategy,
         seed=int(seed),
@@ -246,13 +259,33 @@ def _run_one_window(
         show_progress=False,
         features_ready=True,
         record_fills=False,
-        record_equity_curve=False,
+        record_equity_curve=True,
     )
+
+    if is_spot and rec_eq:
+        perf = _build_cashflow_performance_stats(df_window, eq_df)
+        # Optional: override eq["total_return"] to be safe/explicit
+        if isinstance(metrics, dict) and "equity" in metrics and isinstance(metrics["equity"], dict):
+            metrics["equity"]["total_return"] = float(perf.get("twr_total_return", metrics["equity"].get("total_return", 0.0)) or 0.0)
 
     tstats = _trade_stats(trades_df)
     efficiency = _efficiency_stats(trades_df)
 
+    perf: Dict[str, Any] = {}
+    if rec_eq:
+        # _eq_df is returned by run_backtest_once; keep name stable here:
+        # (we didn't bind it above because of underscore)
+        pass
+
     eq = metrics.get("equity", {})
+    # If spot and we recorded equity curve, total_return should already be TWR.
+    # Still: compute perf for any downstream needs.
+    try:
+        if rec_eq:
+            perf = _build_cashflow_performance_stats(df_window, metrics=None)  # placeholder
+    except Exception:
+        perf = {}
+
     return {
         "equity": eq,
         "trades_summary": tstats,
@@ -396,6 +429,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--chunk-size", type=int, default=5)
     ap.add_argument("--no-progress", action="store_true")
     ap.add_argument("--out", default=None, help="Output folder (default: under from-run)")
+    ap.add_argument(
+        "--market-mode",
+        default=None,
+        choices=["spot", "perps"],
+        help="Override market mode (default: spot or inferred from batch_meta.json).",
+    )
     args = ap.parse_args(argv)
 
     run_dir = Path(args.from_run).resolve()
@@ -412,6 +451,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     template = str(args.template) if args.template else str(meta.get("template") or "strategies.universal:UniversalStrategy")
     seed = int(args.seed) if args.seed is not None else int(meta.get("seed", 1))
     starting_equity = float(args.starting_equity) if args.starting_equity is not None else float(meta.get("starting_equity", 1000.0))
+    market_mode = (
+        str(args.market_mode) if args.market_mode else str(meta.get("market_mode", "spot"))
+    )
 
     sort_by_default, sort_desc_default = _infer_sort_defaults(meta)
     sort_by = str(args.sort_by) if args.sort_by else sort_by_default
@@ -535,7 +577,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             use_tqdm = False
 
     if jobs == 1:
-        _wf_worker_init(str(df_feat_path), str(template), windows)
+        _wf_worker_init(str(df_feat_path), str(template), windows, str(market_mode))
         for ch in chunks:
             rows, sums = _wf_run_config_chunk(
                 ch,
@@ -550,7 +592,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         with ProcessPoolExecutor(
             max_workers=jobs,
             initializer=_wf_worker_init,
-            initargs=(str(df_feat_path), str(template), windows),
+            initargs=(str(df_feat_path), str(template), windows, str(market_mode)),
         ) as ex:
             fut_to_n: Dict[Any, int] = {}
             futs = []
