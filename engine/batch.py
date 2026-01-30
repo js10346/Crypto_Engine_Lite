@@ -47,6 +47,46 @@ from engine.backtester import (
 class ConfigError(Exception):
     pass
 
+
+# ============================================================
+# Progress (optional): JSONL progress events for UI monitoring
+# ============================================================
+
+class ProgressWriter:
+    """Append-only JSONL progress writer (safe no-op if path is None)."""
+
+    def __init__(self, path: Optional[str]):
+        self.enabled = bool(path)
+        self.path: Optional[Path] = Path(path).resolve() if path else None
+        self.t0 = time.time()
+        self._fh = None
+        if self.path:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            # Truncate on start (fresh run)
+            try:
+                self.path.write_text("", encoding="utf-8")
+            except Exception:
+                pass
+            try:
+                self._fh = open(self.path, "a", encoding="utf-8", buffering=1)
+            except Exception:
+                self._fh = None
+                self.enabled = False
+
+    def write(self, obj: Dict[str, Any]) -> None:
+        if not self.enabled or self._fh is None:
+            return
+        payload = dict(obj)
+        t = time.time()
+        payload.setdefault("t", t)
+        payload.setdefault("t_rel", float(t - self.t0))
+        try:
+            self._fh.write(json.dumps(payload) + "\n")
+            self._fh.flush()
+        except Exception:
+            # Never break the run due to progress IO
+            pass
+
 # ============================================================
 # Naming helpers (readable IDs)
 # ============================================================
@@ -983,7 +1023,11 @@ def _eval_sweep_row(
     if is_spot:
         perf = _build_cashflow_performance_stats(df_feat, eq_df)
     else:
-        perf = _build_performance_stats(df_feat, eq_df)
+        perf = (
+        _build_cashflow_performance_stats(df_feat, eq_df)
+        if str(market_mode).lower() == "spot"
+        else _build_performance_stats(df_feat, eq_df)
+    )
     exits = _exit_counts(trades_df)
     tp_levels = _tp_level_counts(trades_df)
     stop_moves = _stop_move_stats(trades_df)
@@ -1170,7 +1214,11 @@ def _save_artifacts_for_config(
         record_fills=True,
     )
 
-    perf = _build_performance_stats(df_feat, eq_df)
+    perf = (
+        _build_cashflow_performance_stats(df_feat, eq_df)
+        if str(market_mode).lower() == "spot"
+        else _build_performance_stats(df_feat, eq_df)
+    )
     tstats = _trade_stats(trades_df)
     exits = _exit_counts(trades_df)
     tp_levels = _tp_level_counts(trades_df)
@@ -1225,6 +1273,8 @@ def _save_artifacts_for_config(
         metrics["reconciliation"] = {"error": "failed_to_compute"}
 
     out_dir.mkdir(parents=True, exist_ok=True)
+
+
     (out_dir / "config.json").write_text(
         json.dumps(cfg_obj["normalized"], indent=2),
         encoding="utf-8",
@@ -1387,6 +1437,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Save full artifacts for top K passing configs (final ranking)",
     )
     ap.add_argument("--no-progress", action="store_true")
+    ap.add_argument("--progress-file", default=None, help="Optional JSONL progress file for UI monitoring.")
+    ap.add_argument("--progress-every", type=int, default=25, help="Emit progress event every N configs (approx).")
     args = ap.parse_args(argv)
 
     run_tag = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
@@ -1397,6 +1449,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     out_dir = (Path(args.out) / str(run_name)).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Progress telemetry (optional): UI can tail this JSONL file
+    progress = ProgressWriter(getattr(args, "progress_file", None))
+    if progress.enabled:
+        progress.write({
+            "stage": "batch",
+            "phase": "init",
+            "done": 0,
+            "total": 0,
+            "out_dir": str(out_dir),
+            "data": str(args.data),
+            "grid": str(args.grid),
+        })
+
 
     # Load  enrich once
     df = _load_ohlcv(args.data)
@@ -1447,6 +1513,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"\nNo configs parsed successfully. Output: {out_dir}")
         if errors:
             print(f"Errors: {len(errors)}  See: {out_dir / 'errors.jsonl'}")
+        progress.write({"stage": "batch", "phase": "done", "done": 0, "total": 0, "out_dir": str(out_dir), "error": "no_configs_parsed"})
         return 1
 
     # Save resolved configs (normalized, stable IDs)
@@ -1484,6 +1551,27 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # Sweep loop
     rows_sweep: List[Dict[str, Any]] = []
+
+    sweep_total = int(len(parsed_configs))
+    sweep_done = 0
+    sweep_pass = 0
+    sweep_fail: Dict[str, int] = {}
+    sweep_metric = str(args.sweep_sort_by)
+    sweep_desc = bool(args.sweep_sort_desc)
+    sweep_best: Optional[float] = None
+    t_sweep0 = time.time()
+    progress.write(
+        {
+            "stage": "batch",
+            "phase": "sweep",
+            "done": 0,
+            "total": sweep_total,
+            "metric": sweep_metric,
+            "sort_desc": sweep_desc,
+            "passed": 0,
+            "failed": 0,
+        }
+    )
 
     if jobs == 1:
         # Reuse the same evaluation logic as workers, but initialize globals in-process.
@@ -1526,6 +1614,44 @@ def main(argv: Optional[List[str]] = None) -> int:
             row["gates.reject_reason"] = str(reason)
 
             rows_sweep.append(row)
+
+            sweep_done += 1
+            if passed:
+                sweep_pass += 1
+            else:
+                k = str(reason)
+                sweep_fail[k] = int(sweep_fail.get(k, 0)) + 1
+
+            # Track best-so-far on sweep metric (among passing configs when possible)
+            try:
+                v = float(row.get(sweep_metric, float("nan")))
+                if math.isfinite(v):
+                    if sweep_best is None:
+                        sweep_best = v
+                    else:
+                        if sweep_desc and v > float(sweep_best):
+                            sweep_best = v
+                        if (not sweep_desc) and v < float(sweep_best):
+                            sweep_best = v
+            except Exception:
+                pass
+
+            pe = int(getattr(args, "progress_every", 25) or 25)
+            if progress.enabled and (sweep_done % pe == 0 or sweep_done >= sweep_total):
+                fail_top = sorted(sweep_fail.items(), key=lambda kv: kv[1], reverse=True)[:6]
+                progress.write(
+                    {
+                        "stage": "batch",
+                        "phase": "sweep",
+                        "done": int(sweep_done),
+                        "total": int(sweep_total),
+                        "rate": float(sweep_done / max(1e-9, (time.time() - t_sweep0))),
+                        "passed": int(sweep_pass),
+                        "failed": int(sweep_done - sweep_pass),
+                        "best": ({"metric": sweep_metric, "value": float(sweep_best)} if sweep_best is not None else None),
+                        "fail_top": fail_top,
+                    }
+                )
     else:
         # Parallel sweep (Windows spawn-safe): workers load df_feat from parquet.
         chunk_size = int(args.chunk_size) if int(args.chunk_size) > 0 else 20
@@ -1579,6 +1705,44 @@ def main(argv: Optional[List[str]] = None) -> int:
                     row["gates.reject_reason"] = str(reason)
                     rows_sweep.append(row)
 
+            sweep_done += 1
+            if passed:
+                sweep_pass += 1
+            else:
+                k = str(reason)
+                sweep_fail[k] = int(sweep_fail.get(k, 0)) + 1
+
+            # Track best-so-far on sweep metric (among passing configs when possible)
+            try:
+                v = float(row.get(sweep_metric, float("nan")))
+                if math.isfinite(v):
+                    if sweep_best is None:
+                        sweep_best = v
+                    else:
+                        if sweep_desc and v > float(sweep_best):
+                            sweep_best = v
+                        if (not sweep_desc) and v < float(sweep_best):
+                            sweep_best = v
+            except Exception:
+                pass
+
+            pe = int(getattr(args, "progress_every", 25) or 25)
+            if progress.enabled and (sweep_done % pe == 0 or sweep_done >= sweep_total):
+                fail_top = sorted(sweep_fail.items(), key=lambda kv: kv[1], reverse=True)[:6]
+                progress.write(
+                    {
+                        "stage": "batch",
+                        "phase": "sweep",
+                        "done": int(sweep_done),
+                        "total": int(sweep_total),
+                        "rate": float(sweep_done / max(1e-9, (time.time() - t_sweep0))),
+                        "passed": int(sweep_pass),
+                        "failed": int(sweep_done - sweep_pass),
+                        "best": ({"metric": sweep_metric, "value": float(sweep_best)} if sweep_best is not None else None),
+                        "fail_top": fail_top,
+                    }
+                )
+
                 if use_tqdm and pbar is not None:
                     pbar.update(len(rows))
 
@@ -1609,6 +1773,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "out_dir": str(out_dir),
         }
         (out_dir / "batch_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        progress.write({"stage": "batch", "phase": "done", "done": int(sweep_done), "total": int(sweep_total), "out_dir": str(out_dir)})
         print(f"\nBatch complete (no passing configs). Output: {out_dir}")
         return 0
 
@@ -1628,6 +1793,26 @@ def main(argv: Optional[List[str]] = None) -> int:
     candidates = [id_to_cfg[cid] for cid in candidate_ids if cid in id_to_cfg]
 
     # Full rerun for candidates (for correct final sorting, plus artifacts)
+    rerun_total = int(len(candidates))
+    rerun_done = 0
+    rerun_pass = 0
+    rerun_fail: Dict[str, int] = {}
+    rerun_metric = str(args.sort_by)
+    rerun_desc = bool(args.sort_desc)
+    rerun_best: Optional[float] = None
+    t_rerun0 = time.time()
+    progress.write(
+        {
+            "stage": "batch",
+            "phase": "rerun",
+            "done": 0,
+            "total": rerun_total,
+            "metric": rerun_metric,
+            "sort_desc": rerun_desc,
+            "passed": 0,
+            "failed": 0,
+        }
+    )
     rows_full: List[Dict[str, Any]] = []
     if len(candidates) == 0:
         rows_full = []
@@ -1663,6 +1848,43 @@ def main(argv: Optional[List[str]] = None) -> int:
             row["gates.passed"] = bool(passed)
             row["gates.reject_reason"] = str(reason)
             rows_full.append(row)
+
+            rerun_done += 1
+            if passed:
+                rerun_pass += 1
+            else:
+                k = str(reason)
+                rerun_fail[k] = int(rerun_fail.get(k, 0)) + 1
+
+            try:
+                v = float(row.get(rerun_metric, float("nan")))
+                if math.isfinite(v):
+                    if rerun_best is None:
+                        rerun_best = v
+                    else:
+                        if rerun_desc and v > float(rerun_best):
+                            rerun_best = v
+                        if (not rerun_desc) and v < float(rerun_best):
+                            rerun_best = v
+            except Exception:
+                pass
+
+            pe = int(getattr(args, "progress_every", 25) or 25)
+            if progress.enabled and (rerun_done % pe == 0 or rerun_done >= rerun_total):
+                fail_top = sorted(rerun_fail.items(), key=lambda kv: kv[1], reverse=True)[:6]
+                progress.write(
+                    {
+                        "stage": "batch",
+                        "phase": "rerun",
+                        "done": int(rerun_done),
+                        "total": int(rerun_total),
+                        "rate": float(rerun_done / max(1e-9, (time.time() - t_rerun0))),
+                        "passed": int(rerun_pass),
+                        "failed": int(rerun_done - rerun_pass),
+                        "best": ({"metric": rerun_metric, "value": float(rerun_best)} if rerun_best is not None else None),
+                        "fail_top": fail_top,
+                    }
+                )
     else:
         # Parallel full rerun: ensure df_feat_path exists for workers
         if not df_feat_path.exists():
@@ -1716,6 +1938,43 @@ def main(argv: Optional[List[str]] = None) -> int:
                     row["gates.reject_reason"] = str(reason)
                     rows_full.append(row)
 
+            rerun_done += 1
+            if passed:
+                rerun_pass += 1
+            else:
+                k = str(reason)
+                rerun_fail[k] = int(rerun_fail.get(k, 0)) + 1
+
+            try:
+                v = float(row.get(rerun_metric, float("nan")))
+                if math.isfinite(v):
+                    if rerun_best is None:
+                        rerun_best = v
+                    else:
+                        if rerun_desc and v > float(rerun_best):
+                            rerun_best = v
+                        if (not rerun_desc) and v < float(rerun_best):
+                            rerun_best = v
+            except Exception:
+                pass
+
+            pe = int(getattr(args, "progress_every", 25) or 25)
+            if progress.enabled and (rerun_done % pe == 0 or rerun_done >= rerun_total):
+                fail_top = sorted(rerun_fail.items(), key=lambda kv: kv[1], reverse=True)[:6]
+                progress.write(
+                    {
+                        "stage": "batch",
+                        "phase": "rerun",
+                        "done": int(rerun_done),
+                        "total": int(rerun_total),
+                        "rate": float(rerun_done / max(1e-9, (time.time() - t_rerun0))),
+                        "passed": int(rerun_pass),
+                        "failed": int(rerun_done - rerun_pass),
+                        "best": ({"metric": rerun_metric, "value": float(rerun_best)} if rerun_best is not None else None),
+                        "fail_top": fail_top,
+                    }
+                )
+
                 if use_tqdm and pbar is not None:
                     pbar.update(len(rows))
 
@@ -1754,6 +2013,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             except Exception:
                 pass
 
+
+        art_total = int(len(top_ids))
+        art_done = 0
+        t_art0 = time.time()
+        progress.write({"stage": "batch", "phase": "artifacts", "done": 0, "total": art_total})
+
         for rank, cfg_id in it3:
             x = id_to_cfg.get(cfg_id)
             if x is None:
@@ -1768,6 +2033,20 @@ def main(argv: Optional[List[str]] = None) -> int:
                 seed=int(args.seed),
                 starting_equity=float(args.starting_equity),
                 market_mode=str(args.market_mode),
+                )
+
+            art_done += 1
+            if progress.enabled:
+                progress.write(
+                    {
+                        "stage": "batch",
+                        "phase": "artifacts",
+                        "done": int(art_done),
+                        "total": int(art_total),
+                        "rate": float(art_done / max(1e-9, (time.time() - t_art0))),
+                        "config_id": str(cfg_id),
+                    }
+
             )
 
     meta = {
@@ -1819,6 +2098,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         json.dumps(meta, indent=2),
         encoding="utf-8",
     )
+
+    progress.write({"stage": "batch", "phase": "done", "done": int(rerun_total), "total": int(rerun_total), "out_dir": str(out_dir)})
 
     print(f"\nBatch complete. Output: {out_dir}")
     print(f"Configs: {meta['configs_total']}  Errors: {meta['errors_total']}")

@@ -46,6 +46,44 @@ _WF_CONSTRAINTS: Optional[EngineConstraints] = None
 _WF_ENGINE_CFG: Optional[BacktestConfig] = None
 
 
+
+# ============================================================
+# Progress (optional): JSONL progress events for UI monitoring
+# ============================================================
+
+class ProgressWriter:
+    """Append-only JSONL progress writer (safe no-op if path is None)."""
+
+    def __init__(self, path: Optional[str]):
+        self.enabled = bool(path)
+        self.path: Optional[Path] = Path(path).resolve() if path else None
+        self.t0 = time.time()
+        self._fh = None
+        if self.path:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                self.path.write_text("", encoding="utf-8")
+            except Exception:
+                pass
+            try:
+                self._fh = open(self.path, "a", encoding="utf-8", buffering=1)
+            except Exception:
+                self._fh = None
+                self.enabled = False
+
+    def write(self, obj: Dict[str, Any]) -> None:
+        if not self.enabled or self._fh is None:
+            return
+        payload = dict(obj)
+        t = time.time()
+        payload.setdefault("t", t)
+        payload.setdefault("t_rel", float(t - self.t0))
+        try:
+            self._fh.write(json.dumps(payload) + "\n")
+            self._fh.flush()
+        except Exception:
+            pass
+
 # ============================================================
 # Small helpers
 # ============================================================
@@ -428,6 +466,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--jobs", type=int, default=10)
     ap.add_argument("--chunk-size", type=int, default=5)
     ap.add_argument("--no-progress", action="store_true")
+    ap.add_argument("--progress-file", default=None, help="Optional JSONL progress file for UI monitoring.")
+    ap.add_argument("--progress-every", type=int, default=10, help="Emit progress every N configs (approx).")
     ap.add_argument("--out", default=None, help="Output folder (default: under from-run)")
     ap.add_argument(
         "--market-mode",
@@ -463,6 +503,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     tag = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     out_dir = Path(args.out).resolve() if args.out else (run_dir / f"walkforward_{tag}")
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    progress = ProgressWriter(args.progress_file)
+    progress.write({"stage": "walkforward", "phase": "init", "done": 0, "total": 0, "out_dir": str(out_dir)})
+
 
     # Load df_feat (reuse cached parquet if possible)
     df_feat_path = run_dir / "df_feat.parquet"
@@ -562,6 +606,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     jobs = int(max(1, args.jobs))
     t_run0 = time.time()
 
+    wf_total = int(len(tasks))
+    wf_done = 0
+    wf_last_emit = 0
+    wf_best_median: Optional[float] = None
+    wf_best_pct: Optional[float] = None
+    t_prog0 = time.time()
+    progress.write(
+        {
+            "stage": "walkforward",
+            "phase": "run",
+            "done": 0,
+            "total": wf_total,
+            "windows": int(len(windows)),
+            "rows_total": int(wf_total * len(windows)),
+        }
+    )
+
+
     wf_rows: List[Dict[str, Any]] = []
     wf_summaries: List[Dict[str, Any]] = []
 
@@ -586,6 +648,41 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
             wf_rows.extend(rows)
             wf_summaries.extend(sums)
+            wf_done += int(len(ch))
+            for srow in sums:
+                try:
+                    mv = float(srow.get("median_window_return", float("nan")))
+                    if math.isfinite(mv):
+                        wf_best_median = mv if wf_best_median is None else max(float(wf_best_median), mv)
+                except Exception:
+                    pass
+                try:
+                    pv = float(srow.get("pct_profitable_windows", float("nan")))
+                    if math.isfinite(pv):
+                        wf_best_pct = pv if wf_best_pct is None else max(float(wf_best_pct), pv)
+                except Exception:
+                    pass
+
+            pe = int(getattr(args, "progress_every", 10) or 10)
+            if progress.enabled and ((wf_done - wf_last_emit) >= pe or wf_done >= wf_total):
+                wf_last_emit = int(wf_done)
+                progress.write(
+                    {
+                        "stage": "walkforward",
+                        "phase": "run",
+                        "done": int(wf_done),
+                        "total": int(wf_total),
+                        "rate": float(wf_done / max(1e-9, (time.time() - t_prog0))),
+                        "windows": int(len(windows)),
+                        "rows_done": int(wf_done * len(windows)),
+                        "rows_total": int(wf_total * len(windows)),
+                        "best": {
+                            "median_window_return": float(wf_best_median) if wf_best_median is not None else None,
+                            "pct_profitable_windows": float(wf_best_pct) if wf_best_pct is not None else None,
+                        },
+                    }
+                )
+
             if use_tqdm and pbar is not None:
                 pbar.update(len(ch))
     else:
@@ -609,9 +706,45 @@ def main(argv: Optional[List[str]] = None) -> int:
                 rows, sums = fut.result()
                 wf_rows.extend(rows)
                 wf_summaries.extend(sums)
-                if use_tqdm and pbar is not None:
 
-                    pbar.update(fut_to_n.get(fut, 1))
+                n_done = int(fut_to_n.get(fut, 1))
+                wf_done += n_done
+                for srow in sums:
+                    try:
+                        mv = float(srow.get("median_window_return", float("nan")))
+                        if math.isfinite(mv):
+                            wf_best_median = mv if wf_best_median is None else max(float(wf_best_median), mv)
+                    except Exception:
+                        pass
+                    try:
+                        pv = float(srow.get("pct_profitable_windows", float("nan")))
+                        if math.isfinite(pv):
+                            wf_best_pct = pv if wf_best_pct is None else max(float(wf_best_pct), pv)
+                    except Exception:
+                        pass
+
+                pe = int(getattr(args, "progress_every", 10) or 10)
+                if progress.enabled and ((wf_done - wf_last_emit) >= pe or wf_done >= wf_total):
+                    wf_last_emit = int(wf_done)
+                    progress.write(
+                        {
+                            "stage": "walkforward",
+                            "phase": "run",
+                            "done": int(wf_done),
+                            "total": int(wf_total),
+                            "rate": float(wf_done / max(1e-9, (time.time() - t_prog0))),
+                            "windows": int(len(windows)),
+                            "rows_done": int(wf_done * len(windows)),
+                            "rows_total": int(wf_total * len(windows)),
+                            "best": {
+                                "median_window_return": float(wf_best_median) if wf_best_median is not None else None,
+                                "pct_profitable_windows": float(wf_best_pct) if wf_best_pct is not None else None,
+                            },
+                        }
+                    )
+
+                if use_tqdm and pbar is not None:
+                    pbar.update(n_done)
 
     if use_tqdm and pbar is not None:
         pbar.close()
@@ -625,6 +758,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     wf_rows_df.to_csv(out_dir / "wf_results.csv", index=False)
     wf_sum_df.to_csv(out_dir / "wf_summary.csv", index=False)
 
+    progress.write({"stage": "walkforward", "phase": "done", "done": int(wf_done), "total": int(wf_total), "out_dir": str(out_dir)})
     print(f"\nWalk-forward complete. Output: {out_dir}")
     print(f"Configs: {len(tasks)}   Windows: {len(windows)}")
     print(f"Rows:    {len(wf_rows_df)} (config x window)")

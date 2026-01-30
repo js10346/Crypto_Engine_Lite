@@ -7,6 +7,9 @@ import re
 import subprocess
 import sys
 import time
+import threading
+import queue
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -109,12 +112,14 @@ def _metric_fmt(metric_id: str, x: Any) -> str:
 
 
 def _read_json(path: Path) -> Dict[str, Any]:
+    path = Path(path)
+    if not path.exists():
+        return {}
     try:
         obj = json.loads(path.read_text(encoding="utf-8"))
         return obj if isinstance(obj, dict) else {}
     except Exception:
         return {}
-
 
 @st.cache_data(show_spinner=False)
 def _read_csv_cached(path: str, mtime: float) -> pd.DataFrame:
@@ -130,6 +135,84 @@ def _load_csv(path: Path) -> Optional[pd.DataFrame]:
     except Exception:
         return None
 
+
+def _infer_bar_ms_from_csv(path: Path) -> Optional[int]:
+    """Infer median bar size in milliseconds from the first ~5000 rows of a CSV.
+
+    Tries 'ts' (ms epoch) first; falls back to parsing 'dt'/'date' as datetimes.
+    Returns None if it can't infer a stable interval.
+    """
+    try:
+        if not path.exists():
+            return None
+        sample = pd.read_csv(path, nrows=5000)
+        if sample is None or len(sample) < 3:
+            return None
+
+        cols = {c.lower(): c for c in sample.columns}
+
+        if "ts" in cols:
+            ts = pd.to_numeric(sample[cols["ts"]], errors="coerce").dropna().astype("int64")
+            if len(ts) < 3:
+                return None
+            diffs = ts.diff().dropna()
+            med = float(diffs.median())
+            if med <= 0:
+                return None
+            return int(med)
+
+        for key in ["dt", "date", "datetime", "time", "timestamp"]:
+            if key in cols:
+                dt = pd.to_datetime(sample[cols[key]], errors="coerce", utc=True)
+                dt = dt.dropna()
+                if len(dt) < 3:
+                    continue
+                diffs = dt.diff().dropna().dt.total_seconds() * 1000.0
+                med = float(diffs.median())
+                if med <= 0:
+                    continue
+                return int(med)
+
+        return None
+    except Exception:
+        return None
+
+
+def _bars_per_day_from_run_meta(run_dir: Path) -> int:
+    """Estimate bars/day based on the run's batch_meta.json and dataset."""
+    try:
+        meta = _read_json(run_dir / "batch_meta.json")
+        data = meta.get("data") if isinstance(meta, dict) else None
+        if not data:
+            return 1
+        bar_ms = _infer_bar_ms_from_csv(Path(str(data)))
+        if not bar_ms or bar_ms <= 0:
+            return 1
+        bpd = int(round(86_400_000 / float(bar_ms)))
+        return int(max(1, min(86_400, bpd)))
+    except Exception:
+        return 1
+
+
+def _human_bar_interval_from_run(run_dir: Path) -> str:
+    try:
+        meta = _read_json(run_dir / "batch_meta.json")
+        data = meta.get("data") if isinstance(meta, dict) else None
+        if not data:
+            return "unknown"
+        bar_ms = _infer_bar_ms_from_csv(Path(str(data)))
+        if not bar_ms:
+            return "unknown"
+        sec = bar_ms / 1000.0
+        if sec >= 86_400:
+            return f"~{sec/86_400:.1f} days/bar"
+        if sec >= 3600:
+            return f"~{sec/3600:.1f} hours/bar"
+        if sec >= 60:
+            return f"~{sec/60:.1f} minutes/bar"
+        return f"~{sec:.0f} seconds/bar"
+    except Exception:
+        return "unknown"
 
 @st.cache_data(show_spinner=False)
 def _read_jsonl_cached(path: str, mtime: float) -> List[Dict[str, Any]]:
@@ -153,10 +236,178 @@ def _load_jsonl(path: Path) -> List[Dict[str, Any]]:
     return _read_jsonl_cached(str(path), path.stat().st_mtime)
 
 
-def _run_cmd(cmd: List[str], *, cwd: Path, label: str) -> None:
+def _tail_jsonl(path: Path, *, max_lines: int = 400) -> List[Dict[str, Any]]:
+    """Read the last N JSONL rows (best-effort)."""
+    if not path or (not path.exists()):
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        lines = lines[-int(max_lines) :]
+        out: List[Dict[str, Any]] = []
+        for s in lines:
+            s = s.strip()
+            if not s:
+                continue
+            try:
+                obj = json.loads(s)
+                if isinstance(obj, dict):
+                    out.append(obj)
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return []
+
+
+def _render_run_monitor(progress_path: Optional[Path]) -> None:
+    """Render live telemetry from a progress.jsonl file.
+
+    Supports both:
+      - ISO8601 timestamps (string) in key `t`
+      - Unix epoch seconds (float/int) in key `t`
     """
-    Run a command and stream stdout/stderr into the UI.
-    """
+    if progress_path is None or (not progress_path.exists()):
+        st.info("Run monitor will appear here once progress telemetry is available.")
+        return
+
+    ev = _tail_jsonl(progress_path, max_lines=800)
+    if not ev:
+        st.info("Waiting for telemetry…")
+        return
+
+    df = pd.DataFrame(ev)
+
+    # Build a safe time index for charts
+    t_index = None
+    if "t" in df.columns:
+        if pd.api.types.is_numeric_dtype(df["t"]):
+            df["_t_dt"] = pd.to_datetime(df["t"], unit="s", errors="coerce", utc=True)
+        else:
+            df["_t_dt"] = pd.to_datetime(df["t"], errors="coerce", utc=True)
+        if df["_t_dt"].notna().any():
+            t_index = "_t_dt"
+
+    last = ev[-1]
+    done = last.get("done") or last.get("done_windows") or 0
+    total = last.get("total") or last.get("windows_total") or 0
+    rate = last.get("rate")
+
+    # Derived metrics
+    elapsed = None
+    if "t_rel" in last and isinstance(last.get("t_rel"), (int, float)):
+        elapsed = float(last["t_rel"])
+    elif t_index:
+        try:
+            elapsed = float((df[t_index].max() - df[t_index].min()).total_seconds())
+        except Exception:
+            elapsed = None
+
+    eta = None
+    try:
+        if isinstance(rate, (int, float)) and float(rate) > 1e-9 and float(total) > 0:
+            eta = max(0.0, (float(total) - float(done)) / float(rate))
+    except Exception:
+        eta = None
+
+    # Header metrics
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1:
+        st.metric("Stage", str(last.get("stage", "")))
+        phase = str(last.get("phase", "")) if last.get("phase") is not None else ""
+        if phase:
+            st.caption(phase)
+    with c2:
+        try:
+            st.metric("Progress", f"{int(done)}/{int(total)}")
+        except Exception:
+            st.metric("Progress", f"{done}/{total}")
+    with c3:
+        st.metric("Throughput", f"{float(rate):.2f}/s" if isinstance(rate, (int, float)) else "")
+        if elapsed is not None:
+            st.caption(f"elapsed: {elapsed:.1f}s")
+    with c4:
+        if eta is not None:
+            st.metric("ETA", f"{eta/60.0:.1f}m" if eta >= 90 else f"{eta:.0f}s")
+        else:
+            st.metric("ETA", "")
+    with c5:
+        if last.get("best") is not None:
+            b = last.get("best")
+            try:
+                st.metric("Best so far", f"{float(b):.4g}")
+            except Exception:
+                st.metric("Best so far", str(b))
+        elif last.get("survivors") is not None:
+            st.metric("Survivors", str(last.get("survivors")))
+        else:
+            msg = (
+                last.get("message")
+                or last.get("msg")
+                or last.get("status")
+                or last.get("config_id")
+                or ""
+            )
+            st.metric("Message", str(msg)[:32])
+
+    # Progress bar
+    try:
+        d = float(done)
+        t = float(total)
+        if t > 0:
+            st.progress(min(1.0, max(0.0, d / t)))
+    except Exception:
+        pass
+
+    # Mini charts
+    if t_index and t_index in df.columns:
+        dfc = df.copy()
+        dfc = dfc[dfc[t_index].notna()]
+        if not dfc.empty:
+            dfc = dfc.set_index(t_index)
+
+            left, right = st.columns(2)
+            with left:
+                if "rate" in dfc.columns:
+                    st.line_chart(dfc["rate"], height=140)
+            with right:
+                if "best" in dfc.columns:
+                    st.line_chart(dfc["best"], height=140)
+
+    # Gate reject breakdown (batch usually)
+    fails = last.get("fails")
+    if isinstance(fails, dict) and fails:
+        st.caption("Gate rejects (so far)")
+        s = pd.Series({str(k): int(v) for k, v in fails.items()}).sort_values(ascending=False)
+        st.bar_chart(s, height=160)
+
+    top = last.get("top")
+    if isinstance(top, list) and top:
+        st.caption("Top so far")
+        for i, item in enumerate(top[:5], start=1):
+            try:
+                cid, sc = item[0], float(item[1])
+                st.write(f"{i}. {cid} — {sc:.4g}")
+            except Exception:
+                st.write(f"{i}. {item}")
+
+    # Recent messages (optional)
+    if "message" in df.columns:
+        msgs = [m for m in df["message"].dropna().astype(str).tolist() if m.strip()]
+        msgs = msgs[-5:]
+        if msgs:
+            st.caption("Recent")
+            for m in reversed(msgs):
+                st.write(f"• {m}")
+
+def _run_cmd(
+    cmd: List[str],
+    *,
+    cwd: Path,
+    label: str,
+    progress_path: Optional[Path] = None,
+    refresh_hz: float = 4.0,
+) -> None:
+    """Run a command and stream output + telemetry into the UI."""
     if not cmd:
         raise ValueError("Empty command")
 
@@ -166,23 +417,85 @@ def _run_cmd(cmd: List[str], *, cwd: Path, label: str) -> None:
 
     with st.expander(label, expanded=True):
         st.code(" ".join(cmd), language="bash")
+
+        mon_ph = st.empty()
+        log_ph = st.empty()
+
+        # Spawn process
         t0 = time.time()
-        p = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True)
+        p = subprocess.Popen(
+            cmd,
+            cwd=str(cwd),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+        q: "queue.Queue[str]" = queue.Queue()
+        def _reader():
+            try:
+                assert p.stdout is not None
+                for line in p.stdout:
+                    q.put(line)
+            except Exception:
+                pass
+
+        th = threading.Thread(target=_reader, daemon=True)
+        th.start()
+
+        lines = deque(maxlen=240)
+        sleep_s = max(0.05, 1.0 / float(max(1.0, refresh_hz)))
+
+        while p.poll() is None:
+            # Drain output queue
+            for _ in range(200):
+                try:
+                    lines.append(q.get_nowait())
+                except Exception:
+                    break
+
+            with mon_ph.container():
+                _render_run_monitor(progress_path)
+
+            if lines:
+                log_ph.code("".join(list(lines)[-120:]), language="text")
+
+            time.sleep(sleep_s)
+
+        # Final drain
+        for _ in range(2000):
+            try:
+                lines.append(q.get_nowait())
+            except Exception:
+                break
+
         dt = time.time() - t0
+        if lines:
+            log_ph.code("".join(lines), language="text")
 
-        if p.stdout:
-            st.code(p.stdout, language="text")
-        if p.stderr:
-            st.code(p.stderr, language="text")
-
-        if p.returncode != 0:
-            raise RuntimeError(f"Command failed (code={p.returncode}) after {dt:.1f}s")
+        rc = int(p.returncode or 0)
+        if rc != 0:
+            raise RuntimeError(f"Command failed (code={rc}) after {dt:.1f}s")
 
 
 def _list_runs() -> List[Path]:
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     xs = [p for p in RUNS_DIR.glob("batch_*") if p.is_dir()]
     return sorted(xs, key=lambda p: p.stat().st_mtime, reverse=True)
+
+def _has_any_results(run_dir: Path) -> bool:
+    """True if the run folder contains any batch result CSV."""
+    for fn in (
+        "results_full_passed.csv",
+        "results_passed.csv",
+        "results_full.csv",
+        "results.csv",
+    ):
+        if (run_dir / fn).exists():
+            return True
+    return False
+
 
 
 def _pick_latest_dir(base: Path, glob_pat: str) -> Optional[Path]:
@@ -783,6 +1096,57 @@ def _write_baseline_json(tmp_dir: Path, *, strategy_name: str, side: str, params
     return p
 
 
+def _read_json(path: Path) -> Dict[str, Any]:
+    path = Path(path)
+    if not path.exists():
+        return {}
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+def _write_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False, sort_keys=True, separators=(',', ':')))
+            f.write('\n')
+
+def _baseline_row_from_base_json(base_path: Path) -> Dict[str, Any]:
+    base = _read_json(base_path)
+    if 'params' not in base or not isinstance(base['params'], dict):
+        raise ValueError("Baseline JSON must contain a 'params' object")
+    row = {
+        'strategy_name': base.get('strategy_name', 'dca_swing'),
+        'side': base.get('side', 'long'),
+        'params': dict(base['params']),
+    }
+    # Tag so the UI can identify the baseline row in batch outputs
+    row['params']['__baseline__'] = True
+    return row
+
+def _ensure_grid_has_baseline(grid_path: Path, base_path: Path, *, total_n: int) -> None:
+    """Prepend baseline row to an existing grid JSONL (deduping any existing baseline row)."""
+    baseline_row = _baseline_row_from_base_json(base_path)
+    rows: List[Dict[str, Any]] = []
+    if grid_path.exists():
+        rows = [r for r in _load_jsonl(grid_path) if isinstance(r, dict)]
+    # Drop any existing baseline row(s) to avoid duplicates
+    cleaned: List[Dict[str, Any]] = []
+    for r in rows:
+        try:
+            if isinstance(r.get('params'), dict) and r['params'].get('__baseline__'):
+                continue
+        except Exception:
+            pass
+        cleaned.append(r)
+    out = [baseline_row, *cleaned]
+    if int(total_n) > 0:
+        out = out[: int(total_n)]
+    _write_jsonl(grid_path, out)
+
+
 # =============================================================================
 # UI: left rail (runs + mode)
 # =============================================================================
@@ -791,16 +1155,28 @@ with st.sidebar:
     st.header("Runs")
     runs = _list_runs()
     run_names = [p.name for p in runs]
-    default_idx = 0
+    run_dirs = {p.name: p for p in runs}
+    run_is_complete = {name: _has_any_results(run_dirs[name]) for name in run_names}
 
-    # Persist selection across reruns
+    # Persist selection across reruns (prefer the latest complete run)
     if "selected_run" not in st.session_state:
-        st.session_state["selected_run"] = run_names[0] if run_names else ""
+        picked = ""
+        for nm in run_names:
+            if run_is_complete.get(nm):
+                picked = nm
+                break
+        st.session_state["selected_run"] = picked or (run_names[0] if run_names else "")
+
+    # Programmatic selection handoff (must happen BEFORE the widget is created)
+    nxt = st.session_state.pop("ui.open_run_next", None)
+    if nxt and nxt in run_names:
+        st.session_state["selected_run"] = nxt
 
     open_existing = st.selectbox(
         "Open existing run",
         options=["(new run)"] + run_names,
         index=(1 + run_names.index(st.session_state["selected_run"]) if st.session_state["selected_run"] in run_names else 0),
+        format_func=lambda nm: (nm if nm == "(new run)" else (nm + ("  (incomplete)" if not run_is_complete.get(nm, False) else ""))),
         key="ui.open_run",
     )
 
@@ -1006,7 +1382,7 @@ if open_existing == "(new run)":
                     "--out",
                     str(tmp_grid),
                     "--n",
-                    str(max(25, min(200, n))),
+                    str(max(0, max(25, min(200, n)) - 1)),
                     "--seed",
                     str(seed),
                 ]
@@ -1016,17 +1392,16 @@ if open_existing == "(new run)":
                         "neighborhood",
                         "--base",
                         str(base_path),
-                        "--include-base",
-                        "true",
                         "--width",
                         str(width),
                         "--vary",
                         ",".join(vary),
                     ]
                 else:
-                    grid_cmd += ["--mode", "random", "--include-base", "true"]
+                    grid_cmd += ["--mode", "random"]
 
                 _run_cmd(grid_cmd, cwd=REPO_ROOT, label="Generate preview grid")
+                _ensure_grid_has_baseline(tmp_grid, base_path, total_n=max(25, min(200, n)))
                 rows = _load_jsonl(tmp_grid)[:25]
                 st.json(rows[:5])
                 st.caption(f"Preview grid rows: {len(rows)} (showing first 5)")
@@ -1118,7 +1493,7 @@ if open_existing == "(new run)":
                     "--out",
                     str(grid_path),
                     "--n",
-                    str(int(st.session_state["new.grid_n"])),
+                    str(max(0, int(st.session_state["new.grid_n"]) - 1)),
                     "--seed",
                     str(int(st.session_state["new.grid_seed"])),
                 ]
@@ -1128,17 +1503,16 @@ if open_existing == "(new run)":
                         "neighborhood",
                         "--base",
                         str(base_path),
-                        "--include-base",
-                        "true",
                         "--width",
                         str(st.session_state.get("new.grid_width", "medium")),
                         "--vary",
                         ",".join(st.session_state.get("new.grid_vary", ["deposits","buys"])),
                     ]
                 else:
-                    grid_cmd += ["--mode", "random", "--include-base", "true"]
+                    grid_cmd += ["--mode", "random"]
 
                 _run_cmd(grid_cmd, cwd=REPO_ROOT, label="1) Generate variants grid")
+                _ensure_grid_has_baseline(grid_path, base_path, total_n=int(st.session_state["new.grid_n"]))
 
                 # 3) Batch
                 batch_cmd: List[str] = [
@@ -1179,7 +1553,15 @@ if open_existing == "(new run)":
                     "--starting-equity",
                     str(starting_equity),
                 ]
-                _run_cmd(batch_cmd, cwd=REPO_ROOT, label="2) Batch sweep + rerun")
+                batch_progress = RUNS_DIR / str(run_name) / "progress" / "batch.jsonl"
+                batch_progress.parent.mkdir(parents=True, exist_ok=True)
+                batch_cmd += ["--no-progress", "--progress-file", str(batch_progress), "--progress-every", "25"]
+                _run_cmd(
+                    batch_cmd,
+                    cwd=REPO_ROOT,
+                    label="2) Batch sweep + rerun",
+                    progress_path=batch_progress,
+                )
 
                 run_dir = RUNS_DIR / str(run_name)
                 if not run_dir.exists():
@@ -1207,7 +1589,7 @@ if open_existing == "(new run)":
 
                 # Switch to opening this run
                 st.session_state["selected_run"] = run_dir.name
-                st.session_state["ui.open_run"] = run_dir.name  # best effort
+                st.session_state["ui.open_run_next"] = run_dir.name  # set on next rerun before widget instantiates
 
                 # Reset wizard
                 st.session_state["new.step"] = 0
@@ -1235,7 +1617,10 @@ if not run_dir.exists():
     st.stop()
 
 st.subheader(f"Run: {selected_run_name}")
-meta = _read_json(run_dir / "batch_meta.json")
+meta_path = run_dir / "batch_meta.json"
+meta = _read_json(meta_path)
+if not meta and not meta_path.exists():
+    st.warning("This run is missing batch_meta.json (likely an interrupted run). You can still view any results that were written.")
 if meta:
     st.caption(f"Data: {meta.get('data','?')}  |  Grid: {meta.get('grid','?')}  |  Template: {meta.get('template','?')}")
 
@@ -1369,6 +1754,7 @@ elif stage_pick == "rs":
 
         start_step = int(st.number_input("Start step (bars)", 1, 365, int(start_step), 5, key="rs.start_step"))
         min_bars = int(st.number_input("Min bars per start", 30, 5000, int(min_bars), 30, key="rs.min_bars"))
+        min_bars_effective = int(min_bars)  # placeholder for future clamping logic
 
     # Compute survivor ids (we stress test every survivor in full_passed if available, else sweep_passed)
     survivors_ids = survivors["config_id"].astype(str).tolist()
@@ -1404,13 +1790,16 @@ elif stage_pick == "rs":
                 "--start-step",
                 str(start_step),
                 "--min-bars",
-                str(min_bars),
+                str(min_bars_effective),
                 "--seed",
                 "1",
                 "--starting-equity",
                 str(float(meta.get("starting_equity", 1000.0) or 1000.0)),
             ]
-            _run_cmd(cmd, cwd=REPO_ROOT, label="Rolling Starts")
+            rs_progress = rs_out_dir / "progress" / "rolling_starts.jsonl"
+            rs_progress.parent.mkdir(parents=True, exist_ok=True)
+            cmd += ["--no-progress", "--progress-file", str(rs_progress), "--progress-every", "25"]
+            _run_cmd(cmd, cwd=REPO_ROOT, label="Rolling Starts", progress_path=rs_progress)
             st.success("Rolling Starts complete.")
             st.rerun()
         except Exception as e:
@@ -1520,81 +1909,124 @@ elif stage_pick == "wf":
 
     with right:
         st.write("**Quick presets**")
+    
+        bars_per_day = _bars_per_day_from_run_meta(run_dir)
+        bar_hint = _human_bar_interval_from_run(run_dir)
+        st.caption(f"Detected timeframe: {bar_hint} (≈ {bars_per_day} bars/day)")
+    
         preset = st.selectbox("Preset", options=["Quick", "Standard", "Thorough"], index=0, key="wf.preset")
-        if preset == "Quick":
-            window_days = 30
-            step_days = 30
-            min_bars = 365
-        elif preset == "Standard":
-            window_days = 60
-            step_days = 30
-            min_bars = 365
-        else:
-            window_days = 90
-            step_days = 15
-            min_bars = 365
-
-        window_days = int(st.number_input("Window days", 7, 365, int(window_days), 5, key="wf.window_days"))
-        step_days = int(st.number_input("Step days", 1, 365, int(step_days), 5, key="wf.step_days"))
-        min_bars = int(st.number_input("Min bars", 30, 10_000, int(min_bars), 30, key="wf.min_bars"))
-        jobs = int(st.number_input("Jobs", 1, 64, 8, 1, key="wf.jobs"))
-
-    survivors_ids = survivors["config_id"].astype(str).tolist()
-    N = len(survivors_ids)
-
-    # WF output dir
-    wf_out_dir = wf_root / f"wf_win{window_days}_step{step_days}_min{min_bars}_n{N}"
-    st.caption(f"Will run on survivors: {N} configs → output: {wf_out_dir}")
-
-    if st.button("Run Walkforward for all survivors", type="primary", disabled=(N == 0)):
-        try:
-            cmd = [
-                PY,
-                "-m",
-                "engine.walkforward",
-                "--from-run",
-                str(run_dir),
-                "--top-n",
-                str(N),
-                "--window-days",
-                str(window_days),
-                "--step-days",
-                str(step_days),
-                "--min-bars",
-                str(min_bars),
-                "--jobs",
-                str(jobs),
-                "--out",
-                str(wf_out_dir),
-                "--sort-by",
-                "gates.passed",  # stable, non-NaN, includes everyone selected by top-n
-                "--sort-desc",
-            ]
-            _run_cmd(cmd, cwd=REPO_ROOT, label="Walkforward")
-            st.success("Walkforward complete.")
-            st.rerun()
-        except Exception as e:
-            st.error(str(e))
-            st.stop()
-
+    
+        # Apply defaults only when preset changes (so number inputs don't reset constantly).
+        prev = st.session_state.get("wf.preset_prev")
+        if prev != preset:
+            if bars_per_day <= 2:
+                # Daily-ish: longer windows make sense
+                if preset == "Quick":
+                    w_default, s_default, cov = 180, 30, 0.90
+                elif preset == "Standard":
+                    w_default, s_default, cov = 365, 30, 0.90
+                else:
+                    w_default, s_default, cov = 730, 30, 0.90
+            else:
+                # Intraday: shorter calendar windows still contain many bars
+                if preset == "Quick":
+                    w_default, s_default, cov = 30, 7, 0.95
+                elif preset == "Standard":
+                    w_default, s_default, cov = 60, 7, 0.95
+                else:
+                    w_default, s_default, cov = 90, 3, 0.95
+    
+            expected = int(max(1, round(w_default * bars_per_day)))
+            mb_default = int(max(1, math.ceil(expected * cov)))
+    
+            st.session_state["wf.window_days"] = int(w_default)
+            st.session_state["wf.step_days"] = int(s_default)
+            st.session_state["wf.min_bars"] = int(mb_default)
+            st.session_state["wf.jobs"] = int(st.session_state.get("wf.jobs", 8))
+            st.session_state["wf.preset_prev"] = preset
+    
+        window_days = int(st.number_input("Window days", 7, 3650, int(st.session_state.get("wf.window_days", 365)), 5, key="wf.window_days"))
+        step_days = int(st.number_input("Step days", 1, 3650, int(st.session_state.get("wf.step_days", 30)), 5, key="wf.step_days"))
+    
+        expected_window_bars = int(max(1, round(window_days * bars_per_day)))
+        st.caption(f"Expected bars per window: ~{expected_window_bars:,}. (Min bars must be ≤ this.)")
+    
+        max_mb = int(max(1, expected_window_bars))
+        min_bars = int(st.number_input(
+            "Min bars per window",
+            1,
+            max_mb,
+            int(min(st.session_state.get("wf.min_bars", max_mb), max_mb)),
+            1,
+            key="wf.min_bars",
+        ))
+        jobs = int(st.number_input("Jobs", 1, 64, int(st.session_state.get("wf.jobs", 8)), 1, key="wf.jobs"))
+    
+        survivors_ids = survivors["config_id"].astype(str).tolist()
+        N = len(survivors_ids)
+    
+        # Clamp min_bars to something feasible for the chosen window
+        expected_window_bars = int(max(1, round(window_days * bars_per_day))) if 'bars_per_day' in locals() else int(window_days)
+        min_bars_effective = int(min(int(min_bars), int(expected_window_bars)))
+        if int(min_bars) != int(min_bars_effective):
+            st.warning(f"Min bars ({min_bars}) exceeds expected bars/window (~{expected_window_bars}). Will clamp to {min_bars_effective}.")
+    
+        # WF output dir
+        wf_out_dir = wf_root / f"wf_win{window_days}_step{step_days}_min{min_bars_effective}_n{N}"
+        st.caption(f"Will run on survivors: {N} configs → output: {wf_out_dir}")
+    
+        if st.button("Run Walkforward for all survivors", type="primary", disabled=(N == 0)):
+            try:
+                cmd = [
+                    PY,
+                    "-m",
+                    "engine.walkforward",
+                    "--from-run",
+                    str(run_dir),
+                    "--top-n",
+                    str(N),
+                    "--window-days",
+                    str(window_days),
+                    "--step-days",
+                    str(step_days),
+                    "--min-bars",
+                    str(min_bars_effective),
+                    "--jobs",
+                    str(jobs),
+                    "--out",
+                    str(wf_out_dir),
+                    "--sort-by",
+                    "gates.passed",  # stable, non-NaN, includes everyone selected by top-n
+                    "--sort-desc",
+                ]
+                wf_progress = wf_out_dir / "progress" / "walkforward.jsonl"
+                wf_progress.parent.mkdir(parents=True, exist_ok=True)
+                cmd += ["--no-progress", "--progress-file", str(wf_progress), "--progress-every", "25"]
+                _run_cmd(cmd, cwd=REPO_ROOT, label="Walkforward", progress_path=wf_progress)
+                st.success("Walkforward complete.")
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
+                st.stop()
+    
     wf_dir_effective = wf_dir or wf_out_dir
     wf_sum = load_wf_summary(wf_dir_effective)
     wf_rows = load_wf_results(wf_dir_effective)
-
+    
     if wf_sum is None or wf_sum.empty:
         st.info("No walkforward stats found yet for the chosen output folder.")
         st.stop()
-
+    
     base = merge_stage(survivors.copy(), wf_sum, on="config_id", suffix="wf")
-
+    
     cov = int(base["wf.measured"].sum()) if "wf.measured" in base.columns else 0
     st.success(f"Coverage: {cov}/{len(base)} configs have walkforward stats in this folder.")
-
+    
     with st.expander("Walkforward questions (filters)", expanded=True):
         wf_ans = _question_ui(walkforward_questions(), key_prefix="q.wf")
-
+    
     dfC = apply_stage_eval(base, stage_key="wfq", questions=walkforward_questions(), answers=wf_ans)
-
+    
     # Filters
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -1603,7 +2035,7 @@ elif stage_pick == "wf":
         show_warn = st.checkbox("Show WARN", value=True, key="f.wf.warn")
     with col3:
         show_fail = st.checkbox("Show FAIL", value=False, key="f.wf.fail")
-
+    
     keep = []
     if show_pass:
         keep.append("PASS")
@@ -1612,7 +2044,7 @@ elif stage_pick == "wf":
     if show_fail:
         keep.append("FAIL")
     df_show = dfC[dfC["wfq.verdict"].isin(keep)].copy()
-
+    
     cols = [
         "config_id",
         "config.label",
@@ -1628,13 +2060,13 @@ elif stage_pick == "wf":
     if "wf.measured" in df_show.columns:
         cols.insert(2, "wf.measured")
     st.dataframe(df_show[cols], use_container_width=True, height=520)
-
+    
     st.download_button(
         "Download walkforward view (CSV)",
         data=df_show.to_csv(index=False).encode("utf-8"),
         file_name=f"{selected_run_name}_walkforward_view.csv",
     )
-
+    
 # =============================================================================
 # Stage D: Grand verdict + deep dive
 # =============================================================================
@@ -1774,11 +2206,19 @@ else:
         with st.expander("Config (normalized)", expanded=False):
             st.json(cfg_norm)
 
-    # Show artifacts if present
+    # --- Replay artifacts (top-k OR on-demand cache) ---
     art_dir = top_map.get(str(pick))
+    if not (art_dir and art_dir.exists()):
+        cache_dir = run_dir / "replay_cache" / str(pick)
+        if cache_dir.exists():
+            art_dir = cache_dir
+
     if art_dir and art_dir.exists():
         eq_path = art_dir / "equity_curve.csv"
         cfg_path = art_dir / "config.json"
+        met_path = art_dir / "metrics.json"
+        tr_path = art_dir / "trades.csv"
+        fi_path = art_dir / "fills.csv"
         if cfg_path.exists():
             with st.expander("Config (artifact config.json)", expanded=False):
                 st.json(_read_json(cfg_path))
@@ -1796,8 +2236,26 @@ else:
                     data=eq_path.read_bytes(),
                     file_name=f"{pick}_equity_curve.csv",
                 )
+        cdl1, cdl2, cdl3 = st.columns(3)
+        with cdl1:
+            if met_path.exists():
+                st.download_button("Download metrics.json", data=met_path.read_bytes(), file_name=f"{pick}_metrics.json")
+        with cdl2:
+            if tr_path.exists():
+                st.download_button("Download trades.csv", data=tr_path.read_bytes(), file_name=f"{pick}_trades.csv")
+        with cdl3:
+            if fi_path.exists():
+                st.download_button("Download fills.csv", data=fi_path.read_bytes(), file_name=f"{pick}_fills.csv")
     else:
-        st.info("No saved artifacts for this config (not in top-k). Increase top_k or add on-demand artifact generation.")
+        st.info("No saved artifacts for this config yet. Generate a replay to inspect it.")
+        replay_script = REPO_ROOT / "tools" / "generate_replay_artifacts.py"
+        if replay_script.exists():
+            if st.button("Generate replay artifacts", key="replay.gen"):
+                cmd = [PY, str(replay_script), "--from-run", str(run_dir), "--config-id", str(pick)]
+                _run_cmd(cmd, cwd=REPO_ROOT, label="Replay: generate artifacts")
+                st.rerun()
+        else:
+            st.warning("Missing tools/generate_replay_artifacts.py (add it to enable replay generation).")
 
     # Rolling detail plot
     if rs_dir_effective and (rs_dir_effective / "rolling_starts_detail.csv").exists():

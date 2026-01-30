@@ -32,6 +32,44 @@ from engine.contracts import StrategyConfig  # noqa: E402
 from engine.features import add_features  # noqa: E402
 
 
+# ============================================================
+# Progress (optional): JSONL progress events for UI monitoring
+# ============================================================
+
+class ProgressWriter:
+    """Append-only JSONL progress writer (safe no-op if path is None)."""
+
+    def __init__(self, path: Optional[str]):
+        self.enabled = bool(path)
+        self.path: Optional[Path] = Path(path).resolve() if path else None
+        self.t0 = 0.0
+        self._fh = None
+        if self.path:
+            self.t0 = float(__import__("time").time())
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                self.path.write_text("", encoding="utf-8")
+            except Exception:
+                pass
+            try:
+                self._fh = open(self.path, "a", encoding="utf-8", buffering=1)
+            except Exception:
+                self._fh = None
+                self.enabled = False
+
+    def write(self, obj: Dict[str, Any]) -> None:
+        if not self.enabled or self._fh is None:
+            return
+        payload = dict(obj)
+        t = float(__import__("time").time())
+        payload.setdefault("t", t)
+        payload.setdefault("t_rel", float(t - self.t0))
+        try:
+            self._fh.write(json.dumps(payload) + "\n")
+            self._fh.flush()
+        except Exception:
+            pass
+
 def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     with open(path, "r", encoding="utf-8-sig") as f:
@@ -219,6 +257,8 @@ def main() -> int:
     ap.add_argument("--starting-equity", type=float, default=1000.0)
     ap.add_argument("--out", default=None, help="Output folder (default: from-run/rolling_starts)")
     ap.add_argument("--no-progress", action="store_true")
+    ap.add_argument("--progress-file", default=None, help="Optional JSONL progress file for UI monitoring.")
+    ap.add_argument("--progress-every", type=int, default=1, help="Emit progress every N configs.")
     args = ap.parse_args()
 
     run_dir = Path(args.from_run).resolve()
@@ -283,6 +323,10 @@ def main() -> int:
     out_dir = Path(args.out).resolve() if args.out else (run_dir / "rolling_starts")
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    progress = ProgressWriter(args.progress_file)
+    progress.write({"stage": "rolling_starts", "phase": "init", "done": 0, "total": 0, "out_dir": str(out_dir)})
+
+
     # Accumulation: load prior results if they exist and parameters match
     meta_path = out_dir / "rs_meta.json"
     detail_path = out_dir / "rolling_starts_detail.csv"
@@ -333,6 +377,24 @@ def main() -> int:
     if not starts:
         raise ValueError("No start points available; reduce --min-bars or --start-step.")
 
+
+    rs_total = int(len(cfgs))
+    rs_done = 0
+    rs_windows_per_cfg = int(len(starts))
+    rs_windows_total = int(rs_total * rs_windows_per_cfg)
+    rs_last_emit = 0
+    t_prog0 = float(__import__("time").time())
+    progress.write(
+        {
+            "stage": "rolling_starts",
+            "phase": "run",
+            "done": 0,
+            "total": rs_total,
+            "windows_per_cfg": rs_windows_per_cfg,
+            "windows_total": rs_windows_total,
+        }
+    )
+
     # Progress bar (optional)
     it_cfgs = cfgs
     if not args.no_progress:
@@ -344,6 +406,9 @@ def main() -> int:
             pass
 
     details: List[Dict[str, Any]] = []
+
+    best_score: Optional[float] = None
+    recent_best: List[Tuple[str, float]] = []  # (config_id, cfg_score) top few
 
     for cid, cfg, _norm in it_cfgs:
         if accumulate_ok and str(cid) in already_done:
@@ -398,6 +463,44 @@ def main() -> int:
             rows_for_cfg.append(row)
             details.append(row)
 
+
+        # A quick per-config score so the UI can show 'best so far' while the run cooks.
+        try:
+            _vals = np.array([float(r.get('performance.twr_total_return', np.nan)) for r in rows_for_cfg], dtype=float)
+            cfg_score = float(np.nanmedian(_vals)) if _vals.size else float('nan')
+        except Exception:
+            cfg_score = float('nan')
+        if best_score is None or (np.isfinite(cfg_score) and cfg_score > float(best_score)):
+            best_score = float(cfg_score)
+        if np.isfinite(cfg_score):
+            recent_best.append((str(cid), float(cfg_score)))
+            # keep only top 5 by score
+            recent_best = sorted(recent_best, key=lambda x: x[1], reverse=True)[:5]
+
+        rs_done += 1
+        pe = int(getattr(args, "progress_every", 1) or 1)
+        if progress.enabled and ((rs_done - rs_last_emit) >= pe or rs_done >= rs_total):
+            rs_last_emit = int(rs_done)
+            elapsed = float(__import__("time").time() - t_prog0)
+            progress.write(
+                {
+                    "stage": "rolling_starts",
+                    "phase": "run",
+                    "done": int(rs_done),
+                    "total": int(rs_total),
+                    "rate": float(rs_done / max(1e-9, elapsed)),
+                    "windows_per_cfg": int(rs_windows_per_cfg),
+                    "windows_done": int(rs_done * rs_windows_per_cfg),
+                    "windows_total": int(rs_windows_total),
+                    "windows_rate": float((rs_done * rs_windows_per_cfg) / max(1e-9, elapsed)),
+                    "config_id": str(cid),
+                    "cfg_score": float(cfg_score) if np.isfinite(cfg_score) else None,
+                    "best": float(best_score) if (best_score is not None and np.isfinite(best_score)) else None,
+                    "message": f"cfg {str(cid)}  score={cfg_score:.4g}" if np.isfinite(cfg_score) else f"cfg {str(cid)}",
+                    "top": recent_best,
+                }
+            )
+
         # No per-config summary here; we recompute summary from accumulated detail at end.
 
     df_new_detail = pd.DataFrame(details)
@@ -423,6 +526,7 @@ def main() -> int:
 
     print(f"Wrote: {detail_path}")
     print(f"Wrote: {summary_path}")
+    progress.write({"stage": "rolling_starts", "phase": "done", "done": int(rs_done), "total": int(rs_total), "out_dir": str(out_dir)})
     return 0
 
 
