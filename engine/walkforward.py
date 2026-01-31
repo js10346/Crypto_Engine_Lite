@@ -676,9 +676,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                         "windows": int(len(windows)),
                         "rows_done": int(wf_done * len(windows)),
                         "rows_total": int(wf_total * len(windows)),
-                        "best": {
-                            "median_window_return": float(wf_best_median) if wf_best_median is not None else None,
-                            "pct_profitable_windows": float(wf_best_pct) if wf_best_pct is not None else None,
+                        "best": (float(wf_best_median) if wf_best_median is not None else None),
+                        "best_metric": "median_window_return",
+                        "best_pct": (float(wf_best_pct) if wf_best_pct is not None else None),
+                        "best_detail": {
+                            "median_window_return": (float(wf_best_median) if wf_best_median is not None else None),
+                            "pct_profitable_windows": (float(wf_best_pct) if wf_best_pct is not None else None),
                         },
                     }
                 )

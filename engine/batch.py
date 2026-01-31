@@ -1023,11 +1023,7 @@ def _eval_sweep_row(
     if is_spot:
         perf = _build_cashflow_performance_stats(df_feat, eq_df)
     else:
-        perf = (
-        _build_cashflow_performance_stats(df_feat, eq_df)
-        if str(market_mode).lower() == "spot"
-        else _build_performance_stats(df_feat, eq_df)
-    )
+        perf = _build_performance_stats(df_feat, eq_df)
     exits = _exit_counts(trades_df)
     tp_levels = _tp_level_counts(trades_df)
     stop_moves = _stop_move_stats(trades_df)
@@ -1568,8 +1564,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             "total": sweep_total,
             "metric": sweep_metric,
             "sort_desc": sweep_desc,
+            "best_metric": str(sweep_metric),
             "passed": 0,
             "failed": 0,
+            "fails": {},
         }
     )
 
@@ -1648,7 +1646,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                         "rate": float(sweep_done / max(1e-9, (time.time() - t_sweep0))),
                         "passed": int(sweep_pass),
                         "failed": int(sweep_done - sweep_pass),
-                        "best": ({"metric": sweep_metric, "value": float(sweep_best)} if sweep_best is not None else None),
+                        "best": (float(sweep_best) if sweep_best is not None else None),
+                        "best_metric": str(sweep_metric),
+                        "best_detail": ({"metric": str(sweep_metric), "value": float(sweep_best)} if sweep_best is not None else None),
+                        "fails": {str(k): int(v) for k, v in sweep_fail.items()},
                         "fail_top": fail_top,
                     }
                 )
@@ -1688,8 +1689,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                 for chunk in chunks
             ]
 
+            pe = int(getattr(args, "progress_every", 25) or 25)
+
             for fut in as_completed(futs):
                 rows = fut.result()
+                # Update console progress bar (if enabled)
+                if use_tqdm and pbar is not None:
+                    pbar.update(len(rows))
+
                 for row in rows:
                     passed, reason = _passes_gates(
                         row=row,
@@ -1705,46 +1712,46 @@ def main(argv: Optional[List[str]] = None) -> int:
                     row["gates.reject_reason"] = str(reason)
                     rows_sweep.append(row)
 
-            sweep_done += 1
-            if passed:
-                sweep_pass += 1
-            else:
-                k = str(reason)
-                sweep_fail[k] = int(sweep_fail.get(k, 0)) + 1
-
-            # Track best-so-far on sweep metric (among passing configs when possible)
-            try:
-                v = float(row.get(sweep_metric, float("nan")))
-                if math.isfinite(v):
-                    if sweep_best is None:
-                        sweep_best = v
+                    sweep_done += 1
+                    if passed:
+                        sweep_pass += 1
                     else:
-                        if sweep_desc and v > float(sweep_best):
-                            sweep_best = v
-                        if (not sweep_desc) and v < float(sweep_best):
-                            sweep_best = v
-            except Exception:
-                pass
+                        k = str(reason)
+                        sweep_fail[k] = int(sweep_fail.get(k, 0)) + 1
 
-            pe = int(getattr(args, "progress_every", 25) or 25)
-            if progress.enabled and (sweep_done % pe == 0 or sweep_done >= sweep_total):
-                fail_top = sorted(sweep_fail.items(), key=lambda kv: kv[1], reverse=True)[:6]
-                progress.write(
-                    {
-                        "stage": "batch",
-                        "phase": "sweep",
-                        "done": int(sweep_done),
-                        "total": int(sweep_total),
-                        "rate": float(sweep_done / max(1e-9, (time.time() - t_sweep0))),
-                        "passed": int(sweep_pass),
-                        "failed": int(sweep_done - sweep_pass),
-                        "best": ({"metric": sweep_metric, "value": float(sweep_best)} if sweep_best is not None else None),
-                        "fail_top": fail_top,
-                    }
-                )
+                    # Track best-so-far on sweep metric (among passing configs when possible)
+                    try:
+                        v = float(row.get(sweep_metric, float("nan")))
+                        if math.isfinite(v):
+                            if sweep_best is None:
+                                sweep_best = v
+                            else:
+                                if sweep_desc and v > float(sweep_best):
+                                    sweep_best = v
+                                if (not sweep_desc) and v < float(sweep_best):
+                                    sweep_best = v
+                    except Exception:
+                        pass
 
-                if use_tqdm and pbar is not None:
-                    pbar.update(len(rows))
+                    if progress.enabled and (sweep_done % pe == 0 or sweep_done >= sweep_total):
+                        fail_top = sorted(sweep_fail.items(), key=lambda kv: kv[1], reverse=True)[:6]
+                        progress.write(
+                            {
+                                "stage": "batch",
+                                "phase": "sweep",
+                                "done": int(sweep_done),
+                                "total": int(sweep_total),
+                                "rate": float(sweep_done / max(1e-9, (time.time() - t_sweep0))),
+                                "passed": int(sweep_pass),
+                                "failed": int(sweep_done - sweep_pass),
+                                "best": (
+                                    {"metric": sweep_metric, "value": float(sweep_best)}
+                                    if sweep_best is not None
+                                    else None
+                                ),
+                                "fail_top": fail_top,
+                            }
+                        )
 
         if use_tqdm and pbar is not None:
             pbar.close()
@@ -1809,8 +1816,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             "total": rerun_total,
             "metric": rerun_metric,
             "sort_desc": rerun_desc,
+            "best_metric": str(rerun_metric),
             "passed": 0,
             "failed": 0,
+            "fails": {},
         }
     )
     rows_full: List[Dict[str, Any]] = []
@@ -1921,8 +1930,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                 for ch in chunks2
             ]
 
+            pe = int(getattr(args, "progress_every", 25) or 25)
+
             for fut in as_completed(futs2):
                 rows = fut.result()
+
+                # Update console progress bar (if enabled)
+                if use_tqdm and pbar is not None:
+                    pbar.update(len(rows))
+
                 for row in rows:
                     passed, reason = _passes_gates(
                         row=row,
@@ -1938,48 +1954,49 @@ def main(argv: Optional[List[str]] = None) -> int:
                     row["gates.reject_reason"] = str(reason)
                     rows_full.append(row)
 
-            rerun_done += 1
-            if passed:
-                rerun_pass += 1
-            else:
-                k = str(reason)
-                rerun_fail[k] = int(rerun_fail.get(k, 0)) + 1
-
-            try:
-                v = float(row.get(rerun_metric, float("nan")))
-                if math.isfinite(v):
-                    if rerun_best is None:
-                        rerun_best = v
+                    rerun_done += 1
+                    if passed:
+                        rerun_pass += 1
                     else:
-                        if rerun_desc and v > float(rerun_best):
-                            rerun_best = v
-                        if (not rerun_desc) and v < float(rerun_best):
-                            rerun_best = v
-            except Exception:
-                pass
+                        k = str(reason)
+                        rerun_fail[k] = int(rerun_fail.get(k, 0)) + 1
 
-            pe = int(getattr(args, "progress_every", 25) or 25)
-            if progress.enabled and (rerun_done % pe == 0 or rerun_done >= rerun_total):
-                fail_top = sorted(rerun_fail.items(), key=lambda kv: kv[1], reverse=True)[:6]
-                progress.write(
-                    {
-                        "stage": "batch",
-                        "phase": "rerun",
-                        "done": int(rerun_done),
-                        "total": int(rerun_total),
-                        "rate": float(rerun_done / max(1e-9, (time.time() - t_rerun0))),
-                        "passed": int(rerun_pass),
-                        "failed": int(rerun_done - rerun_pass),
-                        "best": ({"metric": rerun_metric, "value": float(rerun_best)} if rerun_best is not None else None),
-                        "fail_top": fail_top,
-                    }
-                )
+                    # Track best-so-far on rerun metric
+                    try:
+                        v = float(row.get(rerun_metric, float("nan")))
+                        if math.isfinite(v):
+                            if rerun_best is None:
+                                rerun_best = v
+                            else:
+                                if rerun_desc and v > float(rerun_best):
+                                    rerun_best = v
+                                if (not rerun_desc) and v < float(rerun_best):
+                                    rerun_best = v
+                    except Exception:
+                        pass
 
-                if use_tqdm and pbar is not None:
-                    pbar.update(len(rows))
+                    if progress.enabled and (rerun_done % pe == 0 or rerun_done >= rerun_total):
+                        fail_top = sorted(rerun_fail.items(), key=lambda kv: kv[1], reverse=True)[:6]
+                        progress.write(
+                            {
+                                "stage": "batch",
+                                "phase": "rerun",
+                                "done": int(rerun_done),
+                                "total": int(rerun_total),
+                                "rate": float(rerun_done / max(1e-9, (time.time() - t_rerun0))),
+                                "passed": int(rerun_pass),
+                                "failed": int(rerun_done - rerun_pass),
+                                "best": (float(rerun_best) if rerun_best is not None else None),
+                                "best_metric": str(rerun_metric),
+                                "best_detail": ({"metric": str(rerun_metric), "value": float(rerun_best)} if rerun_best is not None else None),
+                                "fails": {str(k): int(v) for k, v in rerun_fail.items()},
+                                "fail_top": fail_top,
+                            }
+                        )
 
-        if use_tqdm and pbar is not None:
-            pbar.close()
+
+            if use_tqdm and pbar is not None:
+                pbar.close()
 
     _write_csv(out_dir / "results_full.csv", rows_full)
     df_full = pd.DataFrame(rows_full)

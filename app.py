@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import math
 import re
 import subprocess
@@ -17,6 +18,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 try:
     import plotly.express as px
@@ -81,6 +83,55 @@ def _fmt_num(x: Any, *, digits: int = 4) -> str:
         return f"{v:.{digits}f}"
     except Exception:
         return "n/a"
+
+
+
+def _pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+
+def _to_float_series(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(s, errors="coerce").astype(float)
+
+
+def _drawdown_to_frac(dd: pd.Series) -> pd.Series:
+    """Best-effort: convert drawdown series to a 0..1 fraction."""
+    x = _to_float_series(dd).copy()
+    # Heuristic: if values look like 20..80 (percent) convert to fraction
+    finite = x.dropna()
+    if len(finite) > 0:
+        q95 = float(finite.quantile(0.95))
+        if q95 > 2.0:  # likely percent points
+            x = x / 100.0
+    return x
+
+
+def _pareto_frontier(df: pd.DataFrame, x: str, y: str) -> pd.DataFrame:
+    """Return Pareto frontier for maximize y, minimize x."""
+    if df.empty:
+        return df.copy()
+    tmp = df[[x, y]].dropna().sort_values(x, ascending=True).copy()
+    best = -1e100
+    keep_idx = []
+    for idx, row in tmp.iterrows():
+        val = float(row[y])
+        if val > best:
+            best = val
+            keep_idx.append(idx)
+    return df.loc[keep_idx].sort_values(x, ascending=True)
+
+
+def _goodness_percentile(s: pd.Series, *, low_is_good: bool) -> pd.Series:
+    """0..1 where 1 is best."""
+    x = _to_float_series(s)
+    pct = x.rank(pct=True, ascending=True)
+    if low_is_good:
+        n = max(int(pct.notna().sum()), 1)
+        return (1.0 - pct) + (1.0 / n)
+    return pct
 
 
 def _fmt_money(x: Any) -> str:
@@ -259,145 +310,174 @@ def _tail_jsonl(path: Path, *, max_lines: int = 400) -> List[Dict[str, Any]]:
         return []
 
 
-def _render_run_monitor(progress_path: Optional[Path]) -> None:
-    """Render live telemetry from a progress.jsonl file.
 
-    Supports both:
-      - ISO8601 timestamps (string) in key `t`
-      - Unix epoch seconds (float/int) in key `t`
+def _render_run_monitor(progress_path: Optional[Path]) -> None:
+    """Render run progress from a JSONL file *or* a directory of JSONL files.
+
+    Some stages may write telemetry to different files (e.g., rerun.jsonl), so
+    supporting a directory keeps the UI live without having to guess filenames.
     """
-    if progress_path is None or (not progress_path.exists()):
+
+    if progress_path is None:
         st.info("Run monitor will appear here once progress telemetry is available.")
         return
 
-    ev = _tail_jsonl(progress_path, max_lines=800)
-    if not ev:
-        st.info("Waiting for telemetry…")
+    paths: List[Path] = []
+    if progress_path.is_dir():
+        paths = sorted(progress_path.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
+        if not paths:
+            st.info("Run monitor will appear here once progress telemetry is available.")
+            return
+    else:
+        if not progress_path.exists():
+            st.info("Run monitor will appear here once progress telemetry is available.")
+            return
+        paths = [progress_path]
+
+    events: List[Dict[str, Any]] = []
+    for p in paths:
+        try:
+            text = p.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(obj, dict):
+                # tag the source file (useful when debugging)
+                obj.setdefault("_src", p.name)
+                events.append(obj)
+
+    if not events:
+        st.info("Run monitor will appear here once progress telemetry is available.")
         return
 
-    df = pd.DataFrame(ev)
-
-    # Build a safe time index for charts
-    t_index = None
-    if "t" in df.columns:
-        if pd.api.types.is_numeric_dtype(df["t"]):
-            df["_t_dt"] = pd.to_datetime(df["t"], unit="s", errors="coerce", utc=True)
-        else:
-            df["_t_dt"] = pd.to_datetime(df["t"], errors="coerce", utc=True)
-        if df["_t_dt"].notna().any():
-            t_index = "_t_dt"
-
-    last = ev[-1]
-    done = last.get("done") or last.get("done_windows") or 0
-    total = last.get("total") or last.get("windows_total") or 0
-    rate = last.get("rate")
-
-    # Derived metrics
-    elapsed = None
-    if "t_rel" in last and isinstance(last.get("t_rel"), (int, float)):
-        elapsed = float(last["t_rel"])
-    elif t_index:
+    # Sort by timestamp if available; otherwise preserve file order.
+    def _t(e: Dict[str, Any]) -> float:
+        t = e.get("t")
         try:
-            elapsed = float((df[t_index].max() - df[t_index].min()).total_seconds())
+            return float(t)
         except Exception:
-            elapsed = None
+            return float("nan")
 
-    eta = None
-    try:
-        if isinstance(rate, (int, float)) and float(rate) > 1e-9 and float(total) > 0:
-            eta = max(0.0, (float(total) - float(done)) / float(rate))
-    except Exception:
-        eta = None
+    # If at least some events have timestamps, sort by them.
+    if any(isinstance(e.get("t"), (int, float)) for e in events):
+        events = sorted(events, key=lambda e: (_t(e) if _t(e) == _t(e) else float("inf")))
+
+    last = events[-1]
+    df = pd.DataFrame(events)
+
+    stage = str(last.get("stage", ""))
+    phase = str(last.get("phase", ""))
+    done = last.get("i", last.get("done", last.get("n_done", 0)))
+    total = last.get("n", last.get("total", last.get("n_total", 0)))
 
     # Header metrics
-    c1, c2, c3, c4, c5 = st.columns(5)
-    with c1:
-        st.metric("Stage", str(last.get("stage", "")))
-        phase = str(last.get("phase", "")) if last.get("phase") is not None else ""
-        if phase:
-            st.caption(phase)
-    with c2:
+    cols = st.columns(4)
+    with cols[0]:
+        st.metric("Stage", (f"{stage}:{phase}" if phase else stage) or "(unknown)")
+    with cols[1]:
         try:
             st.metric("Progress", f"{int(done)}/{int(total)}")
         except Exception:
             st.metric("Progress", f"{done}/{total}")
-    with c3:
-        st.metric("Throughput", f"{float(rate):.2f}/s" if isinstance(rate, (int, float)) else "")
-        if elapsed is not None:
-            st.caption(f"elapsed: {elapsed:.1f}s")
-    with c4:
-        if eta is not None:
-            st.metric("ETA", f"{eta/60.0:.1f}m" if eta >= 90 else f"{eta:.0f}s")
+    with cols[2]:
+        rate = last.get("rate", last.get("throughput"))
+        if rate is None:
+            st.metric("Throughput", "")
         else:
-            st.metric("ETA", "")
-    with c5:
-        if last.get("best") is not None:
-            b = last.get("best")
             try:
-                st.metric("Best so far", f"{float(b):.4g}")
+                st.metric("Throughput", f"{float(rate):.2f}/s")
             except Exception:
-                st.metric("Best so far", str(b))
-        elif last.get("survivors") is not None:
-            st.metric("Survivors", str(last.get("survivors")))
+                st.metric("Throughput", str(rate))
+    with cols[3]:
+        # Prefer showing survivors if available, otherwise show message
+        surv = last.get("survivors")
+        if isinstance(surv, int):
+            st.metric("Survivors", str(surv))
         else:
-            msg = (
-                last.get("message")
-                or last.get("msg")
-                or last.get("status")
-                or last.get("config_id")
-                or ""
-            )
-            st.metric("Message", str(msg)[:32])
+            st.metric("Message", str(last.get("message", ""))[:32])
 
     # Progress bar
     try:
-        d = float(done)
-        t = float(total)
-        if t > 0:
-            st.progress(min(1.0, max(0.0, d / t)))
+        done_f = float(done)
+        total_f = float(total)
+        if total_f > 0:
+            st.progress(min(1.0, max(0.0, done_f / total_f)))
     except Exception:
         pass
 
-    # Mini charts
-    if t_index and t_index in df.columns:
-        dfc = df.copy()
-        dfc = dfc[dfc[t_index].notna()]
-        if not dfc.empty:
-            dfc = dfc.set_index(t_index)
+    # Mini charts (rate + best-so-far)
+    if "t" in df.columns:
+        if "rate" in df.columns:
+            s = pd.to_numeric(df["rate"], errors="coerce").dropna()
+            if len(s) >= 3:
+                st.line_chart(df.set_index("t")["rate"], height=140)
 
-            left, right = st.columns(2)
-            with left:
-                if "rate" in dfc.columns:
-                    st.line_chart(dfc["rate"], height=140)
-            with right:
-                if "best" in dfc.columns:
-                    st.line_chart(dfc["best"], height=140)
+        # Best: support either a numeric 'best' column OR dict-shaped best_detail
+        best_series = None
+        if "best" in df.columns:
+            b = pd.to_numeric(df["best"], errors="coerce")
+            if b.notna().sum() >= 3:
+                best_series = b
 
-    # Gate reject breakdown (batch usually)
+        if best_series is None and "best_detail" in df.columns:
+            def _best_from_detail(x: Any) -> float:
+                if isinstance(x, dict):
+                    # common shapes
+                    if "value" in x:
+                        try:
+                            return float(x.get("value"))
+                        except Exception:
+                            return float("nan")
+                    # pick median_window_return if present, else first numeric
+                    if "median_window_return" in x:
+                        try:
+                            return float(x.get("median_window_return"))
+                        except Exception:
+                            return float("nan")
+                    for v in x.values():
+                        try:
+                            fv = float(v)
+                            if math.isfinite(fv):
+                                return fv
+                        except Exception:
+                            continue
+                return float("nan")
+            b2 = df["best_detail"].apply(_best_from_detail)
+            if pd.to_numeric(b2, errors="coerce").notna().sum() >= 3:
+                best_series = pd.to_numeric(b2, errors="coerce")
+
+        if best_series is not None:
+            st.line_chart(pd.DataFrame({"best": best_series, "t": df["t"]}).set_index("t")["best"], height=140)
+
+        # Optional: best_pct if present
+        if "best_pct" in df.columns:
+            p = pd.to_numeric(df["best_pct"], errors="coerce").dropna()
+            if len(p) >= 3:
+                st.line_chart(df.set_index("t")["best_pct"], height=140)
+
+    # Failure breakdown if present (support 'fails' dict or 'fail_top' list)
     fails = last.get("fails")
+    if not (isinstance(fails, dict) and fails):
+        ft = last.get("fail_top")
+        if isinstance(ft, list) and ft:
+            try:
+                fails = {str(k): int(v) for k, v in ft}
+            except Exception:
+                fails = None
+
     if isinstance(fails, dict) and fails:
         st.caption("Gate rejects (so far)")
         s = pd.Series({str(k): int(v) for k, v in fails.items()}).sort_values(ascending=False)
         st.bar_chart(s, height=160)
 
-    top = last.get("top")
-    if isinstance(top, list) and top:
-        st.caption("Top so far")
-        for i, item in enumerate(top[:5], start=1):
-            try:
-                cid, sc = item[0], float(item[1])
-                st.write(f"{i}. {cid} — {sc:.4g}")
-            except Exception:
-                st.write(f"{i}. {item}")
 
-    # Recent messages (optional)
-    if "message" in df.columns:
-        msgs = [m for m in df["message"].dropna().astype(str).tolist() if m.strip()]
-        msgs = msgs[-5:]
-        if msgs:
-            st.caption("Recent")
-            for m in reversed(msgs):
-                st.write(f"• {m}")
 
 def _run_cmd(
     cmd: List[str],
@@ -1106,6 +1186,11 @@ def _read_json(path: Path) -> Dict[str, Any]:
     except Exception:
         return {}
 
+
+def _write_json(path: Path, obj: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+
 def _write_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, 'w', encoding='utf-8') as f:
@@ -1196,8 +1281,8 @@ with st.sidebar:
     stage_labels = [x[0] for x in STAGES]
     stage_keys = [x[1] for x in STAGES]
 
-    if "ui.stage" not in st.session_state:
-        st.session_state["ui.stage"] = "batch"
+    st.session_state.setdefault("ui.stage", "batch")
+    st.session_state.setdefault("ui.batch.scroll_to_inspect", False)
 
     stage_map = {key: label for (label, key) in STAGES}
     stage_pick = st.radio("Stage", options=stage_keys, format_func=lambda k: stage_map.get(k, k), key="ui.stage")
@@ -1515,6 +1600,8 @@ if open_existing == "(new run)":
                 _ensure_grid_has_baseline(grid_path, base_path, total_n=int(st.session_state["new.grid_n"]))
 
                 # 3) Batch
+                template_path = str(st.session_state.get("new.template_path", "strategies.dca_swing:Strategy"))
+                market_mode = str(st.session_state.get("new.market_mode", "spot"))
                 batch_cmd: List[str] = [
                     PY,
                     "-m",
@@ -1524,9 +1611,9 @@ if open_existing == "(new run)":
                     "--grid",
                     str(grid_path),
                     "--template",
-                    str(st.session_state.get("new.template_path", "strategies.dca_swing:Strategy")),
+                    template_path,
                     "--market-mode",
-                    "spot",
+                    market_mode,
                     "--run-name",
                     str(run_name),
                     "--out",
@@ -1555,12 +1642,39 @@ if open_existing == "(new run)":
                 ]
                 batch_progress = RUNS_DIR / str(run_name) / "progress" / "batch.jsonl"
                 batch_progress.parent.mkdir(parents=True, exist_ok=True)
+                # Persist enough metadata for replay tools (grid/data/template/etc.)
+                run_dir = RUNS_DIR / str(run_name)
+                meta_path = run_dir / "batch_meta.json"
+                meta: Dict[str, Any] = {}
+                try:
+                    if meta_path.exists():
+                        meta = _read_json(meta_path)  # type: ignore
+                except Exception:
+                    meta = {}
+
+                # Estimate bars/day from the dataset so downstream Rolling Starts / Walkforward
+                # interpret "min bars" correctly. Falls back to 1 (daily) if inference fails.
+                bar_ms = _infer_bar_ms_from_csv(Path(str(data_path)))
+                if bar_ms and bar_ms > 0:
+                    bars_per_day = int(max(1, round(86_400_000 / float(bar_ms))))
+                else:
+                    bars_per_day = 1
+                meta.update({
+                    "run_name": str(run_name),
+                    "grid_path": str(grid_path),
+                    "data_path": str(data_path),
+                    "template": str(template_path),
+                    "market_mode": market_mode,
+                    "bars_per_day": int(bars_per_day),
+                    "ui_written_at": time.time(),
+                })
+                _write_json(meta_path, meta)
                 batch_cmd += ["--no-progress", "--progress-file", str(batch_progress), "--progress-every", "25"]
                 _run_cmd(
                     batch_cmd,
                     cwd=REPO_ROOT,
                     label="2) Batch sweep + rerun",
-                    progress_path=batch_progress,
+                    progress_path=batch_progress.parent,
                 )
 
                 run_dir = RUNS_DIR / str(run_name)
@@ -1686,23 +1800,333 @@ if stage_pick == "batch":
 
     df_show = dfA[dfA["batch.verdict"].isin(keep)].copy()
 
-    # Table
-    cols = [
-        "config_id",
-        "config.label",
-        "batch.verdict",
-        "equity.net_profit_ex_cashflows",
-        "performance.twr_total_return",
-        "performance.max_drawdown_equity",
-        "trades_summary.trades_closed",
-    ]
-    # Optional score columns
-    for c in ["score.calmar_equity", "score.profit_dd", "score.twr_dd", "score.profit"]:
-        if c in df_show.columns and c not in cols:
-            cols.append(c)
+    # ---------------------------------------------------------------------
+    # Visual scan (turn the table into something a human can reason about)
+    # ---------------------------------------------------------------------
+    st.write("#### Quick visual scan")
 
-    cols = [c for c in cols if c in df_show.columns]
-    st.dataframe(df_show[cols], use_container_width=True, height=520)
+    id_col = "config_id"
+    label_col = _pick_col(df_show, ["config.label", "label", "config_label"])
+    verdict_col = _pick_col(df_show, ["batch.verdict", "verdict", "batch_verdict"])
+
+    profit_col = _pick_col(df_show, ["equity.net_profit_ex_cashflows", "equity.net_profit", "equity.net_profit_ex_cashflow"])
+    dd_col = _pick_col(df_show, ["performance.max_drawdown_equity", "performance.max_drawdown", "equity.max_drawdown"])
+    trades_col = _pick_col(df_show, ["trades_summary.trades_closed", "trades.closed", "trades_closed", "trades"])
+
+    calmar_col = _pick_col(df_show, ["score.calmar_equity", "performance.calmar", "calmar"])
+
+    if profit_col and dd_col and px is not None and go is not None and not df_show.empty:
+        plot_df = df_show.copy()
+        plot_df["_profit"] = _to_float_series(plot_df[profit_col])
+        plot_df["_dd"] = _drawdown_to_frac(plot_df[dd_col])
+        if trades_col:
+            plot_df["_trades"] = _to_float_series(plot_df[trades_col]).fillna(0.0)
+        else:
+            plot_df["_trades"] = 0.0
+
+        plot_df["_label"] = plot_df[label_col].astype(str) if label_col else ""
+        plot_df["_verdict"] = plot_df[verdict_col].astype(str) if verdict_col else "?"
+
+        # Scatter: profit vs drawdown
+        fig = px.scatter(
+            plot_df,
+            x="_dd",
+            y="_profit",
+            color="_verdict",
+            size="_trades",
+            hover_data={
+                id_col: True,
+                "_label": True,
+                "_profit": ":.2f",
+                "_dd": ":.4f",
+                "_trades": ":.0f",
+            },
+            render_mode="webgl",
+            title="Return vs max drawdown (each dot is a strategy)",
+        )
+        fig.update_layout(
+            xaxis_title="Max drawdown (fraction, lower is better)",
+            yaxis_title="Net profit (excluding deposits)",
+            legend_title_text="Batch verdict",
+            height=520,
+            margin=dict(l=10, r=10, t=50, b=10),
+        )
+
+        # Pareto frontier overlay (can't improve profit without worsening drawdown)
+        frontier = _pareto_frontier(plot_df, "_dd", "_profit")
+        if not frontier.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=frontier["_dd"],
+                    y=frontier["_profit"],
+                    mode="lines+markers",
+                    name="Pareto frontier",
+                    line=dict(width=2),
+                )
+            )
+
+        st.plotly_chart(fig, use_container_width=True)
+
+    else:
+        st.info("Scatter plot unavailable (missing Plotly or required columns).")
+
+    # ---------------------------------------------------------------------
+    # Top candidates as cards (humans think in tradeoffs, not columns)
+    # ---------------------------------------------------------------------
+    st.write("#### Top candidates (cards)")
+
+    rank_col = _pick_col(df_show, ["score.profit", profit_col] if profit_col else ["score.profit"])
+    if rank_col is None:
+        rank_col = profit_col
+
+    cards_df = df_show.copy()
+    if rank_col:
+        cards_df["_rank"] = _to_float_series(cards_df[rank_col])
+        cards_df = cards_df.sort_values("_rank", ascending=False)
+    cards_df = cards_df.head(12).copy()
+
+    if cards_df.empty:
+        st.info("No rows to show.")
+    else:
+        cols_cards = st.columns(3)
+        for i, (_, r) in enumerate(cards_df.iterrows()):
+            cfg_id = str(r.get(id_col, ""))
+            label = str(r.get(label_col, cfg_id)) if label_col else cfg_id
+            verdict = str(r.get(verdict_col, "")) if verdict_col else ""
+
+            profit_v = float(r.get(profit_col, float("nan"))) if profit_col else float("nan")
+            dd_v = float(r.get(dd_col, float("nan"))) if dd_col else float("nan")
+            dd_frac = float(_drawdown_to_frac(pd.Series([dd_v])).iloc[0]) if dd_col else float("nan")
+            trades_v = int(float(r.get(trades_col, 0))) if trades_col and str(r.get(trades_col, "")).strip() != "" else 0
+            calmar_v = float(r.get(calmar_col, float("nan"))) if calmar_col else float("nan")
+
+            with cols_cards[i % 3]:
+                with st.container(border=True):
+                    st.write(f"**{label}**")
+                    st.caption(f"{cfg_id} • {verdict}")
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("Profit", _fmt_money(profit_v) if profit_col else "n/a")
+                    m2.metric("Max DD", _fmt_pct(dd_frac) if dd_col else "n/a")
+                    m3.metric("Trades", f"{trades_v}" if trades_col else "n/a")
+                    if calmar_col:
+                        st.caption(f"Calmar: {_fmt_num(calmar_v, digits=3)}")
+
+                    if st.button("Inspect", key=f"batch.inspect.{cfg_id}"):
+                        st.session_state["ui.batch.inspect_id"] = cfg_id
+                        st.session_state["ui.batch.scroll_to_inspect"] = True
+                        st.rerun()
+
+    # ---------------------------------------------------------------------
+    # Heatmap table (percentiles) for quick pattern recognition
+    # ---------------------------------------------------------------------
+    st.write("#### Quick scan heatmap (percentiles among shown rows)")
+    heat_base = df_show.copy()
+    n = len(heat_base)
+
+    heat = pd.DataFrame()
+    heat["config_id"] = heat_base["config_id"].astype(str)
+    if label_col:
+        heat["label"] = heat_base[label_col].astype(str)
+    if verdict_col:
+        heat["verdict"] = heat_base[verdict_col].astype(str)
+
+    # Raw helpers
+    if profit_col:
+        heat["profit"] = _to_float_series(heat_base[profit_col])
+        heat["profit_%ile"] = (_goodness_percentile(heat_base[profit_col], low_is_good=False) * 100.0).round(1)
+    if dd_col:
+        dd_frac = _drawdown_to_frac(heat_base[dd_col])
+        heat["max_dd"] = dd_frac
+        heat["dd_%ile"] = (_goodness_percentile(dd_frac, low_is_good=True) * 100.0).round(1)
+    if trades_col:
+        heat["trades"] = _to_float_series(heat_base[trades_col]).round(0)
+        # More trades generally = more evidence; treat low-is-bad (so low_is_good=False)
+        heat["trades_%ile"] = (_goodness_percentile(heat_base[trades_col], low_is_good=False) * 100.0).round(1)
+    if calmar_col:
+        heat["calmar"] = _to_float_series(heat_base[calmar_col])
+        heat["calmar_%ile"] = (_goodness_percentile(heat_base[calmar_col], low_is_good=False) * 100.0).round(1)
+
+    # Display with color on the percentile columns
+    pct_cols = [c for c in heat.columns if c.endswith("%ile")]
+    disp_cols = ["config_id"] + (["label"] if "label" in heat.columns else []) + (["verdict"] if "verdict" in heat.columns else [])
+    disp_cols += [c for c in ["profit", "max_dd", "trades", "calmar"] if c in heat.columns]
+    disp_cols += pct_cols
+
+    heat_disp = heat[disp_cols].copy()
+    sty = heat_disp.style
+    for c in pct_cols:
+        sty = sty.background_gradient(subset=[c], cmap="RdYlGn")
+
+    st.dataframe(sty, use_container_width=True, height=420)
+
+    # ---------------------------------------------------------------------
+    # Inspect + Replay
+    # ---------------------------------------------------------------------
+    st.write("#### Inspect a strategy")
+    default_pick = st.session_state.get("ui.batch.inspect_id")
+    if default_pick not in set(df_show["config_id"].astype(str)):
+        default_pick = str(df_show["config_id"].iloc[0]) if not df_show.empty else None
+
+    if default_pick:
+        pick = st.selectbox(
+            "Choose a config_id to inspect / replay",
+            options=df_show["config_id"].astype(str).tolist(),
+            index=df_show["config_id"].astype(str).tolist().index(default_pick),
+            key="ui.batch.pick",
+        )
+        batch_profit_ex_cf = None
+        row = df_show[df_show["config_id"].astype(str) == str(pick)].head(1)
+        if not row.empty:
+            r = row.iloc[0].to_dict()
+            # Keep a reference for replay sanity checks
+            batch_profit_ex_cf = None
+            try:
+                if profit_col:
+                    batch_profit_ex_cf = float(r.get(profit_col))
+            except Exception:
+                batch_profit_ex_cf = None
+
+            c1, c2, c3, c4 = st.columns(4)
+            if profit_col:
+                c1.metric("Profit (ex cashflows)", _fmt_money(r.get(profit_col)))
+            if dd_col:
+                c2.metric("Max DD", _fmt_pct(_drawdown_to_frac(pd.Series([r.get(dd_col)])).iloc[0]))
+            if trades_col:
+                c3.metric("Trades", f"{int(float(r.get(trades_col, 0) or 0))}")
+            if calmar_col:
+                c4.metric("Calmar", _fmt_num(r.get(calmar_col), digits=3))
+
+        # Artifacts locations
+        replay_dir = run_dir / "replay_cache" / str(pick)
+        art_dir = replay_dir if (replay_dir / "equity_curve.csv").exists() else top_map.get(str(pick), replay_dir)
+
+        eq_path = art_dir / "equity_curve.csv"
+        can_replay = (run_dir / "configs_resolved.jsonl").exists()
+        if not eq_path.exists():
+            if st.button("Generate replay artifacts (cached)", type="primary", disabled=(not can_replay), key="batch.replay.btn"):
+                progress_path = replay_dir / "progress.jsonl"
+                meta = {}
+                try:
+                    mp = run_dir / "batch_meta.json"
+                    if mp.exists():
+                        meta = _read_json(mp)
+                except Exception:
+                    meta = {}
+                starting_equity = float(meta.get("starting_equity", 10000.0) or 10000.0)
+                seed = int(meta.get("seed", 1) or 1)
+
+                cmd = [
+                    PY,
+                    str(REPO_ROOT / "tools" / "generate_replay_artifacts.py"),
+                    "--from-run",
+                    str(run_dir),
+                    "--config-id",
+                    str(pick),
+                    "--progress-file",
+                    str(progress_path),
+                    "--starting-equity",
+                    str(starting_equity),
+                    "--seed",
+                    str(seed),
+                ]
+                _run_cmd(cmd, cwd=REPO_ROOT, label="Replay: generate artifacts", progress_path=progress_path)
+                st.success("Replay artifacts generated.")
+                st.rerun()
+
+        if eq_path.exists():
+            try:
+                eq_df = pd.read_csv(eq_path)
+                st.caption(f"Replay artifacts dir: `{art_dir}`")
+
+                if "equity" in eq_df.columns:
+                    # Use dt column when present, otherwise fall back to first column
+                    tcol = "dt" if "dt" in eq_df.columns else eq_df.columns[0]
+                    t = pd.to_datetime(eq_df[tcol], errors="coerce")
+                    equity = pd.to_numeric(eq_df["equity"], errors="coerce")
+
+                    start_eq = float(equity.iloc[0]) if len(equity) else float("nan")
+                    end_eq = float(equity.iloc[-1]) if len(equity) else float("nan")
+                    cashflow_total = 0.0
+                    if "cashflow" in eq_df.columns:
+                        cashflow_total = float(pd.to_numeric(eq_df["cashflow"], errors="coerce").fillna(0.0).sum())
+                    replay_profit_ex_cf = float(end_eq - start_eq - cashflow_total) if (math.isfinite(end_eq) and math.isfinite(start_eq)) else float("nan")
+
+                    cA, cB, cC, cD = st.columns(4)
+                    cA.metric("Replay start equity", _fmt_money(start_eq))
+                    cB.metric("Replay end equity", _fmt_money(end_eq))
+                    cC.metric("Replay cashflows", _fmt_money(cashflow_total))
+                    cD.metric("Replay profit (ex cashflows)", _fmt_money(replay_profit_ex_cf))
+
+                    # Warn when replay doesn't match the batch row (common sign of loading the wrong config/dataset)
+                    try:
+                        if batch_profit_ex_cf is not None and math.isfinite(replay_profit_ex_cf):
+                            if abs(float(batch_profit_ex_cf) - float(replay_profit_ex_cf)) > max(5.0, 0.01 * abs(float(batch_profit_ex_cf))):
+                                st.warning(
+                                    "Replay result does **not** match the batch row profit. "
+                                    "This usually means the replay loaded the wrong config payload (e.g., didn't unwrap normalized config), "
+                                    "or the replay is using a different dataset/seed/starting equity."
+                                )
+                    except Exception:
+                        pass
+
+                    # Plot equity
+                    try:
+                        chart_idx = t if t.notna().any() else eq_df[tcol]
+                        st.line_chart(pd.DataFrame({"equity": equity.values}, index=chart_idx)["equity"])
+                    except Exception:
+                        st.line_chart(eq_df.set_index(tcol)["equity"])
+
+                    # Optional: drawdown curve
+                    try:
+                        eq2 = pd.to_numeric(equity, errors="coerce").fillna(method="ffill")
+                        peak = eq2.cummax()
+                        dd = (eq2 / peak - 1.0).fillna(0.0)
+                        st.line_chart(pd.DataFrame({"drawdown": dd.values}, index=(t if t.notna().any() else eq_df[tcol]))["drawdown"])
+                    except Exception:
+                        pass
+
+                st.download_button(
+                    "Download replay equity_curve.csv",
+                    data=eq_path.read_bytes(),
+                    file_name=f"{selected_run_name}_{pick}_equity_curve.csv",
+                )
+                trades_path = art_dir / "trades.csv"
+                fills_path = art_dir / "fills.csv"
+                if trades_path.exists():
+                    st.download_button(
+                        "Download replay trades.csv",
+                        data=trades_path.read_bytes(),
+                        file_name=f"{selected_run_name}_{pick}_trades.csv",
+                    )
+                if fills_path.exists():
+                    st.download_button(
+                        "Download replay fills.csv",
+                        data=fills_path.read_bytes(),
+                        file_name=f"{selected_run_name}_{pick}_fills.csv",
+                    )
+            except Exception as e:
+                st.warning(f"Could not load replay artifacts: {e}")
+        else:
+            st.caption("Replay artifacts not found yet for this config_id.")
+
+    # ---------------------------------------------------------------------
+    # Raw table (advanced)
+    # ---------------------------------------------------------------------
+    with st.expander("Raw table (advanced)", expanded=False):
+        cols = [
+            "config_id",
+            "config.label",
+            "batch.verdict",
+            "equity.net_profit_ex_cashflows",
+            "performance.twr_total_return",
+            "performance.max_drawdown_equity",
+            "trades_summary.trades_closed",
+        ]
+        for c in ["score.calmar_equity", "score.profit_dd", "score.twr_dd", "score.profit"]:
+            if c in df_show.columns and c not in cols:
+                cols.append(c)
+        cols = [c for c in cols if c in df_show.columns]
+        st.dataframe(df_show[cols], use_container_width=True, height=520)
 
     st.download_button(
         "Download batch survivors (CSV)",
@@ -1890,8 +2314,10 @@ elif stage_pick == "wf":
         st.warning("Walkforward module not found/importable yet (engine.walkforward). UI wiring is ready though.")
         st.stop()
 
-    # Choose WF run dir
+
+    # Choose WF run dir + parameters
     left, right = st.columns([2, 1])
+    run_clicked = False
 
     with left:
         wf_runs = []
@@ -1907,15 +2333,19 @@ elif stage_pick == "wf":
         )
         wf_dir = (wf_root / wf_choice) if (wf_choice != "(none)") else None
 
+    # Build WF command in the sidebar-ish column, but RUN it full-width (below columns)
+    cmd: Optional[List[str]] = None
+    wf_progress: Optional[Path] = None
+
     with right:
         st.write("**Quick presets**")
-    
+
         bars_per_day = _bars_per_day_from_run_meta(run_dir)
         bar_hint = _human_bar_interval_from_run(run_dir)
         st.caption(f"Detected timeframe: {bar_hint} (≈ {bars_per_day} bars/day)")
-    
+
         preset = st.selectbox("Preset", options=["Quick", "Standard", "Thorough"], index=0, key="wf.preset")
-    
+
         # Apply defaults only when preset changes (so number inputs don't reset constantly).
         prev = st.session_state.get("wf.preset_prev")
         if prev != preset:
@@ -1935,22 +2365,22 @@ elif stage_pick == "wf":
                     w_default, s_default, cov = 60, 7, 0.95
                 else:
                     w_default, s_default, cov = 90, 3, 0.95
-    
+
             expected = int(max(1, round(w_default * bars_per_day)))
             mb_default = int(max(1, math.ceil(expected * cov)))
-    
+
             st.session_state["wf.window_days"] = int(w_default)
             st.session_state["wf.step_days"] = int(s_default)
             st.session_state["wf.min_bars"] = int(mb_default)
             st.session_state["wf.jobs"] = int(st.session_state.get("wf.jobs", 8))
             st.session_state["wf.preset_prev"] = preset
-    
+
         window_days = int(st.number_input("Window days", 7, 3650, int(st.session_state.get("wf.window_days", 365)), 5, key="wf.window_days"))
         step_days = int(st.number_input("Step days", 1, 3650, int(st.session_state.get("wf.step_days", 30)), 5, key="wf.step_days"))
-    
+
         expected_window_bars = int(max(1, round(window_days * bars_per_day)))
         st.caption(f"Expected bars per window: ~{expected_window_bars:,}. (Min bars must be ≤ this.)")
-    
+
         max_mb = int(max(1, expected_window_bars))
         min_bars = int(st.number_input(
             "Min bars per window",
@@ -1961,54 +2391,60 @@ elif stage_pick == "wf":
             key="wf.min_bars",
         ))
         jobs = int(st.number_input("Jobs", 1, 64, int(st.session_state.get("wf.jobs", 8)), 1, key="wf.jobs"))
-    
+
         survivors_ids = survivors["config_id"].astype(str).tolist()
         N = len(survivors_ids)
-    
+
         # Clamp min_bars to something feasible for the chosen window
-        expected_window_bars = int(max(1, round(window_days * bars_per_day))) if 'bars_per_day' in locals() else int(window_days)
+        expected_window_bars = int(max(1, round(window_days * bars_per_day))) if "bars_per_day" in locals() else int(window_days)
         min_bars_effective = int(min(int(min_bars), int(expected_window_bars)))
         if int(min_bars) != int(min_bars_effective):
             st.warning(f"Min bars ({min_bars}) exceeds expected bars/window (~{expected_window_bars}). Will clamp to {min_bars_effective}.")
-    
+
         # WF output dir
         wf_out_dir = wf_root / f"wf_win{window_days}_step{step_days}_min{min_bars_effective}_n{N}"
         st.caption(f"Will run on survivors: {N} configs → output: {wf_out_dir}")
-    
-        if st.button("Run Walkforward for all survivors", type="primary", disabled=(N == 0)):
-            try:
-                cmd = [
-                    PY,
-                    "-m",
-                    "engine.walkforward",
-                    "--from-run",
-                    str(run_dir),
-                    "--top-n",
-                    str(N),
-                    "--window-days",
-                    str(window_days),
-                    "--step-days",
-                    str(step_days),
-                    "--min-bars",
-                    str(min_bars_effective),
-                    "--jobs",
-                    str(jobs),
-                    "--out",
-                    str(wf_out_dir),
-                    "--sort-by",
-                    "gates.passed",  # stable, non-NaN, includes everyone selected by top-n
-                    "--sort-desc",
-                ]
-                wf_progress = wf_out_dir / "progress" / "walkforward.jsonl"
-                wf_progress.parent.mkdir(parents=True, exist_ok=True)
-                cmd += ["--no-progress", "--progress-file", str(wf_progress), "--progress-every", "25"]
-                _run_cmd(cmd, cwd=REPO_ROOT, label="Walkforward", progress_path=wf_progress)
-                st.success("Walkforward complete.")
-                st.rerun()
-            except Exception as e:
-                st.error(str(e))
-                st.stop()
-    
+
+        run_clicked = st.button("Run Walkforward for all survivors", type="primary", disabled=(N == 0))
+
+        if run_clicked:
+            cmd = [
+                PY,
+                "-m",
+                "engine.walkforward",
+                "--from-run",
+                str(run_dir),
+                "--top-n",
+                str(N),
+                "--window-days",
+                str(window_days),
+                "--step-days",
+                str(step_days),
+                "--min-bars",
+                str(min_bars_effective),
+                "--jobs",
+                str(jobs),
+                "--out",
+                str(wf_out_dir),
+                "--sort-by",
+                "gates.passed",  # stable, non-NaN, includes everyone selected by top-n
+                "--sort-desc",
+            ]
+            wf_progress = wf_out_dir / "progress" / "walkforward.jsonl"
+            wf_progress.parent.mkdir(parents=True, exist_ok=True)
+            cmd += ["--no-progress", "--progress-file", str(wf_progress), "--progress-every", "25"]
+
+    # Run full-width (NOT inside the right-side column) so the progress UI doesn't get squeezed.
+    if run_clicked and cmd is not None and wf_progress is not None:
+        st.markdown("---")
+        try:
+            _run_cmd(cmd, cwd=REPO_ROOT, label="Walkforward", progress_path=wf_progress)
+            st.success("Walkforward complete.")
+            st.rerun()
+        except Exception as e:
+            st.error(str(e))
+            st.stop()
+
     wf_dir_effective = wf_dir or wf_out_dir
     wf_sum = load_wf_summary(wf_dir_effective)
     wf_rows = load_wf_results(wf_dir_effective)

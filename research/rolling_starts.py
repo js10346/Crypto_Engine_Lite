@@ -390,6 +390,7 @@ def main() -> int:
             "phase": "run",
             "done": 0,
             "total": rs_total,
+            "best_metric": "median_twr_total_return",
             "windows_per_cfg": rs_windows_per_cfg,
             "windows_total": rs_windows_total,
         }
@@ -492,6 +493,10 @@ def main() -> int:
                     "windows_per_cfg": int(rs_windows_per_cfg),
                     "windows_done": int(rs_done * rs_windows_per_cfg),
                     "windows_total": int(rs_windows_total),
+                    "best": (float(best_score) if best_score is not None else None),
+                    "best_metric": "median_twr_total_return",
+                    "best_detail": {"metric": "median_twr_total_return", "value": (float(best_score) if best_score is not None else None), "top5": list(recent_best)},
+                    "message": f"last_cfg={cid}",
                     "windows_rate": float((rs_done * rs_windows_per_cfg) / max(1e-9, elapsed)),
                     "config_id": str(cid),
                     "cfg_score": float(cfg_score) if np.isfinite(cfg_score) else None,
