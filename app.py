@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
+import numpy as np
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -109,19 +110,92 @@ def _drawdown_to_frac(dd: pd.Series) -> pd.Series:
     return x
 
 
-def _pareto_frontier(df: pd.DataFrame, x: str, y: str) -> pd.DataFrame:
-    """Return Pareto frontier for maximize y, minimize x."""
+def _pareto_frontier(df: pd.DataFrame, x: str, y: str, *, x_round: int = 6, y_eps: float = 1e-12) -> pd.DataFrame:
+    """Return Pareto frontier for maximize y, minimize x.
+
+    Notes:
+    - Collapses near-duplicate x values (rounding) to avoid ugly vertical segments.
+    - Uses a strict-improvement threshold on y to avoid float jitter.
+    """
     if df.empty:
         return df.copy()
-    tmp = df[[x, y]].dropna().sort_values(x, ascending=True).copy()
+
+    tmp = df[[x, y]].dropna().copy()
+    if tmp.empty:
+        return tmp
+
+    tmp[x] = pd.to_numeric(tmp[x], errors="coerce")
+    tmp[y] = pd.to_numeric(tmp[y], errors="coerce")
+    tmp = tmp.dropna()
+    if tmp.empty:
+        return tmp
+
+    # Collapse duplicate/near-duplicate x values so the frontier doesn't look like a glitchy barcode.
+    tmp["_xbin"] = tmp[x].round(x_round)
+    tmp = tmp.groupby("_xbin", as_index=False).agg({x: "min", y: "max"}).sort_values(x, ascending=True)
+
     best = -1e100
-    keep_idx = []
-    for idx, row in tmp.iterrows():
+    keep_rows = []
+    for _, row in tmp.iterrows():
         val = float(row[y])
-        if val > best:
+        if val > best + y_eps:
             best = val
-            keep_idx.append(idx)
-    return df.loc[keep_idx].sort_values(x, ascending=True)
+            keep_rows.append(row)
+
+    out = pd.DataFrame(keep_rows)
+    # Ensure x,y columns exist for downstream plotting.
+    return out[[x, y]].sort_values(x, ascending=True)
+
+
+def _pareto_frontier_rows(
+    df: pd.DataFrame,
+    x: str,
+    y: str,
+    *,
+    x_round: int = 6,
+    y_eps: float = 1e-12,
+) -> pd.DataFrame:
+    """Return Pareto frontier *rows* from the original dataframe.
+
+    We maximize y and minimize x. This version keeps the original row payload (config_id, label, trades, etc.)
+    so we can show a frontier table and better hover text.
+
+    Implementation:
+    1) Round x into bins to collapse near-duplicates (avoids ugly vertical barcode segments).
+    2) Within each x-bin, pick the row with max y.
+    3) Sweep increasing x and keep only rows that strictly improve y (epsilon to avoid float jitter).
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    tmp = df.copy()
+    tmp[x] = pd.to_numeric(tmp[x], errors="coerce")
+    tmp[y] = pd.to_numeric(tmp[y], errors="coerce")
+    tmp = tmp.dropna(subset=[x, y])
+    if tmp.empty:
+        return pd.DataFrame()
+
+    tmp["_xbin"] = tmp[x].round(x_round)
+
+    # Pick best-y row per bin (if ties, idxmax returns first occurrence).
+    try:
+        idx = tmp.groupby("_xbin")[y].idxmax()
+        cand = tmp.loc[idx].sort_values(x, ascending=True)
+    except Exception:
+        # Fallback: no groupby for weird data
+        cand = tmp.sort_values([x, y], ascending=[True, False]).drop_duplicates("_xbin", keep="first")
+
+    best = -1e100
+    keep_rows = []
+    for _, row in cand.iterrows():
+        val = float(row[y])
+        if val > best + y_eps:
+            best = val
+            keep_rows.append(row)
+
+    out = pd.DataFrame(keep_rows).drop(columns=["_xbin"], errors="ignore")
+    return out.sort_values(x, ascending=True)
+
 
 
 def _goodness_percentile(s: pd.Series, *, low_is_good: bool) -> pd.Series:
@@ -893,25 +967,50 @@ def rolling_questions() -> List[QuestionSpec]:
 
 def walkforward_questions() -> List[QuestionSpec]:
     # Walkforward metrics are produced by engine.walkforward -> wf_summary.csv
-    # and are not currently in lab.metrics, so we keep labels simple here.
+    #
+    # Philosophy: WF exists to punish "in-sample optimism".
+    # Defaults below are intentionally mild (WARN/INFO) so users can explore,
+    # but the questions steer attention toward worst-case and stability.
     return [
         QuestionSpec(
-            id="wf_median",
-            title="Do you require the typical walk-forward window to be positive?",
-            explanation="Median return across walk-forward windows.",
+            id="wf_typical",
+            title="Do you require typical walk-forward performance to be positive?",
+            explanation="Median (p50) return across walk-forward windows.",
             choices=[
-                ChoiceSpec("Yes (median window return ≥ 0)", [ConstraintSpec("median_window_return", ">=", 0.0, "warn")]),
+                ChoiceSpec("Yes (p50 ≥ 0)", [ConstraintSpec("return_p50", ">=", 0.0, "warn")]),
                 ChoiceSpec("No", []),
             ],
             default_index=0,
         ),
         QuestionSpec(
-            id="wf_min",
-            title="How bad can the worst walk-forward window be?",
-            explanation="Minimum window return across walk-forward windows.",
+            id="wf_worst_typical",
+            title="How negative can the 'worst typical' window be?",
+            explanation="10th percentile (p10) return across windows. This is a good 'robustness' anchor.",
             choices=[
-                ChoiceSpec("Worst window must be ≥ -10%", [ConstraintSpec("min_window_return", ">=", -0.10, "warn")]),
-                ChoiceSpec("Worst window must be ≥ -25%", [ConstraintSpec("min_window_return", ">=", -0.25, "info")]),
+                ChoiceSpec("p10 ≥ -5%", [ConstraintSpec("return_p10", ">=", -0.05, "warn")]),
+                ChoiceSpec("p10 ≥ -10%", [ConstraintSpec("return_p10", ">=", -0.10, "info")]),
+                ChoiceSpec("Don't filter on this", []),
+            ],
+            default_index=1,
+        ),
+        QuestionSpec(
+            id="wf_min",
+            title="How bad can the single worst window be?",
+            explanation="Minimum window return across all walk-forward windows (the absolute faceplant).",
+            choices=[
+                ChoiceSpec("Worst ≥ -10%", [ConstraintSpec("min_window_return", ">=", -0.10, "warn")]),
+                ChoiceSpec("Worst ≥ -25%", [ConstraintSpec("min_window_return", ">=", -0.25, "info")]),
+                ChoiceSpec("Don't filter on this", []),
+            ],
+            default_index=1,
+        ),
+        QuestionSpec(
+            id="wf_dd",
+            title="How much drawdown pain can you tolerate in walk-forward?",
+            explanation="90th percentile max drawdown (dd_p90) across windows. Lower is better.",
+            choices=[
+                ChoiceSpec("dd_p90 ≤ 20%", [ConstraintSpec("dd_p90", "<=", 0.20, "warn")]),
+                ChoiceSpec("dd_p90 ≤ 35%", [ConstraintSpec("dd_p90", "<=", 0.35, "info")]),
                 ChoiceSpec("Don't filter on this", []),
             ],
             default_index=1,
@@ -921,8 +1020,19 @@ def walkforward_questions() -> List[QuestionSpec]:
             title="How consistent should it be across windows?",
             explanation="Percent of windows with positive return.",
             choices=[
-                ChoiceSpec("At least 60% of windows profitable", [ConstraintSpec("pct_profitable_windows", ">=", 0.60, "warn")]),
-                ChoiceSpec("At least 50% of windows profitable", [ConstraintSpec("pct_profitable_windows", ">=", 0.50, "info")]),
+                ChoiceSpec("≥ 60% profitable windows", [ConstraintSpec("pct_profitable_windows", ">=", 0.60, "warn")]),
+                ChoiceSpec("≥ 50% profitable windows", [ConstraintSpec("pct_profitable_windows", ">=", 0.50, "info")]),
+                ChoiceSpec("Don't filter on this", []),
+            ],
+            default_index=1,
+        ),
+        QuestionSpec(
+            id="wf_trading",
+            title="Should it actually trade in most windows?",
+            explanation="Percent of windows with at least 1 trade. Avoids strategies that only 'wake up' rarely.",
+            choices=[
+                ChoiceSpec("≥ 80% windows traded", [ConstraintSpec("pct_windows_traded", ">=", 0.80, "warn")]),
+                ChoiceSpec("≥ 60% windows traded", [ConstraintSpec("pct_windows_traded", ">=", 0.60, "info")]),
                 ChoiceSpec("Don't filter on this", []),
             ],
             default_index=1,
@@ -1827,6 +1937,24 @@ if stage_pick == "batch":
         plot_df["_label"] = plot_df[label_col].astype(str) if label_col else ""
         plot_df["_verdict"] = plot_df[verdict_col].astype(str) if verdict_col else "?"
 
+        # Frontier hygiene: by default, ignore ultra-low-activity configs so the frontier is meaningful.
+        # (Otherwise you often get near-zero drawdown "do nothing" configs anchoring the left edge.)
+        max_tr = int(max(0.0, float(pd.to_numeric(plot_df["_trades"], errors="coerce").max() or 0.0)))
+        max_slider = max(0, min(200, max_tr))
+        default_tr = 3 if max_slider >= 3 else max_slider
+        frontier_min_trades = st.slider(
+            "Pareto frontier: min trades",
+            min_value=0,
+            max_value=max_slider,
+            value=default_tr,
+            step=1,
+            help="Frontier is shown only among configs with at least this many trades (to avoid 'do nothing' near-zero DD anchors).",
+        )
+
+        frontier_df = plot_df
+        if frontier_min_trades > 0:
+            frontier_df = plot_df[plot_df["_trades"] >= frontier_min_trades].copy()
+
         # Scatter: profit vs drawdown
         fig = px.scatter(
             plot_df,
@@ -1853,20 +1981,37 @@ if stage_pick == "batch":
         )
 
         # Pareto frontier overlay (can't improve profit without worsening drawdown)
-        frontier = _pareto_frontier(plot_df, "_dd", "_profit")
+        frontier = _pareto_frontier_rows(frontier_df, "_dd", "_profit")
         if not frontier.empty:
+            hover_text = None
+            if "_label" in frontier.columns and "config_id" in frontier.columns:
+                hover_text = frontier["_label"].astype(str) + " • " + frontier["config_id"].astype(str)
+            elif "_label" in frontier.columns:
+                hover_text = frontier["_label"].astype(str)
+            elif "config_id" in frontier.columns:
+                hover_text = frontier["config_id"].astype(str)
+
             fig.add_trace(
                 go.Scatter(
                     x=frontier["_dd"],
                     y=frontier["_profit"],
                     mode="lines+markers",
                     name="Pareto frontier",
+                    text=hover_text,
+                    hovertemplate="%{text}<br>dd=%{x:.4f}<br>profit=%{y:.2f}<extra></extra>",
                     line=dict(width=2),
                 )
             )
 
         st.plotly_chart(fig, use_container_width=True)
 
+        # Quick sanity: list frontier points (helps confirm it's "real" and not plotting artifacts)
+        with st.expander("Pareto frontier points", expanded=False):
+            if frontier.empty:
+                st.caption("No frontier points available (check filters).")
+            else:
+                show_cols = [c for c in ["config_id", "_label", "_verdict", "_trades", "_dd", "_profit"] if c in frontier.columns]
+                st.dataframe(frontier[show_cols].sort_values("_dd", ascending=True), use_container_width=True)
     else:
         st.info("Scatter plot unavailable (missing Plotly or required columns).")
 
@@ -1919,7 +2064,7 @@ if stage_pick == "batch":
     # ---------------------------------------------------------------------
     # Heatmap table (percentiles) for quick pattern recognition
     # ---------------------------------------------------------------------
-    st.write("#### Quick scan heatmap (percentiles among shown rows)")
+    st.write("#### Quick scan heatmap (scores among shown rows — higher is better)")
     heat_base = df_show.copy()
     n = len(heat_base)
 
@@ -1937,7 +2082,7 @@ if stage_pick == "batch":
     if dd_col:
         dd_frac = _drawdown_to_frac(heat_base[dd_col])
         heat["max_dd"] = dd_frac
-        heat["dd_%ile"] = (_goodness_percentile(dd_frac, low_is_good=True) * 100.0).round(1)
+        heat["dd_good_%ile"] = (_goodness_percentile(dd_frac, low_is_good=True) * 100.0).round(1)
     if trades_col:
         heat["trades"] = _to_float_series(heat_base[trades_col]).round(0)
         # More trades generally = more evidence; treat low-is-bad (so low_is_good=False)
@@ -2000,6 +2145,7 @@ if stage_pick == "batch":
         replay_dir = run_dir / "replay_cache" / str(pick)
         art_dir = replay_dir if (replay_dir / "equity_curve.csv").exists() else top_map.get(str(pick), replay_dir)
 
+        replay_dl_items: List[Tuple[str, bytes, str]] = []
         eq_path = art_dir / "equity_curve.csv"
         can_replay = (run_dir / "configs_resolved.jsonl").exists()
         if not eq_path.exists():
@@ -2069,80 +2215,466 @@ if stage_pick == "batch":
                     except Exception:
                         pass
 
-                    # Plot equity
-                    try:
-                        chart_idx = t if t.notna().any() else eq_df[tcol]
-                        st.line_chart(pd.DataFrame({"equity": equity.values}, index=chart_idx)["equity"])
-                    except Exception:
-                        st.line_chart(eq_df.set_index(tcol)["equity"])
+                                        # -----------------------------------------------------------------
+                    # Replay charts (juicy + interpretable)
+                    # -----------------------------------------------------------------
+                    trades_path = art_dir / "trades.csv"
+                    fills_path = art_dir / "fills.csv"
 
-                    # Optional: drawdown curve
+                    # Build a plot-friendly frame
                     try:
-                        eq2 = pd.to_numeric(equity, errors="coerce").fillna(method="ffill")
-                        peak = eq2.cummax()
-                        dd = (eq2 / peak - 1.0).fillna(0.0)
-                        st.line_chart(pd.DataFrame({"drawdown": dd.values}, index=(t if t.notna().any() else eq_df[tcol]))["drawdown"])
+                        t_idx = t if t.notna().any() else pd.to_datetime(eq_df[tcol], errors="coerce")
+                    except Exception:
+                        t_idx = pd.to_datetime(eq_df[tcol], errors="coerce")
+
+                    plot_df = pd.DataFrame(
+                        {
+                            "dt": t_idx,
+                            "equity": pd.to_numeric(eq_df.get("equity"), errors="coerce"),
+                            "cash": pd.to_numeric(eq_df.get("cash"), errors="coerce") if "cash" in eq_df.columns else np.nan,
+                            "price": pd.to_numeric(eq_df.get("price"), errors="coerce") if "price" in eq_df.columns else np.nan,
+                            "pos_qty": pd.to_numeric(eq_df.get("pos_qty"), errors="coerce") if "pos_qty" in eq_df.columns else np.nan,
+                            "cashflow": pd.to_numeric(eq_df.get("cashflow"), errors="coerce") if "cashflow" in eq_df.columns else 0.0,
+                        }
+                    )
+                    plot_df = plot_df.dropna(subset=["dt"]).sort_values("dt")
+                    plot_df["pos_value"] = plot_df["pos_qty"] * plot_df["price"] if ("pos_qty" in plot_df.columns and "price" in plot_df.columns) else np.nan
+                    plot_df["exposure"] = np.nan
+                    try:
+                        pv = pd.to_numeric(plot_df["pos_value"], errors="coerce")
+                        eqv = pd.to_numeric(plot_df["equity"], errors="coerce")
+                        plot_df["exposure"] = (pv.abs() / eqv.replace(0.0, np.nan)).clip(0.0, 5.0)
                     except Exception:
                         pass
 
-                st.download_button(
-                    "Download replay equity_curve.csv",
-                    data=eq_path.read_bytes(),
-                    file_name=f"{selected_run_name}_{pick}_equity_curve.csv",
-                )
+                    # Load trades for markers (if present)
+                    td = None
+                    if trades_path.exists():
+                        try:
+                            td = pd.read_csv(trades_path)
+                        except Exception:
+                            td = None
+
+                    def _nearest_y(ts: pd.Series) -> np.ndarray:
+                        # Nearest equity values for a series of datetimes
+                        x = plot_df["dt"].to_numpy(dtype="datetime64[ns]")
+                        y = plot_df["equity"].to_numpy(dtype=float)
+                        t_arr = pd.to_datetime(ts, errors="coerce").to_numpy(dtype="datetime64[ns]")
+                        out = np.full(len(t_arr), np.nan, dtype=float)
+                        if len(x) == 0:
+                            return out
+                        # Searchsorted gives insertion point; compare neighbors to pick nearest
+                        idxs = np.searchsorted(x, t_arr, side="left")
+                        idxs = np.clip(idxs, 0, len(x) - 1)
+                        prev = np.clip(idxs - 1, 0, len(x) - 1)
+                        # Choose prev when it's closer
+                        choose_prev = np.abs(t_arr - x[prev]) <= np.abs(x[idxs] - t_arr)
+                        best = np.where(choose_prev, prev, idxs)
+                        out = y[best]
+                        return out
+
+                    tab_eq, tab_cash, tab_exp = st.tabs(["Equity + Trades", "Cash vs Position", "Exposure"])
+
+                    with tab_eq:
+                        fig = go.Figure()
+                        fig.add_trace(go.Scatter(x=plot_df["dt"], y=plot_df["equity"], mode="lines", name="Equity"))
+
+                        # Deposit / cashflow markers (spot/DCA interpretable moment)
+                        try:
+                            cf = pd.to_numeric(plot_df["cashflow"], errors="coerce").fillna(0.0)
+                            mask = cf.abs() > 1e-9
+                            if mask.any():
+                                fig.add_trace(
+                                    go.Scatter(
+                                        x=plot_df.loc[mask, "dt"],
+                                        y=plot_df.loc[mask, "equity"],
+                                        mode="markers",
+                                        name="Cashflow",
+                                        marker=dict(size=6, symbol="circle-open"),
+                                        hovertemplate="dt=%{x}<br>cashflow=%{customdata:,.2f}<extra></extra>",
+                                        customdata=cf.loc[mask].to_numpy(),
+                                    )
+                                )
+                        except Exception:
+                            pass
+
+                        # Trade markers
+                        if td is not None and not td.empty and "entry_dt" in td.columns:
+                            try:
+                                entry_t = pd.to_datetime(td["entry_dt"], errors="coerce")
+                                entry_y = _nearest_y(entry_t)
+                                fig.add_trace(
+                                    go.Scatter(
+                                        x=entry_t,
+                                        y=entry_y,
+                                        mode="markers",
+                                        name="Entry",
+                                        marker=dict(size=8, symbol="triangle-up"),
+                                        hovertemplate="entry=%{x}<extra></extra>",
+                                    )
+                                )
+                            except Exception:
+                                pass
+
+                        if td is not None and not td.empty and "exit_dt" in td.columns:
+                            try:
+                                exit_t = pd.to_datetime(td["exit_dt"], errors="coerce")
+                                exit_mask = exit_t.notna()
+                                exit_t2 = exit_t[exit_mask]
+                                exit_y = _nearest_y(exit_t2)
+                                # If we have net_pnl, pass it as customdata so you can see winners/losers on hover
+                                custom = None
+                                if "net_pnl" in td.columns:
+                                    custom = pd.to_numeric(td.loc[exit_mask, "net_pnl"], errors="coerce").to_numpy()
+                                fig.add_trace(
+                                    go.Scatter(
+                                        x=exit_t2,
+                                        y=exit_y,
+                                        mode="markers",
+                                        name="Exit",
+                                        marker=dict(size=8, symbol="triangle-down"),
+                                        hovertemplate="exit=%{x}<br>net_pnl=%{customdata:,.2f}<extra></extra>",
+                                        customdata=custom,
+                                    )
+                                )
+                            except Exception:
+                                pass
+
+                        fig.update_layout(margin=dict(l=10, r=10, t=10, b=10), height=420, legend=dict(orientation="h"))
+                        st.plotly_chart(fig, use_container_width=True)
+
+                        # Drawdown (with max-DD episode shading)
+                        try:
+                            eq2 = pd.to_numeric(plot_df["equity"], errors="coerce").fillna(method="ffill")
+                            dt2 = pd.to_datetime(plot_df["dt"], errors="coerce")
+                            peak = eq2.cummax()
+                            dd = (eq2 / peak - 1.0).fillna(0.0)
+
+                            # Identify max drawdown episode (peak -> trough -> recovery if any)
+                            x0 = None
+                            x1 = None
+                            try:
+                                if len(dd):
+                                    trough_i = int(np.nanargmin(dd.to_numpy()))
+                                    peak_val = float(peak.iloc[trough_i])
+
+                                    # start = last time equity touched the high-water mark before the trough
+                                    pre_eq = eq2.iloc[:trough_i]  # exclude trough itself
+                                    if len(pre_eq):
+                                        hit = pre_eq >= peak_val * (1.0 - 1e-9)
+                                        if hit.any():
+                                            start_pos = int(np.flatnonzero(hit.to_numpy())[-1])
+                                            x0 = dt2.iloc[start_pos]
+
+                                    # recovery = first time AFTER the trough equity >= peak
+                                    post_eq = eq2.iloc[trough_i + 1 :]
+                                    if len(post_eq):
+                                        rec_mask = post_eq >= peak_val * (1.0 - 1e-9)
+                                        if rec_mask.any():
+                                            rec_rel = int(np.flatnonzero(rec_mask.to_numpy())[0])
+                                            x1 = dt2.iloc[trough_i + 1 + rec_rel]
+
+                                    # If never recovered, shade peak->trough so the user still sees "the bad zone"
+                                    if x0 is not None and x1 is None:
+                                        x1 = dt2.iloc[min(trough_i, len(dt2) - 1)]
+                            except Exception:
+                                x0 = None
+                                x1 = None
+
+                            fig2 = go.Figure()
+                            fig2.add_trace(go.Scatter(x=dt2, y=dd, mode="lines", name="Drawdown"))
+
+                            if x0 is not None and x1 is not None and pd.notna(x0) and pd.notna(x1):
+                                fig2.add_vrect(
+                                    x0=x0,
+                                    x1=x1,
+                                    fillcolor="rgba(200,0,0,0.08)",
+                                    line_width=0,
+                                    annotation_text="Max DD episode",
+                                    annotation_position="top left",
+                                    annotation_font_size=10,
+                                )
+
+                            fig2.update_layout(margin=dict(l=10, r=10, t=10, b=10), height=260, legend=dict(orientation="h"))
+                            st.plotly_chart(fig2, use_container_width=True)
+                        except Exception:
+                            pass
+
+                    with tab_cash:
+                        fig = go.Figure()
+                        if "cash" in plot_df.columns:
+                            fig.add_trace(go.Scatter(x=plot_df["dt"], y=plot_df["cash"], mode="lines", name="Cash"))
+                        if "pos_value" in plot_df.columns:
+                            fig.add_trace(go.Scatter(x=plot_df["dt"], y=plot_df["pos_value"], mode="lines", name="Position value"))
+                        fig.add_trace(go.Scatter(x=plot_df["dt"], y=plot_df["equity"], mode="lines", name="Equity"))
+                        fig.update_layout(margin=dict(l=10, r=10, t=10, b=10), height=360, legend=dict(orientation="h"))
+                        st.plotly_chart(fig, use_container_width=True)
+
+                    with tab_exp:
+                        if "exposure" in plot_df.columns and plot_df["exposure"].notna().any():
+                            fig = go.Figure()
+                            fig.add_trace(go.Scatter(x=plot_df["dt"], y=plot_df["exposure"], mode="lines", name="Exposure (pos_value / equity)"))
+                            fig.update_layout(margin=dict(l=10, r=10, t=10, b=10), height=320, legend=dict(orientation="h"))
+                            st.plotly_chart(fig, use_container_width=True)
+                        else:
+                            st.caption("Exposure chart unavailable (missing pos_qty/price/equity columns).")
+
+
+                    # -----------------------------------------------------------------
+                    # Strategy story (interpretable summary from replay artifacts)
+                    # -----------------------------------------------------------------
+                    with st.expander("Strategy story (replay)", expanded=True):
+                        # --- Drawdown story ---
+                        try:
+                            eq_series = pd.to_numeric(plot_df["equity"], errors="coerce").fillna(method="ffill")
+                            dt_series = pd.to_datetime(plot_df["dt"], errors="coerce")
+                            peak = eq_series.cummax()
+                            dd = (eq_series / peak - 1.0).fillna(0.0)
+
+                            dd_min = float(dd.min()) if len(dd) else float("nan")
+                            dd_trough_i = int(np.nanargmin(dd.to_numpy())) if len(dd) else None
+
+                            dd_start_dt = None
+                            dd_trough_dt = None
+                            dd_recover_dt = None
+                            dd_peak_val = None
+
+                            if dd_trough_i is not None and math.isfinite(dd_min):
+                                dd_trough_dt = dt_series.iloc[dd_trough_i]
+                                dd_peak_val = float(peak.iloc[dd_trough_i])
+                            
+                                # peak date = last time equity touched the high-water mark before the trough
+                                pre_eq = eq_series.iloc[:dd_trough_i]  # exclude trough itself
+                                if len(pre_eq):
+                                    hit = pre_eq >= dd_peak_val * (1.0 - 1e-9)
+                                    if hit.any():
+                                        start_pos = int(np.flatnonzero(hit.to_numpy())[-1])
+                                        dd_start_dt = dt_series.iloc[start_pos]
+                                    else:
+                                        dd_start_dt = dt_series.iloc[0]
+                                else:
+                                    dd_start_dt = dt_series.iloc[0]
+                            
+                                # recovery date = first time AFTER trough equity >= peak value
+                                post_eq = eq_series.iloc[dd_trough_i + 1 :]
+                                if len(post_eq):
+                                    rec_mask = post_eq >= dd_peak_val * (1.0 - 1e-9)
+                                    if rec_mask.any():
+                                        rec_rel = int(np.flatnonzero(rec_mask.to_numpy())[0])
+                                        dd_recover_dt = dt_series.iloc[dd_trough_i + 1 + rec_rel]
+
+                            # underwater longest segment
+                            underwater = eq_series < peak * (1.0 - 1e-12)
+                            uw = underwater.astype(int)
+                            seg = (uw.diff().fillna(0).abs() > 0).cumsum()
+
+                            longest_days = None
+                            longest_start = None
+                            longest_end = None
+                            if underwater.any():
+                                for sid, grp in plot_df.loc[underwater].groupby(seg[underwater]):
+                                    dts = pd.to_datetime(grp["dt"], errors="coerce")
+                                    if dts.notna().any():
+                                        dur = (dts.max() - dts.min()).total_seconds() / 86400.0
+                                        if (longest_days is None) or (dur > longest_days):
+                                            longest_days = dur
+                                            longest_start = dts.min()
+                                            longest_end = dts.max()
+
+                            c1, c2, c3, c4 = st.columns(4)
+                            c1.metric("Max drawdown", _fmt_pct(dd_min))
+                            c2.metric("DD peak", f"{dd_start_dt.date()}" if dd_start_dt is not None else "n/a")
+                            c3.metric("DD trough", f"{dd_trough_dt.date()}" if dd_trough_dt is not None else "n/a")
+                            if dd_recover_dt is not None and dd_start_dt is not None:
+                                days = (dd_recover_dt - dd_start_dt).total_seconds() / 86400.0
+                                c4.metric("DD to recovery", f"{days:.0f} days")
+                                st.caption(f"Recovery: {dd_recover_dt.date()}")
+                            else:
+                                c4.metric("DD to recovery", "not recovered" if dd_start_dt is not None else "n/a")
+
+                            if longest_days is not None and longest_start is not None and longest_end is not None:
+                                st.caption(f"Longest underwater: {longest_days:.0f} days ({longest_start.date()} → {longest_end.date()})")
+                        except Exception:
+                            st.info("Drawdown story unavailable (missing equity series).")
+
+                        st.divider()
+
+                        # --- Trades story ---
+                        if td is None or td.empty:
+                            st.info("No trades.csv found for this replay yet.")
+                        else:
+                            tdf = td.copy()
+                            if "net_pnl" in tdf.columns:
+                                pnl = pd.to_numeric(tdf["net_pnl"], errors="coerce")
+                            elif "pnl" in tdf.columns:
+                                pnl = pd.to_numeric(tdf["pnl"], errors="coerce")
+                            else:
+                                pnl = pd.Series([np.nan] * len(tdf))
+
+                            wins = pnl > 0
+                            win_rate = float(wins.mean()) if len(pnl.dropna()) else float("nan")
+                            gross_win = float(pnl[wins].sum()) if wins.any() else 0.0
+                            gross_loss = float(pnl[~wins].sum()) if (~wins).any() else 0.0
+                            profit_factor = (gross_win / abs(gross_loss)) if gross_loss < 0 else float("inf") if gross_win > 0 else float("nan")
+
+                            best_trade = float(pnl.max()) if pnl.notna().any() else float("nan")
+                            worst_trade = float(pnl.min()) if pnl.notna().any() else float("nan")
+
+                            hold_days = None
+                            if "entry_dt" in tdf.columns and "exit_dt" in tdf.columns:
+                                ed = pd.to_datetime(tdf["entry_dt"], errors="coerce")
+                                xd = pd.to_datetime(tdf["exit_dt"], errors="coerce")
+                                hold = (xd - ed).dt.total_seconds() / 86400.0
+                                hold_days = float(hold.mean()) if hold.notna().any() else None
+
+                            exp_mean = float(pd.to_numeric(plot_df.get("exposure"), errors="coerce").mean()) if "exposure" in plot_df.columns else float("nan")
+                            exp_max = float(pd.to_numeric(plot_df.get("exposure"), errors="coerce").max()) if "exposure" in plot_df.columns else float("nan")
+
+                            c1, c2, c3, c4 = st.columns(4)
+                            c1.metric("Win rate", _fmt_pct(win_rate))
+                            c2.metric("Profit factor", _fmt_num(profit_factor, digits=2) if math.isfinite(profit_factor) else "∞" if profit_factor == float("inf") else "n/a")
+                            c3.metric("Best / Worst trade", f"{_fmt_money(best_trade)} / {_fmt_money(worst_trade)}")
+                            c4.metric("Avg exposure", _fmt_pct(exp_mean))
+
+                            if hold_days is not None:
+                                st.caption(f"Avg hold time: {hold_days:.1f} days · Max exposure: {_fmt_pct(exp_max)}")
+
+                            show_cols = []
+                            for c in ["entry_dt", "exit_dt", "entry_price", "exit_price", "qty", "net_pnl", "fees", "reason", "exit_reason"]:
+                                if c in tdf.columns:
+                                    show_cols.append(c)
+                            if "net_pnl" not in tdf.columns:
+                                tdf["net_pnl"] = pnl
+
+                            st.write("**Top trades**")
+                            left, right = st.columns(2)
+                            with left:
+                                st.caption("Best (by net_pnl)")
+                                st.dataframe(tdf.sort_values("net_pnl", ascending=False).head(5)[show_cols or ["net_pnl"]], use_container_width=True, height=220)
+                            with right:
+                                st.caption("Worst (by net_pnl)")
+                                st.dataframe(tdf.sort_values("net_pnl", ascending=True).head(5)[show_cols or ["net_pnl"]], use_container_width=True, height=220)
+
+                        st.divider()
+
+                        # --- Cashflow story ---
+                        try:
+                            cf = pd.to_numeric(plot_df.get("cashflow"), errors="coerce").fillna(0.0)
+                            mask = cf.abs() > 1e-9
+                            if mask.any():
+                                n = int(mask.sum())
+                                total = float(cf[mask].sum())
+                                avg = float(cf[mask].mean())
+                                st.write("**Cashflows (deposits/withdrawals)**")
+                                c1, c2, c3 = st.columns(3)
+                                c1.metric("Cashflow events", f"{n}")
+                                c2.metric("Total cashflow", _fmt_money(total))
+                                c3.metric("Avg event size", _fmt_money(avg))
+                            else:
+                                st.caption("No cashflows recorded in equity curve.")
+                        except Exception:
+                            pass
+
+                # Stash replay exports for the Exports dropdown below
+                replay_dl_items = [
+                    (
+                        "Download replay equity_curve.csv",
+                        eq_path.read_bytes(),
+                        f"{selected_run_name}_{pick}_equity_curve.csv",
+                    )
+                ]
                 trades_path = art_dir / "trades.csv"
                 fills_path = art_dir / "fills.csv"
                 if trades_path.exists():
-                    st.download_button(
-                        "Download replay trades.csv",
-                        data=trades_path.read_bytes(),
-                        file_name=f"{selected_run_name}_{pick}_trades.csv",
+                    replay_dl_items.append(
+                        (
+                            "Download replay trades.csv",
+                            trades_path.read_bytes(),
+                            f"{selected_run_name}_{pick}_trades.csv",
+                        )
                     )
                 if fills_path.exists():
-                    st.download_button(
-                        "Download replay fills.csv",
-                        data=fills_path.read_bytes(),
-                        file_name=f"{selected_run_name}_{pick}_fills.csv",
+                    replay_dl_items.append(
+                        (
+                            "Download replay fills.csv",
+                            fills_path.read_bytes(),
+                            f"{selected_run_name}_{pick}_fills.csv",
+                        )
                     )
             except Exception as e:
                 st.warning(f"Could not load replay artifacts: {e}")
         else:
             st.caption("Replay artifacts not found yet for this config_id.")
-
     # ---------------------------------------------------------------------
-    # Raw table (advanced)
+    # Exports (advanced)
     # ---------------------------------------------------------------------
-    with st.expander("Raw table (advanced)", expanded=False):
-        cols = [
-            "config_id",
-            "config.label",
-            "batch.verdict",
-            "equity.net_profit_ex_cashflows",
-            "performance.twr_total_return",
-            "performance.max_drawdown_equity",
-            "trades_summary.trades_closed",
-        ]
-        for c in ["score.calmar_equity", "score.profit_dd", "score.twr_dd", "score.profit"]:
-            if c in df_show.columns and c not in cols:
-                cols.append(c)
-        cols = [c for c in cols if c in df_show.columns]
-        st.dataframe(df_show[cols], use_container_width=True, height=520)
+    with st.expander("Exports (advanced)", expanded=False):
+        if replay_dl_items:
+            st.write("**Replay exports**")
+            for label, data, fname in replay_dl_items:
+                st.download_button(label, data=data, file_name=fname)
+            st.divider()
 
-    st.download_button(
-        "Download batch survivors (CSV)",
-        data=df_show.to_csv(index=False).encode("utf-8"),
-        file_name=f"{selected_run_name}_batch_view.csv",
-    )
+        st.write("**Batch exports**")
+        st.download_button(
+            "Download batch survivors (CSV)",
+            data=df_show.to_csv(index=False).encode("utf-8"),
+            file_name=f"{selected_run_name}_batch_view.csv",
+        )
+
+        show_raw = st.checkbox("Show raw table", value=False, key="ui.batch.show_raw")
+        if show_raw:
+                cols = [
+                    "config_id",
+                    "config.label",
+                    "batch.verdict",
+                    "equity.net_profit_ex_cashflows",
+                    "performance.twr_total_return",
+                    "performance.max_drawdown_equity",
+                    "trades_summary.trades_closed",
+                ]
+                for c in ["score.calmar_equity", "score.profit_dd", "score.twr_dd", "score.profit"]:
+                    if c in df_show.columns and c not in cols:
+                        cols.append(c)
+                cols = [c for c in cols if c in df_show.columns]
+                st.dataframe(df_show[cols], use_container_width=True, height=520)
 
     st.divider()
-    st.write("Next: run Rolling Starts to measure start-date fragility.")
+    c_next, _ = st.columns([1, 4])
+    with c_next:
+        if st.button("Next: Rolling Starts →", type="primary"):
+            st.session_state["ui.stage"] = "rs"
+            st.rerun()
+    st.caption("Next: run Rolling Starts to measure start-date fragility.")
 
 # =============================================================================
 # Stage B: Rolling Starts
 # =============================================================================
 
-elif stage_pick == "rs":
+if stage_pick == "rs":
     st.write("### B) Rolling Starts (start-date sensitivity)")
+    with st.expander("How to read Rolling Starts", expanded=True):
+        st.markdown(
+            """
+Rolling Starts reruns the **same** strategy many times — each run starts on a different date.
+It answers the quant-flavored question: **is this edge real, or is it just “you started on the right day”?**
+
+**How to read the summary numbers**
+- **Windows**: number of start dates tested. More is better. **< 10 is noisy**.
+- **Return p10 / p50 / p90**: pessimistic / typical / optimistic outcomes across start dates.
+- **DD p90**: a “bad-but-plausible” max drawdown. Lower is better.
+- **Underwater p90 (days)**: how long you’re likely to be stuck below your prior equity peak.
+- **Fragility (spread p90 − p10)**: how wide outcomes swing across start dates. **Smaller = more stable.**
+
+**How to read the charts**
+- Each dot = one rolling-start window (one start date).
+- Tight clusters are good. Wild scatter means **start-date luck** dominates.
+- Dashed line = median (p50). Dotted lines = p10 / p90.
+
+Rule of thumb: prefer strategies with a **decent p10** (survives bad starts), not just a spicy p50.
+            """
+        )
+
     st.caption("Runs the same strategy many times with different starting days, to measure fragility.")
 
     # RS selection / settings
@@ -2162,23 +2694,62 @@ elif stage_pick == "rs":
         )
         rs_dir = (rs_root / rs_choice) if (rs_choice != "(none)") else None
 
-    with right:
-        st.write("**Quick presets**")
-        preset = st.selectbox("Preset", options=["Quick", "Standard", "Thorough"], index=0, key="rs.preset")
+        with right:
+            st.write("**Quick presets**")
 
-        if preset == "Quick":
-            start_step = 90
-            min_bars = 365
-        elif preset == "Standard":
-            start_step = 30
-            min_bars = 365
-        else:
-            start_step = 15
-            min_bars = 365
+            bars_per_day = _bars_per_day_from_run_meta(run_dir)
+            bar_hint = _human_bar_interval_from_run(run_dir)
+            st.caption(f"Detected timeframe: {bar_hint} (≈ {bars_per_day} bars/day)")
 
-        start_step = int(st.number_input("Start step (bars)", 1, 365, int(start_step), 5, key="rs.start_step"))
-        min_bars = int(st.number_input("Min bars per start", 30, 5000, int(min_bars), 30, key="rs.min_bars"))
-        min_bars_effective = int(min_bars)  # placeholder for future clamping logic
+            preset = st.selectbox("Preset", options=["Quick", "Standard", "Thorough"], index=0, key="rs.preset")
+
+            # Apply defaults only when preset changes (so number inputs don't reset constantly).
+            prev = st.session_state.get("rs.preset_prev")
+            if prev != preset:
+                if bars_per_day <= 2:
+                    # Daily-ish bars: space starts out in days, and require a long minimum history
+                    if preset == "Quick":
+                        step_days, min_days = 30, 365
+                    elif preset == "Standard":
+                        step_days, min_days = 14, 365
+                    else:
+                        step_days, min_days = 7, 365
+                else:
+                    # Intraday: still think in calendar days (convert to bars), but min history can be shorter
+                    if preset == "Quick":
+                        step_days, min_days = 7, 60
+                    elif preset == "Standard":
+                        step_days, min_days = 3, 90
+                    else:
+                        step_days, min_days = 1, 120
+
+                st.session_state["rs.start_step"] = int(max(1, round(step_days * bars_per_day)))
+                st.session_state["rs.min_bars"] = int(max(30, round(min_days * bars_per_day)))
+                st.session_state["rs.preset_prev"] = preset
+
+            start_step = int(
+                st.number_input(
+                    "Start step (bars)",
+                    1,
+                    500000,
+                    int(st.session_state.get("rs.start_step", max(1, int(round(7 * bars_per_day))))),
+                    5,
+                    key="rs.start_step",
+                )
+            )
+            min_bars = int(
+                st.number_input(
+                    "Min bars per start",
+                    30,
+                    5000000,
+                    int(st.session_state.get("rs.min_bars", max(30, int(round(60 * bars_per_day))))),
+                    30,
+                    key="rs.min_bars",
+                )
+            )
+            st.caption(f"Preset interpretation: start every ~{max(1, round(start_step / max(1e-9, bars_per_day))):.0f} days; require ~{max(1, round(min_bars / max(1e-9, bars_per_day))):.0f} days of data per start.")
+
+            min_bars_effective = int(min_bars)  # placeholder for future clamping logic
 
     # Compute survivor ids (we stress test every survivor in full_passed if available, else sweep_passed)
     survivors_ids = survivors["config_id"].astype(str).tolist()
@@ -2269,37 +2840,410 @@ elif stage_pick == "rs":
         keep.append("FAIL")
     df_show = dfB[dfB["rsq.verdict"].isin(keep)].copy()
 
+    
+if stage_pick == "rs":
+    # -------------------------------------------------------------------------
+    # Rolling Starts: interpretability
+    # -------------------------------------------------------------------------
+    # Main table columns
     cols = [
         "config_id",
         "config.label",
         "rsq.verdict",
         "twr_p10",
         "twr_p50",
+        "twr_p90",
+        "dd_p50",
         "dd_p90",
+        "uw_p50_days",
         "uw_p90_days",
         "util_p50",
+        "util_p90",
         "robustness_score",
         "windows",
     ]
     cols = [c for c in cols if c in df_show.columns]
     if "rs.measured" in df_show.columns:
         cols.insert(2, "rs.measured")
-    st.dataframe(df_show[cols], use_container_width=True, height=520)
 
-    st.download_button(
-        "Download rolling-start view (CSV)",
-        data=df_show.to_csv(index=False).encode("utf-8"),
-        file_name=f"{selected_run_name}_rolling_view.csv",
-    )
+    # Quick visual scan: robustness map (return vs drawdown)
+    st.subheader("Quick visual scan")
+    df_plot = df_show.copy()
+    for c in ["twr_p10", "twr_p50", "twr_p90", "dd_p50", "dd_p90", "robustness_score", "windows"]:
+        if c in df_plot.columns:
+            df_plot[c] = pd.to_numeric(df_plot[c], errors="coerce")
 
-    if rs_det is not None and not rs_det.empty:
-        st.caption("Detail file detected (rolling_starts_detail.csv). Deep dive will plot per-start distribution.")
 
-# =============================================================================
+    # Derived measures (UI-only)
+    if ("twr_p10" in df_plot.columns) and ("twr_p90" in df_plot.columns):
+        df_plot["fragility_spread"] = pd.to_numeric(df_plot["twr_p90"], errors="coerce") - pd.to_numeric(df_plot["twr_p10"], errors="coerce")
+    else:
+        df_plot["fragility_spread"] = np.nan
+
+    # (Micro-juice) Let users tighten the frontier so it doesn't get dominated by tiny sample sizes.
+    min_windows = int(st.slider("Minimum rolling-start windows", 1, 200, 10, 1, key="rs.min_windows_ui"))
+    # Filter by minimum windows (avoid df.get(...) returning an int when the column is missing)
+    if "windows" in df_plot.columns:
+        _win = pd.to_numeric(df_plot["windows"], errors="coerce").fillna(0).astype(int)
+        df_plot = df_plot[_win >= min_windows].copy()
+    else:
+        st.info("No rolling-start 'windows' column found yet (run Rolling Starts first).")
+        df_plot = df_plot.iloc[0:0].copy()
+
+
+
+    # Cohort summary + fragility labels (relative to the current table)
+    if not df_plot.empty:
+        _sp = pd.to_numeric(df_plot.get("fragility_spread"), errors="coerce")
+        if _sp.notna().any():
+            q33 = float(_sp.quantile(0.33))
+            q66 = float(_sp.quantile(0.66))
+        else:
+            q33, q66 = float("nan"), float("nan")
+
+        def _frag_label(v: Any) -> str:
+            try:
+                x = float(v)
+                if not math.isfinite(x):
+                    return "—"
+                if math.isfinite(q33) and x <= q33:
+                    return "Low"
+                if math.isfinite(q66) and x <= q66:
+                    return "Medium"
+                return "High"
+            except Exception:
+                return "—"
+
+        df_plot["fragility"] = df_plot.get("fragility_spread").apply(_frag_label) if "fragility_spread" in df_plot.columns else "—"
+
+        cc1, cc2, cc3, cc4 = st.columns(4)
+        cc1.metric("Strategies (≥ min windows)", f"{len(df_plot)}")
+        if "twr_p10" in df_plot.columns:
+            cc2.metric("Median return p10", _fmt_pct(pd.to_numeric(df_plot["twr_p10"], errors="coerce").median()))
+        if "dd_p90" in df_plot.columns:
+            cc3.metric("Median DD p90", _fmt_pct(pd.to_numeric(df_plot["dd_p90"], errors="coerce").median()))
+        if "fragility" in df_plot.columns:
+            high_share = (df_plot["fragility"] == "High").mean() if len(df_plot) else 0.0
+            cc4.metric("High fragility share", f"{high_share*100:.0f}%")
+
+        st.caption("Each dot = one strategy. Up/right is better (higher median return, lower DD p90). Bigger dots = more rolling-start windows.")
+
+        color_mode = st.selectbox("Color dots by", ["Verdict", "Fragility"], index=0, key="rs.scan.color")
+        if color_mode == "Fragility" and "fragility" in df_plot.columns:
+            color_col = "fragility"
+        else:
+            color_col = ("rsq.verdict" if "rsq.verdict" in df_plot.columns else None)
+    else:
+        color_col = None
+    if df_plot.empty or ("dd_p90" not in df_plot.columns) or ("twr_p50" not in df_plot.columns):
+        st.info("Not enough Rolling Starts data to plot yet.")
+    else:
+        fig = px.scatter(
+            df_plot,
+            x="dd_p90",
+            y="twr_p50",
+            color=color_col,
+            size=("windows" if "windows" in df_plot.columns else None),
+            hover_data=[c for c in ["config_id", "config.label", "rsq.verdict", "twr_p10", "twr_p50", "twr_p90", "dd_p90", "uw_p90_days", "windows", "fragility", "fragility_spread", "robustness_score"] if c in df_plot.columns],
+            labels={
+                "dd_p90": "Drawdown p90 (lower is better)",
+                "twr_p50": "Return p50 (higher is better)",
+            },
+            title="Rolling Starts: return vs drawdown (robustness map)",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("Inspect a strategy (Rolling Starts)")
+    if df_show.empty:
+        st.info("No Rolling Starts rows to inspect.")
+    else:
+        # Pick a config to inspect (default: best robustness_score)
+        df_rank = df_show.copy()
+        if "robustness_score" in df_rank.columns:
+            df_rank["robustness_score"] = pd.to_numeric(df_rank["robustness_score"], errors="coerce")
+            df_rank = df_rank.sort_values("robustness_score", ascending=False)
+        inspect_opts = df_rank["config_id"].astype(str).tolist()
+        inspect_id = st.selectbox("Choose a config_id", options=inspect_opts, index=0, key="rs.inspect_id")
+
+        row = df_show[df_show["config_id"].astype(str) == str(inspect_id)].head(1)
+        if row.empty:
+            st.warning("Could not load that config_id from the Rolling Starts view.")
+        else:
+            r0 = row.iloc[0]
+
+            def _fmt_pct(x: float) -> str:
+                try:
+                    if pd.isna(x):
+                        return "—"
+                    return f"{float(x)*100:.2f}%"
+                except Exception:
+                    return "—"
+
+            def _fmt_num(x: float) -> str:
+                try:
+                    if pd.isna(x):
+                        return "—"
+                    return f"{float(x):.3f}"
+                except Exception:
+                    return "—"
+
+            # Mini story cards
+            c1, c2, c3, c4, c5 = st.columns(5)
+            if "windows" in row.columns:
+                c1.metric("Windows", f"{int(pd.to_numeric(r0.get('windows'), errors='coerce') or 0)}")
+            else:
+                c1.metric("Windows", "—")
+            c2.metric("Return p10", _fmt_pct(r0.get("twr_p10")))
+            c3.metric("Return p50", _fmt_pct(r0.get("twr_p50")))
+            c4.metric("DD p90", _fmt_pct(r0.get("dd_p90")))
+            if "robustness_score" in row.columns:
+                c5.metric("Robustness score", _fmt_num(r0.get("robustness_score")))
+            else:
+                c5.metric("Robustness score", "—")
+
+            # Fragility: a fast, plain-English read (start-date sensitivity)
+            frag = None
+            try:
+                frag = float(r0.get("twr_p90")) - float(r0.get("twr_p10"))
+            except Exception:
+                frag = None
+
+            # Label fragility relative to the current cohort (so it adapts to different datasets)
+            label = "—"
+            try:
+                cohort = df_show.copy()
+                if ("twr_p10" in cohort.columns) and ("twr_p90" in cohort.columns):
+                    cohort["_spread"] = pd.to_numeric(cohort["twr_p90"], errors="coerce") - pd.to_numeric(cohort["twr_p10"], errors="coerce")
+                    cohort["_spread"] = cohort["_spread"].replace([np.inf, -np.inf], np.nan)
+                    cohort_sp = cohort["_spread"].dropna()
+                    if len(cohort_sp) >= 8 and frag is not None and math.isfinite(float(frag)):
+                        q33 = float(cohort_sp.quantile(0.33))
+                        q66 = float(cohort_sp.quantile(0.66))
+                        if float(frag) <= q33:
+                            label = "Low"
+                        elif float(frag) <= q66:
+                            label = "Medium"
+                        else:
+                            label = "High"
+            except Exception:
+                label = "—"
+
+            # Plain-English reason (what hurts, how often)
+            uw_p90 = r0.get("uw_p90_days") if "uw_p90_days" in row.columns else None
+            win_n = None
+            try:
+                win_n = int(pd.to_numeric(r0.get("windows"), errors="coerce") or 0)
+            except Exception:
+                win_n = None
+
+            parts = []
+            if frag is not None and not pd.isna(frag):
+                parts.append(f"spread(p90−p10) {_fmt_pct(frag)}")
+            if "twr_p10" in row.columns:
+                parts.append(f"p10 {_fmt_pct(r0.get('twr_p10'))}")
+            if "dd_p90" in row.columns:
+                parts.append(f"DD p90 {_fmt_pct(r0.get('dd_p90'))}")
+            if uw_p90 is not None and not pd.isna(uw_p90):
+                parts.append(f"UW p90 {int(float(uw_p90))}d")
+            if win_n is not None:
+                parts.append(f"{win_n} windows")
+
+            msg = " · ".join(parts) if parts else "Not enough data."
+
+            if label == "Low":
+                st.success(f"Fragility: **Low** — {msg}")
+            elif label == "Medium":
+                st.warning(f"Fragility: **Medium** — {msg}")
+            elif label == "High":
+                st.error(f"Fragility: **High** — {msg}")
+            else:
+                st.info(f"Fragility: **—** — {msg}")
+
+            # Detail plots (per-start windows)
+            if rs_det is None or rs_det.empty:
+                st.info("rolling_starts_detail.csv not found for this run yet. (You’ll still have the summary above.)")
+            else:
+                g = rs_det[rs_det["config_id"].astype(str) == str(inspect_id)].copy()
+                if g.empty:
+                    st.info("No per-start detail rows found for this config_id.")
+                else:
+                    # Parse & sort start date
+                    if "start_dt" in g.columns:
+                        g["start_dt"] = pd.to_datetime(g["start_dt"], errors="coerce")
+                    if "start_i" in g.columns:
+                        g["start_i"] = pd.to_numeric(g["start_i"], errors="coerce")
+                    g = g.sort_values(["start_dt" if "start_dt" in g.columns else "start_i"])
+
+                    # Normalize numeric fields
+                    for c in ["performance.twr_total_return", "performance.max_drawdown_equity", "uw_max_days", "util_mean", "equity.net_profit_ex_cashflows"]:
+                        if c in g.columns:
+                            g[c] = pd.to_numeric(g[c], errors="coerce")
+
+                    
+                    # Quick pain points (what was the worst start date, and why?)
+                    pains = []
+                    try:
+                        if "performance.twr_total_return" in g.columns:
+                            rmin = g.dropna(subset=["performance.twr_total_return"]).nsmallest(1, "performance.twr_total_return").head(1)
+                            if not rmin.empty:
+                                rr = rmin.iloc[0]
+                                s = rr.get("start_dt", rr.get("start_i", "—"))
+                                pains.append(f"Worst return start: **{s}** → return {_fmt_pct(rr.get('performance.twr_total_return'))}, DD {_fmt_pct(rr.get('performance.max_drawdown_equity'))}, UW {int(0 if pd.isna(pd.to_numeric(rr.get('uw_max_days'), errors='coerce')) else pd.to_numeric(rr.get('uw_max_days'), errors='coerce'))}d")
+                        if "performance.max_drawdown_equity" in g.columns:
+                            dmax = g.dropna(subset=["performance.max_drawdown_equity"]).nlargest(1, "performance.max_drawdown_equity").head(1)
+                            if not dmax.empty:
+                                rr = dmax.iloc[0]
+                                s = rr.get("start_dt", rr.get("start_i", "—"))
+                                pains.append(f"Worst drawdown start: **{s}** → DD {_fmt_pct(rr.get('performance.max_drawdown_equity'))}, return {_fmt_pct(rr.get('performance.twr_total_return'))}")
+                        if "uw_max_days" in g.columns:
+                            umax = g.dropna(subset=["uw_max_days"]).nlargest(1, "uw_max_days").head(1)
+                            if not umax.empty:
+                                rr = umax.iloc[0]
+                                s = rr.get("start_dt", rr.get("start_i", "—"))
+                                pains.append(f"Longest underwater start: **{s}** → UW {int(0 if pd.isna(pd.to_numeric(rr.get('uw_max_days'), errors='coerce')) else pd.to_numeric(rr.get('uw_max_days'), errors='coerce'))}d, return {_fmt_pct(rr.get('performance.twr_total_return'))}")
+                    except Exception:
+                        pains = []
+
+                    if pains:
+                        st.markdown("**Worst-case highlights**  \\n" + "  \\n".join([f"- {p}" for p in pains]))
+
+                    tabs = st.tabs(["Return vs start", "Drawdown vs start", "Underwater vs start", "Distributions", "Starts table"])
+
+                    with tabs[0]:
+                        if "performance.twr_total_return" not in g.columns:
+                            st.info("Missing performance.twr_total_return in detail.")
+                        else:
+                            # Friendlier units for charts
+                            if "performance.twr_total_return" in g.columns:
+                                g["twr_pct"] = g["performance.twr_total_return"] * 100.0
+                            if "performance.max_drawdown_equity" in g.columns:
+                                g["dd_pct"] = g["performance.max_drawdown_equity"] * 100.0
+                            fig_r = px.scatter(
+                                g,
+                                x=("start_dt" if "start_dt" in g.columns else "start_i"),
+                                y="twr_pct",
+                                hover_data=[c for c in ["start_dt", "start_i", "bars", "performance.max_drawdown_equity", "uw_max_days"] if c in g.columns],
+                                labels={"twr_pct": "Total return (%)"},
+                                title="Rolling Starts: return by start date",
+                            )
+                            # Add p10/p50/p90 reference lines from the summary row
+                            for qname, dash in [("twr_p10", "dot"), ("twr_p50", "dash"), ("twr_p90", "dot")]:
+                                if qname in row.columns and not pd.isna(r0.get(qname)):
+                                    fig_r.add_hline(y=float(r0.get(qname)) * 100.0, line_dash=dash)
+                            st.caption("Dotted lines = p10/p90. Dashed line = median (p50). The less these dots care about where you start, the more 'real' the edge is.")
+                            st.plotly_chart(fig_r, use_container_width=True)
+
+                            # Worst / best start dates quick peek
+                            g_rank = g.dropna(subset=["performance.twr_total_return"]).copy()
+                            if not g_rank.empty:
+                                worst = g_rank.nsmallest(5, "performance.twr_total_return")
+                                best = g_rank.nlargest(5, "performance.twr_total_return")
+                                cc1, cc2 = st.columns(2)
+                                with cc1:
+                                    st.write("**Worst starts (by return)**")
+                                    st.dataframe(
+                                        worst[[c for c in ["start_dt", "start_i", "performance.twr_total_return", "performance.max_drawdown_equity", "uw_max_days"] if c in worst.columns]],
+                                        use_container_width=True,
+                                        height=210,
+                                    )
+                                with cc2:
+                                    st.write("**Best starts (by return)**")
+                                    st.dataframe(
+                                        best[[c for c in ["start_dt", "start_i", "performance.twr_total_return", "performance.max_drawdown_equity", "uw_max_days"] if c in best.columns]],
+                                        use_container_width=True,
+                                        height=210,
+                                    )
+
+                    with tabs[1]:
+                        if "performance.max_drawdown_equity" not in g.columns:
+                            st.info("Missing performance.max_drawdown_equity in detail.")
+                        else:
+                            fig_d = px.scatter(
+                                g,
+                                x=("start_dt" if "start_dt" in g.columns else "start_i"),
+                                y="dd_pct",
+                                hover_data=[c for c in ["start_dt", "start_i", "bars", "performance.twr_total_return"] if c in g.columns],
+                                labels={"dd_pct": "Max drawdown (%)"},
+                                title="Rolling Starts: max drawdown by start date",
+                            )
+                            st.plotly_chart(fig_d, use_container_width=True)
+
+                    with tabs[2]:
+                        if "uw_max_days" not in g.columns:
+                            st.info("Missing uw_max_days in detail.")
+                        else:
+                            fig_u = px.scatter(
+                                g,
+                                x=("start_dt" if "start_dt" in g.columns else "start_i"),
+                                y="uw_max_days",
+                                hover_data=[c for c in ["start_dt", "start_i", "bars", "performance.twr_total_return", "performance.max_drawdown_equity"] if c in g.columns],
+                                labels={"uw_max_days": "Max underwater days"},
+                                title="Rolling Starts: max underwater days by start date",
+                            )
+                            st.plotly_chart(fig_u, use_container_width=True)
+
+                    
+                    with tabs[3]:
+                        # Distribution views help you see "how often does it hurt?"
+                        cols_dist = st.columns(3)
+
+                        if "performance.twr_total_return" in g.columns:
+                            g["_twr_pct"] = pd.to_numeric(g["performance.twr_total_return"], errors="coerce") * 100.0
+                            fig_hd = px.histogram(g.dropna(subset=["_twr_pct"]), x="_twr_pct", nbins=30, title="Return distribution (rolling starts)")
+                            for qname, dash in [("twr_p10", "dot"), ("twr_p50", "dash"), ("twr_p90", "dot")]:
+                                if qname in row.columns and not pd.isna(r0.get(qname)):
+                                    fig_hd.add_vline(x=float(r0.get(qname)) * 100.0, line_dash=dash)
+                            cols_dist[0].plotly_chart(fig_hd, use_container_width=True)
+                        else:
+                            cols_dist[0].info("No return column in detail.")
+
+                        if "performance.max_drawdown_equity" in g.columns:
+                            g["_dd_pct"] = pd.to_numeric(g["performance.max_drawdown_equity"], errors="coerce") * 100.0
+                            fig_dd = px.histogram(g.dropna(subset=["_dd_pct"]), x="_dd_pct", nbins=30, title="Drawdown distribution (rolling starts)")
+                            for qname, dash in [("dd_p50", "dash"), ("dd_p90", "dot")]:
+                                if qname in row.columns and not pd.isna(r0.get(qname)):
+                                    fig_dd.add_vline(x=float(r0.get(qname)) * 100.0, line_dash=dash)
+                            cols_dist[1].plotly_chart(fig_dd, use_container_width=True)
+                        else:
+                            cols_dist[1].info("No drawdown column in detail.")
+
+                        if "uw_max_days" in g.columns:
+                            fig_uw = px.histogram(g.dropna(subset=["uw_max_days"]), x="uw_max_days", nbins=30, title="Underwater days distribution (rolling starts)")
+                            for qname, dash in [("uw_p50_days", "dash"), ("uw_p90_days", "dot")]:
+                                if qname in row.columns and not pd.isna(r0.get(qname)):
+                                    fig_uw.add_vline(x=float(r0.get(qname)), line_dash=dash)
+                            cols_dist[2].plotly_chart(fig_uw, use_container_width=True)
+                        else:
+                            cols_dist[2].info("No underwater column in detail.")
+
+                        st.caption("Dashed line = median. Dotted lines = p10/p90 (or p90 for drawdown/underwater). Tight distributions are what 'robust' looks like.")
+                    with tabs[4]:
+                        st.dataframe(g, use_container_width=True, height=420)
+
+                    with st.expander("Exports (advanced)", expanded=False):
+                        st.download_button(
+                            "Download rolling-start view (CSV)",
+                            data=df_show.to_csv(index=False).encode("utf-8"),
+                            file_name=f"{selected_run_name}_rolling_view.csv",
+                        )
+                        st.download_button(
+                            "Download rolling-start detail for this config (CSV)",
+                            data=g.to_csv(index=False).encode("utf-8"),
+                            file_name=f"{selected_run_name}_rs_detail_{inspect_id}.csv",
+                        )
+
+        with st.expander("Rolling Starts table", expanded=False):
+            st.dataframe(df_show[cols], use_container_width=True, height=520)
+
+        # Next step: Walkforward
+        if st.button("Next: Walkforward →", type="primary", key="rs.next_to_wf"):
+            st.session_state["ui.stage"] = "wf"
+            st.rerun()
+
 # Stage C: Walkforward
 # =============================================================================
 
-elif stage_pick == "wf":
+if stage_pick == "wf":
     st.write("### C) Walkforward (generalization)")
     st.caption("Splits the history into rolling windows and measures how performance behaves out-of-sample-ish.")
 
@@ -2375,22 +3319,36 @@ elif stage_pick == "wf":
             st.session_state["wf.jobs"] = int(st.session_state.get("wf.jobs", 8))
             st.session_state["wf.preset_prev"] = preset
 
-        window_days = int(st.number_input("Window days", 7, 3650, int(st.session_state.get("wf.window_days", 365)), 5, key="wf.window_days"))
-        step_days = int(st.number_input("Step days", 1, 3650, int(st.session_state.get("wf.step_days", 30)), 5, key="wf.step_days"))
+        # Avoid Streamlit warning: don't set both a widget default and session_state.
+        if "wf.window_days" not in st.session_state:
+            st.session_state["wf.window_days"] = int(365)
+        if "wf.step_days" not in st.session_state:
+            st.session_state["wf.step_days"] = int(30)
+
+        window_days = int(st.number_input("Window days", min_value=7, max_value=3650, step=5, key="wf.window_days"))
+        step_days = int(st.number_input("Step days", min_value=1, max_value=3650, step=5, key="wf.step_days"))
 
         expected_window_bars = int(max(1, round(window_days * bars_per_day)))
         st.caption(f"Expected bars per window: ~{expected_window_bars:,}. (Min bars must be ≤ this.)")
 
         max_mb = int(max(1, expected_window_bars))
+        if "wf.min_bars" not in st.session_state:
+            st.session_state["wf.min_bars"] = int(max_mb)
+        # Clamp current value to widget bounds to avoid Streamlit exceptions.
+        if int(st.session_state.get("wf.min_bars", 1)) > int(max_mb):
+            st.session_state["wf.min_bars"] = int(max_mb)
+
         min_bars = int(st.number_input(
             "Min bars per window",
-            1,
-            max_mb,
-            int(min(st.session_state.get("wf.min_bars", max_mb), max_mb)),
-            1,
+            min_value=1,
+            max_value=max_mb,
+            step=1,
             key="wf.min_bars",
         ))
-        jobs = int(st.number_input("Jobs", 1, 64, int(st.session_state.get("wf.jobs", 8)), 1, key="wf.jobs"))
+
+        if "wf.jobs" not in st.session_state:
+            st.session_state["wf.jobs"] = 8
+        jobs = int(st.number_input("Jobs", min_value=1, max_value=64, step=1, key="wf.jobs"))
 
         survivors_ids = survivors["config_id"].astype(str).tolist()
         N = len(survivors_ids)
@@ -2481,34 +3439,352 @@ elif stage_pick == "wf":
         keep.append("FAIL")
     df_show = dfC[dfC["wfq.verdict"].isin(keep)].copy()
     
+    
     cols = [
         "config_id",
         "config.label",
         "wfq.verdict",
+        "return_p10",
+        "return_p50",
+        "return_p90",
+        "dd_p90",
+        "uw_days_p90",
         "pct_profitable_windows",
-        "mean_window_return",
-        "median_window_return",
+        "pct_windows_traded",
+        "trades_p10",
+        "trades_p50",
         "min_window_return",
-        "max_window_return",
+        "median_window_return",
+        "stitched_total_return",
+        "stitched_max_drawdown",
         "windows",
     ]
     cols = [c for c in cols if c in df_show.columns]
     if "wf.measured" in df_show.columns:
         cols.insert(2, "wf.measured")
     st.dataframe(df_show[cols], use_container_width=True, height=520)
-    
+
     st.download_button(
         "Download walkforward view (CSV)",
         data=df_show.to_csv(index=False).encode("utf-8"),
         file_name=f"{selected_run_name}_walkforward_view.csv",
     )
+
+    st.markdown("---")
+    st.write("### Inspect a strategy (Walkforward)")
+
+    with st.expander("How to read Walkforward (what these charts mean)", expanded=True):
+        st.write("Walkforward chops history into many rolling windows (episodes). Each dot in the charts is one episode.")
+        st.write("You're looking for consistency across episodes — not one lucky stretch.")
+        st.write("• Return over time: each dot is total return inside one window. Tight clusters beat wild scatter.")
+        st.write("• Drawdown over time: each dot is the worst peak→trough drop inside that window. Spikes mean occasional pain.")
+        st.write("• Underwater days: how long equity stayed below its prior peak inside the window (recovery time).")
+        st.write("• Histogram: p10/p50/p90 are worst-typical / typical / best-typical window outcomes.")
+        st.write("• Stitched curve: compounds non-overlapping step slices to avoid overlap. It's a stability visualization, not a promise of tradability.")
+
+
+    if wf_rows is None or wf_rows.empty:
+        st.info("No per-window walkforward rows found yet (wf_results.csv).")
+    else:
+        # Pick a config to inspect (default: highest typical return)
+        if "return_p50" in df_show.columns:
+            opts = (
+                df_show.sort_values("return_p50", ascending=False)["config_id"].astype(str).tolist()
+            )
+        else:
+            opts = df_show["config_id"].astype(str).tolist()
+
+        if not opts:
+            st.info("No configs in the current filter set.")
+        else:
+            pick_id = st.selectbox("Config", options=opts, index=0, key="wf.inspect.pick")
+
+            wsub = wf_rows[wf_rows["config_id"].astype(str) == str(pick_id)].copy()
+            wsub = wsub.sort_values("window_idx", kind="mergesort")
+
+            sum_row = None
+            try:
+                ssub = wf_sum[wf_sum["config_id"].astype(str) == str(pick_id)]
+                if ssub is not None and not ssub.empty:
+                    sum_row = ssub.iloc[0].to_dict()
+            except Exception:
+                sum_row = None
+
+            # Summary metrics
+            if sum_row:
+                m1, m2, m3, m4 = st.columns(4)
+                with m1:
+                    st.metric("WF p50 return", _fmt_pct(sum_row.get("return_p50")))
+                with m2:
+                    st.metric("WF p10 return", _fmt_pct(sum_row.get("return_p10")))
+                with m3:
+                    st.metric("WF dd_p90", _fmt_pct(sum_row.get("dd_p90")))
+                with m4:
+                    st.metric("% profitable windows", _fmt_pct(sum_row.get("pct_profitable_windows")))
+
+            # Per-window timeline
+            if "flags" in wsub.columns:
+                wsub["has_flags"] = wsub["flags"].astype(str).str.len() > 0
+            else:
+                wsub["has_flags"] = False
+
+            if "window_start_dt" in wsub.columns:
+                x = "window_start_dt"
+            else:
+                x = "window_idx"
+
+            yret = "window_return" if "window_return" in wsub.columns else "equity.total_return"
+            fig = px.scatter(
+                wsub,
+                x=x,
+                y=yret,
+                color="has_flags",
+                hover_data=[c for c in ["window_end_dt", "window_max_drawdown", "window_underwater_days", "trades_closed", "flags"] if c in wsub.columns],
+                title="Walkforward windows: return over time",
+            )
+            # Quantile guides: teach the user to think in distributions (bad/typical/good windows).
+            try:
+                _vals = pd.to_numeric(wsub[yret], errors="coerce").dropna()
+                if not _vals.empty:
+                    r10 = float(_vals.quantile(0.10))
+                    r50 = float(_vals.quantile(0.50))
+                    r90 = float(_vals.quantile(0.90))
+                    fig.add_hline(y=r50, line_dash="dash", annotation_text=f"p50 {r50:.1%}", annotation_position="top left")
+                    fig.add_hline(y=r10, line_dash="dot", annotation_text=f"p10 {r10:.1%}", annotation_position="bottom left")
+                    fig.add_hline(y=r90, line_dash="dot", annotation_text=f"p90 {r90:.1%}", annotation_position="top left")
+            except Exception:
+                pass
+            fig.update_yaxes(tickformat=".0%")
+            st.plotly_chart(fig, use_container_width=True)
+            st.caption("Each dot is one window. Tight clusters beat lucky spikes. p10/p50/p90 lines show bad/typical/good window outcomes.")
+
+            if "window_max_drawdown" in wsub.columns:
+                fig2 = px.scatter(
+                    wsub,
+                    x=x,
+                    y="window_max_drawdown",
+                    color="has_flags",
+                    hover_data=[c for c in ["window_return", "window_underwater_days", "trades_closed", "flags"] if c in wsub.columns],
+                    title="Walkforward windows: max drawdown over time",
+                )
+                try:
+                    d90 = float(pd.to_numeric(wsub["window_max_drawdown"], errors="coerce").dropna().quantile(0.90))
+                    fig2.add_hline(y=d90, line_dash="dash", annotation_text=f"dd_p90 {d90:.1%}", annotation_position="top left")
+                except Exception:
+                    pass
+                fig2.update_yaxes(tickformat=".0%")
+                st.plotly_chart(fig2, use_container_width=True)
+                st.caption("Each dot is the worst peak→trough drop inside that window. dd_p90 is your 'bad but typical' drawdown anchor.")
+
+            if "window_underwater_days" in wsub.columns:
+                fig_uw = px.scatter(
+                    wsub,
+                    x=x,
+                    y="window_underwater_days",
+                    color="has_flags",
+                    hover_data=[c for c in ["window_return", "window_max_drawdown", "trades_closed", "flags"] if c in wsub.columns],
+                    title="Walkforward windows: underwater days over time",
+                )
+                try:
+                    uw90 = float(pd.to_numeric(wsub["window_underwater_days"], errors="coerce").dropna().quantile(0.90))
+                    fig_uw.add_hline(y=uw90, line_dash="dash", annotation_text=f"uw_p90 {uw90:.0f}d", annotation_position="top left")
+                except Exception:
+                    pass
+                st.plotly_chart(fig_uw, use_container_width=True)
+                st.caption("Underwater days = time spent below the previous equity peak inside the window. High values mean long recovery / long boredom.")
+
+            # Distribution (sanity check)
+            if "window_return" in wsub.columns:
+                fig3 = px.histogram(wsub, x="window_return", nbins=30, title="Window return distribution")
+                try:
+                    _vals = pd.to_numeric(wsub["window_return"], errors="coerce").dropna()
+                    if not _vals.empty:
+                        r10 = float(_vals.quantile(0.10))
+                        r50 = float(_vals.quantile(0.50))
+                        r90 = float(_vals.quantile(0.90))
+                        fig3.add_vline(x=r50, line_dash="dash", annotation_text=f"p50 {r50:.1%}", annotation_position="top")
+                        fig3.add_vline(x=r10, line_dash="dot", annotation_text=f"p10 {r10:.1%}", annotation_position="top")
+                        fig3.add_vline(x=r90, line_dash="dot", annotation_text=f"p90 {r90:.1%}", annotation_position="top")
+                except Exception:
+                    pass
+                fig3.update_xaxes(tickformat=".0%")
+                st.plotly_chart(fig3, use_container_width=True)
+                st.caption("Histogram of window returns. p10 is the 'worst-typical' anchor; p50 is typical; p90 is best-typical.")
+
+            # Window leaderboard (failure modes)
+            if "window_return" in wsub.columns:
+                st.write("**Window leaderboard (failure modes)**")
+                show_cols = [c for c in ["window_idx", "window_start_dt", "window_end_dt", "window_return", "window_max_drawdown", "window_underwater_days", "trades_closed", "flags"] if c in wsub.columns]
+
+                t1, t2, t3 = st.tabs(["Worst return", "Worst drawdown", "Longest underwater"])
+                with t1:
+                    st.dataframe(
+                        wsub.sort_values("window_return", ascending=True)[show_cols].head(10),
+                        use_container_width=True,
+                        height=260,
+                    )
+                with t2:
+                    if "window_max_drawdown" in wsub.columns:
+                        st.dataframe(
+                            wsub.sort_values("window_max_drawdown", ascending=False)[show_cols].head(10),
+                            use_container_width=True,
+                            height=260,
+                        )
+                    else:
+                        st.info("No drawdown column for this walkforward run.")
+                with t3:
+                    if "window_underwater_days" in wsub.columns:
+                        st.dataframe(
+                            wsub.sort_values("window_underwater_days", ascending=False)[show_cols].head(10),
+                            use_container_width=True,
+                            height=260,
+                        )
+                    else:
+                        st.info("No underwater-days column for this walkforward run.")
+
+            # Stitched curve (non-overlapping segments)
+            stitched_path = None
+            try:
+                if sum_row and sum_row.get("stitched_path"):
+                    stitched_path = wf_dir_effective / str(sum_row["stitched_path"])
+                else:
+                    stitched_path = wf_dir_effective / "stitched" / f"{pick_id}.csv"
+            except Exception:
+                stitched_path = wf_dir_effective / "stitched" / f"{pick_id}.csv"
+
+            if stitched_path is not None and stitched_path.exists():
+                st.write("**Stitched curve (non-overlapping segments)**")
+                st.caption("This compounds step-sized slices to avoid overlap. It's a stability visualization, not a promise of tradability.")
+                sdf = _load_csv(stitched_path)
+                if sdf is not None and not sdf.empty and "stitched_twr" in sdf.columns:
+                    fig4 = px.line(sdf, x="dt" if "dt" in sdf.columns else sdf.columns[0], y="stitched_twr", title="Stitched TWR index")
+                    try:
+                        fig4.add_hline(y=1.0, line_dash="dash", annotation_text="start (1.0)", annotation_position="bottom right")
+                    except Exception:
+                        pass
+                    st.plotly_chart(fig4, use_container_width=True)
+
+                    st.download_button(
+                        "Download stitched curve (CSV)",
+                        data=sdf.to_csv(index=False).encode("utf-8"),
+                        file_name=f"{selected_run_name}_wf_stitched_{pick_id}.csv",
+                    )
+            else:
+                st.info("No stitched curve found for this config (expected under wf_dir/stitched/).")
+
+            # Downloads
+            st.download_button(
+                "Download per-window rows for this config (CSV)",
+                data=wsub.to_csv(index=False).encode("utf-8"),
+                file_name=f"{selected_run_name}_wf_windows_{pick_id}.csv",
+            )
+
     
+    # =============================================================================
+
 # =============================================================================
 # Stage D: Grand verdict + deep dive
 # =============================================================================
 
-else:
+def _apply_grand_preset(preset: str) -> None:
+    """
+    Presets are *just defaults* for the question radios in Grand Verdict.
+    They exist to teach the "target profile" habit: pick pain limits first, then filter.
+    """
+    preset = (preset or "").strip().lower()
+    if preset in {"", "none"}:
+        return
+
+    # Choice indexes correspond to the order inside each QuestionSpec.
+    PRESETS: Dict[str, Dict[str, Dict[str, int]]] = {
+        # Tight pain limits. Fewer survivors, more stability.
+        "conservative": {
+            "batch": {"batch_drawdown": 0, "batch_profit": 0, "batch_fees": 0},
+            "rs": {"rs_worst_return": 0, "rs_drawdown": 0, "rs_underwater": 0, "rs_util": 0},
+            "wf": {"wf_typical": 0, "wf_worst_typical": 0, "wf_min": 0, "wf_dd": 0, "wf_consistency": 0, "wf_trading": 0},
+        },
+        # "Reasonable adult" defaults. Lets exploration happen without being naive.
+        "balanced": {
+            "batch": {"batch_drawdown": 1, "batch_profit": 0, "batch_fees": 1},
+            "rs": {"rs_worst_return": 1, "rs_drawdown": 1, "rs_underwater": 2, "rs_util": 1},
+            "wf": {"wf_typical": 0, "wf_worst_typical": 1, "wf_min": 1, "wf_dd": 1, "wf_consistency": 1, "wf_trading": 1},
+        },
+        # Loose filters. Useful early when you want to see "what exists", not only survivors.
+        "aggressive": {
+            "batch": {"batch_drawdown": 2, "batch_profit": 0, "batch_fees": 2},
+            "rs": {"rs_worst_return": 2, "rs_drawdown": 2, "rs_underwater": 3, "rs_util": 2},
+            "wf": {"wf_typical": 0, "wf_worst_typical": 2, "wf_min": 2, "wf_dd": 2, "wf_consistency": 2, "wf_trading": 2},
+        },
+    }
+
+    p = PRESETS.get(preset)
+    if not p:
+        return
+
+    # Keys used by _question_ui
+    for qid, idx in p["batch"].items():
+        st.session_state[f"q.grand.batch.{qid}"] = int(idx)
+    for qid, idx in p["rs"].items():
+        st.session_state[f"q.grand.rs.{qid}"] = int(idx)
+    for qid, idx in p["wf"].items():
+        st.session_state[f"q.grand.wf.{qid}"] = int(idx)
+
+
+def _grand_score_row(r: Dict[str, Any]) -> float:
+    """
+    Worst-case-aware score. Higher is better.
+
+    Uses:
+      - WF return_p10 and dd_p90 (most important)
+      - RS twr_p10 and dd_p90 (second)
+      - Batch TWR return and drawdown (third)
+
+    Underwater days are converted to "years" to keep units sane.
+    """
+    wf_r10 = _to_float(r.get("return_p10", float("nan")))
+    wf_dd90 = _to_float(r.get("dd_p90", float("nan")))
+    wf_uw90 = _to_float(r.get("uw_days_p90", float("nan")))
+
+    rs_r10 = _to_float(r.get("twr_p10", float("nan")))
+    rs_dd90 = _to_float(r.get("dd_p90", float("nan")))  # RS uses dd_p90 too
+    rs_uw90 = _to_float(r.get("uw_p90_days", float("nan")))
+
+    b_r = _to_float(r.get("performance.twr_total_return", float("nan")))
+    b_dd = _to_float(r.get("performance.max_drawdown_equity", float("nan")))
+
+    def _nan0(x: float) -> float:
+        return 0.0 if (x != x) else float(x)
+
+    wf = _nan0(wf_r10) - 0.50 * _nan0(wf_dd90) - 0.10 * (_nan0(wf_uw90) / 365.0)
+    rs = _nan0(rs_r10) - 0.50 * _nan0(rs_dd90) - 0.10 * (_nan0(rs_uw90) / 365.0)
+    bt = _nan0(b_r) - 0.50 * _nan0(b_dd)
+
+    # Penalize missing measurements (unmeasured WF/RS shouldn't float to the top).
+    wf_pen = 0.25 if (wf_r10 != wf_r10 or wf_dd90 != wf_dd90) else 0.0
+    rs_pen = 0.10 if (rs_r10 != rs_r10 or rs_dd90 != rs_dd90) else 0.0
+
+    return 0.60 * wf + 0.30 * rs + 0.10 * bt - wf_pen - rs_pen
+
+
+if stage_pick == "grand":
     st.write("### D) Grand verdict (Batch + RS + WF)")
+    st.caption(
+        "This is the final filter + ranking stage. You pick your pain limits first (target profile), "
+        "then the lab finds the strategies that survive *all* stress tests."
+    )
+
+    with st.expander("How to read Grand Verdict", expanded=False):
+        st.markdown(
+            """
+- **PASS / WARN / FAIL** are driven by the question sets below.
+- **PASS** means the strategy stays within your limits.
+- **WARN** means it violates *soft* constraints (it might be OK, but it’s suspicious).
+- **FAIL** means it violates *hard* constraints.
+- If Rolling Starts or Walkforward are **UNMEASURED**, you can either ignore them or require them.
+
+The ranking is intentionally **worst‑case aware**: it prefers strategies with good *p10* outcomes and tolerable *p90* drawdowns.
+            """.strip()
+        )
 
     # Load latest RS/WF if present
     rs_dir_effective = rs_latest
@@ -2519,6 +3795,22 @@ else:
 
     df = survivors.copy()
     df = _ensure_config_id(df)
+
+    # --- Target profile presets ---
+    preset = st.selectbox(
+        "Target profile preset",
+        options=["None", "Balanced", "Conservative", "Aggressive"],
+        index=1,
+        key="grand.profile_preset",
+        help="Sets default choices for the filters below. You can still tweak anything.",
+    )
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        if st.button("Apply preset", key="grand.apply_preset_btn"):
+            _apply_grand_preset(str(preset))
+            st.rerun()
+    with c2:
+        st.caption("Presets just set defaults for the radios below. They don’t change your data, only the filters.")
 
     # Stage A verdict
     with st.expander("Batch questions (used in grand verdict)", expanded=False):
@@ -2561,38 +3853,96 @@ else:
             return True
         if rule.startswith("PASS only"):
             return verdict == "PASS"
-        # PASS or WARN
         return verdict in {"PASS", "WARN"}
 
-    keep_mask = []
+    keep_mask: List[bool] = []
+    grand_verdicts: List[str] = []
+
     for _, r in df.iterrows():
         ok = True
-        ok = ok and _keep(str(r.get("batch.verdict", "")), req_batch)
+        stage_vs: List[str] = []
+
+        v_batch = str(r.get("batch.verdict", ""))
+        ok = ok and _keep(v_batch, req_batch)
+        if not req_batch.startswith("Ignore"):
+            stage_vs.append(v_batch)
+
         v_rs = str(r.get("rsq.verdict", "UNMEASURED"))
         if v_rs == "UNMEASURED":
             ok = ok and (req_rs == "Ignore")
+            if not req_rs.startswith("Ignore"):
+                stage_vs.append("UNMEASURED")
         else:
             ok = ok and _keep(v_rs, req_rs)
+            if not req_rs.startswith("Ignore"):
+                stage_vs.append(v_rs)
+
         v_wf = str(r.get("wfq.verdict", "UNMEASURED"))
         if v_wf == "UNMEASURED":
             ok = ok and (req_wf == "Ignore")
+            if not req_wf.startswith("Ignore"):
+                stage_vs.append("UNMEASURED")
         else:
             ok = ok and _keep(v_wf, req_wf)
+            if not req_wf.startswith("Ignore"):
+                stage_vs.append(v_wf)
+
         keep_mask.append(bool(ok))
+
+        # Combine into a single grand verdict (for readability)
+        if "FAIL" in stage_vs or "UNMEASURED" in stage_vs:
+            gv = "FAIL" if "UNMEASURED" not in stage_vs else "UNMEASURED"
+        elif "WARN" in stage_vs:
+            gv = "WARN"
+        else:
+            gv = "PASS"
+        grand_verdicts.append(gv)
+
+    df["grand.verdict"] = grand_verdicts
     df2 = df[pd.Series(keep_mask, index=df.index)].copy()
 
     st.success(f"Grand survivors: {len(df2)}/{len(df)}")
 
-    # Ranking
+    # --- Scoring / ranking ---
     st.subheader("Ranking")
+
+    # Compute a worst-case aware score (visible + exportable)
+    df2["score.grand_robust"] = [_grand_score_row(r) for r in df2.to_dict(orient="records")]
+    df2["score.grand_robust"] = pd.to_numeric(df2["score.grand_robust"], errors="coerce")
+
+    with st.expander("What is the 'Grand robust score'?", expanded=False):
+        st.markdown(
+            """
+It’s a deliberately boring scoring function:
+
+- rewards **p10 returns** (worst‑typical outcomes)  
+- penalizes **p90 drawdowns** (bad‑typical pain)  
+- lightly penalizes **underwater time** (in years)
+
+Walkforward matters most, Rolling Starts second, Batch third.
+
+It’s not a magic number — it’s a ranking hint. The receipts (charts + artifacts) still win.
+            """.strip()
+        )
+
     sort_opts = []
-    if "score.calmar_equity" in df2.columns:
-        sort_opts.append("score.calmar_equity")
-    if "robustness_score" in df2.columns:
-        sort_opts.append("robustness_score")
-    if "median_window_return" in df2.columns:
-        sort_opts.append("median_window_return")
-    sort_opts += ["equity.net_profit_ex_cashflows", "performance.twr_total_return"]
+    for c in [
+        "score.grand_robust",
+        "score.calmar_equity",
+        "robustness_score",
+        "return_p10",
+        "return_p50",
+        "dd_p90",
+        "pct_profitable_windows",
+        "pct_windows_traded",
+        "twr_p10",
+        "twr_p50",
+        "performance.twr_total_return",
+        "performance.max_drawdown_equity",
+        "equity.net_profit_ex_cashflows",
+    ]:
+        if c in df2.columns and c not in sort_opts:
+            sort_opts.append(c)
 
     sort_by = st.selectbox("Sort by", options=sort_opts, index=0, key="grand.sort_by")
     ascending = st.checkbox("Ascending", value=False, key="grand.asc")
@@ -2600,21 +3950,52 @@ else:
         df2[sort_by] = pd.to_numeric(df2[sort_by], errors="coerce")
         df2 = df2.sort_values(sort_by, ascending=bool(ascending))
 
-    cols = [
+    show_cols = [
         "config_id",
         "config.label",
+        "grand.verdict",
         "batch.verdict",
         "rsq.verdict",
         "wfq.verdict",
-        "equity.net_profit_ex_cashflows",
+        "score.grand_robust",
+        "return_p10",
+        "return_p50",
+        "dd_p90",
+        "uw_days_p90",
+        "pct_profitable_windows",
+        "pct_windows_traded",
+        "twr_p10",
+        "twr_p50",
+        "robustness_score",
         "performance.twr_total_return",
         "performance.max_drawdown_equity",
-        "robustness_score",
-        "median_window_return",
-        "pct_profitable_windows",
+        "equity.net_profit_ex_cashflows",
     ]
-    cols = [c for c in cols if c in df2.columns]
-    st.dataframe(df2[cols], use_container_width=True, height=520)
+    show_cols = [c for c in show_cols if c in df2.columns]
+
+    # Verdict visibility toggles
+    vc1, vc2, vc3 = st.columns(3)
+    with vc1:
+        show_pass = st.checkbox("Show PASS", value=True, key="grand.show_pass")
+    with vc2:
+        show_warn = st.checkbox("Show WARN", value=True, key="grand.show_warn")
+    with vc3:
+        show_fail = st.checkbox("Show FAIL/UNMEASURED", value=False, key="grand.show_fail")
+
+    mask_v = []
+    for v in df2.get("grand.verdict", pd.Series([], dtype=str)).astype(str):
+        if v == "PASS" and show_pass:
+            mask_v.append(True)
+        elif v == "WARN" and show_warn:
+            mask_v.append(True)
+        elif v in {"FAIL", "UNMEASURED"} and show_fail:
+            mask_v.append(True)
+        else:
+            mask_v.append(False)
+
+    df_show = df2[pd.Series(mask_v, index=df2.index)] if len(mask_v) == len(df2) else df2
+
+    st.dataframe(df_show[show_cols], use_container_width=True, height=520)
 
     st.download_button(
         "Download grand survivors (CSV)",
@@ -2622,18 +4003,54 @@ else:
         file_name=f"{selected_run_name}_grand_survivors.csv",
     )
 
+    # =============================================================================
+    # Deep dive (grand)
+    # =============================================================================
     st.divider()
     st.subheader("Deep dive")
+
+    if df2.empty:
+        st.info("No grand survivors under the current rules. Relax constraints or run RS/WF.")
+        st.stop()
 
     pick = st.selectbox(
         "Pick a strategy",
         options=df2["config_id"].astype(str).tolist()[:5000],
-        index=0 if len(df2) else None,
+        index=0,
         key="deep.pick",
     )
-
     if not pick:
         st.stop()
+
+    # Row for this strategy (for stage receipts)
+    row = df2[df2["config_id"].astype(str) == str(pick)].iloc[0].to_dict()
+
+    # Stage receipts: show verdict + reasons
+    st.write("#### Receipts (why this passed/warned/failed)")
+
+    def _stage_receipt(title: str, verdict_key: str, q_fn, ans: Dict[str, int]) -> None:
+        out = evaluate_row_with_questions(row, q_fn(), ans)
+        badge = out.verdict
+        st.markdown(f"**{title}: `{badge}`**  —  {out.crits} crit, {out.warns} warn, {out.missing} missing")
+        if out.violations:
+            # Show a compact table
+            vdf = pd.DataFrame(out.violations)
+            keep = [c for c in ["severity", "metric", "value", "op", "threshold", "message"] if c in vdf.columns]
+            st.dataframe(vdf[keep], use_container_width=True, height=220)
+        elif out.missing_metrics:
+            st.caption("No violations, but some metrics were missing for this stage.")
+            st.code(", ".join(out.missing_metrics))
+        else:
+            st.caption("No violations.")
+
+    with st.expander("Batch receipts", expanded=False):
+        _stage_receipt("Batch", "batch.verdict", batch_questions, batch_ans)
+    if rs_sum is not None and not rs_sum.empty:
+        with st.expander("Rolling Starts receipts", expanded=False):
+            _stage_receipt("Rolling Starts", "rsq.verdict", rolling_questions, rs_ans)
+    if wf_sum is not None and not wf_sum.empty:
+        with st.expander("Walkforward receipts", expanded=False):
+            _stage_receipt("Walkforward", "wfq.verdict", walkforward_questions, wf_ans)
 
     # Load config details
     cfg_map = {r.get("config_id"): r.get("normalized") for r in _load_jsonl(run_dir / "configs_resolved.jsonl")}
@@ -2661,17 +4078,13 @@ else:
         if eq_path.exists():
             eq = _load_csv(eq_path)
             if eq is not None and not eq.empty:
-                # dt column expected in artifact
                 if "dt" in eq.columns:
                     eq["dt"] = pd.to_datetime(eq["dt"], errors="coerce", utc=True)
                 if px is not None and "equity" in eq.columns:
-                    fig = px.line(eq, x="dt" if "dt" in eq.columns else None, y="equity", title="Equity curve")
+                    fig = px.line(eq, x="dt" if "dt" in eq.columns else None, y="equity", title="Equity curve (Batch replay)")
                     st.plotly_chart(fig, use_container_width=True)
-                st.download_button(
-                    "Download equity_curve.csv",
-                    data=eq_path.read_bytes(),
-                    file_name=f"{pick}_equity_curve.csv",
-                )
+                st.download_button("Download equity_curve.csv", data=eq_path.read_bytes(), file_name=f"{pick}_equity_curve.csv")
+
         cdl1, cdl2, cdl3 = st.columns(3)
         with cdl1:
             if met_path.exists():
@@ -2693,21 +4106,23 @@ else:
         else:
             st.warning("Missing tools/generate_replay_artifacts.py (add it to enable replay generation).")
 
-    # Rolling detail plot
+    # Rolling detail plot (lightweight)
     if rs_dir_effective and (rs_dir_effective / "rolling_starts_detail.csv").exists():
         rs_det = load_rs_detail(run_dir, rs_dir_effective)
         if rs_det is not None and not rs_det.empty and "config_id" in rs_det.columns:
             d = rs_det[rs_det["config_id"].astype(str) == str(pick)].copy()
             if not d.empty and px is not None and "performance.twr_total_return" in d.columns:
                 d["start_dt"] = pd.to_datetime(d.get("start_dt"), errors="coerce", utc=True)
-                fig = px.histogram(d, x="performance.twr_total_return", nbins=40, title="Rolling-start TWR distribution")
+                fig = px.histogram(d, x="performance.twr_total_return", nbins=40, title="Rolling-start TWR distribution (detail)")
                 st.plotly_chart(fig, use_container_width=True)
 
-    # Walkforward plot
+    # Walkforward plot (lightweight)
     if wf_dir_effective and (wf_dir_effective / "wf_results.csv").exists():
         wf_rows = load_wf_results(wf_dir_effective)
         if wf_rows is not None and not wf_rows.empty and "config_id" in wf_rows.columns:
             d = wf_rows[wf_rows["config_id"].astype(str) == str(pick)].copy()
-            if not d.empty and px is not None and "equity.total_return" in d.columns:
-                fig = px.line(d, x="window_idx", y="equity.total_return", title="Walkforward window returns")
-                st.plotly_chart(fig, use_container_width=True)
+            if not d.empty and px is not None:
+                if "window_return" in d.columns:
+                    fig = px.line(d, x="window_idx", y="window_return", title="Walkforward window returns (detail)")
+                    st.plotly_chart(fig, use_container_width=True)
+
