@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import json
+import zipfile
+import io
+import hashlib
 import os
 import math
 import re
@@ -24,15 +27,58 @@ import streamlit.components.v1 as components
 try:
     import plotly.express as px
     import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
 except Exception:  # pragma: no cover
     px = None
     go = None
+    make_subplots = None
 
 # Optional (nice formatting + metric labels)
 try:
     from lab.metrics import METRICS
 except Exception:  # pragma: no cover
     METRICS = {}
+
+
+# =============================================================================
+# Visual system (Sprint 6)
+# =============================================================================
+
+PASS_COLOR = "#00C853"   # vibrant green
+WARN_COLOR = "#FFD600"   # bright amber
+FAIL_COLOR = "#FF1744"   # vivid red
+NEUTRAL_COLOR = "#9E9E9E"
+ACCENT_BLUE = "#2979FF"  # electric blue
+
+VERDICT_COLORS = {
+    "PASS": PASS_COLOR,
+    "WARN": WARN_COLOR,
+    "FAIL": FAIL_COLOR,
+    "UNMEASURED": NEUTRAL_COLOR,
+}
+
+def _style_fig(fig, title: str | None = None):
+    """Apply a consistent sleek + vibrant look to plotly figures."""
+    if fig is None:
+        return fig
+    try:
+        fig.update_layout(
+            template="plotly_white",
+            title=title or (fig.layout.title.text if getattr(fig.layout, "title", None) else None),
+            margin=dict(l=20, r=20, t=55, b=20),
+            font=dict(family="Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial", size=13, color="#111827"),
+            paper_bgcolor="white",
+            plot_bgcolor="white",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        )
+        fig.update_xaxes(showgrid=True, gridcolor="rgba(17,24,39,0.08)", zeroline=False)
+        fig.update_yaxes(showgrid=True, gridcolor="rgba(17,24,39,0.08)", zeroline=False)
+    except Exception:
+        pass
+    return fig
+
+def _verdict_color(v: str) -> str:
+    return VERDICT_COLORS.get(str(v or "").upper(), NEUTRAL_COLOR)
 
 # =============================================================================
 # App meta
@@ -393,18 +439,18 @@ def _render_run_monitor(progress_path: Optional[Path]) -> None:
     """
 
     if progress_path is None:
-        st.info("Run monitor will appear here once progress telemetry is available.")
+        st.info("Waiting for progress telemetry…")
         return
 
     paths: List[Path] = []
     if progress_path.is_dir():
         paths = sorted(progress_path.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
         if not paths:
-            st.info("Run monitor will appear here once progress telemetry is available.")
+            st.info("Waiting for progress telemetry…")
             return
     else:
         if not progress_path.exists():
-            st.info("Run monitor will appear here once progress telemetry is available.")
+            st.info("Waiting for progress telemetry…")
             return
         paths = [progress_path]
 
@@ -428,7 +474,7 @@ def _render_run_monitor(progress_path: Optional[Path]) -> None:
                 events.append(obj)
 
     if not events:
-        st.info("Run monitor will appear here once progress telemetry is available.")
+        st.info("Waiting for progress telemetry…")
         return
 
     # Sort by timestamp if available; otherwise preserve file order.
@@ -447,6 +493,24 @@ def _render_run_monitor(progress_path: Optional[Path]) -> None:
     df = pd.DataFrame(events)
 
     stage = str(last.get("stage", ""))
+    # Friendlier labels (avoid dev-y stage:phase spam)
+    _stage_key = stage.split(":")[0].strip().lower()
+    _phase_key = str(last.get("phase", "")).split(":")[0].strip().lower()
+    _stage_map = {
+        "batch": "Batch sweep",
+        "rolling_starts": "Rolling Starts",
+        "walkforward": "Walkforward",
+        "postprocess": "Postprocess",
+    }
+    _phase_map = {
+        "run": "running",
+        "artifacts": "finalizing",
+        "done": "done",
+        "rerun": "rerun",
+        "rank": "ranking",
+    }
+    stage_disp = _stage_map.get(_stage_key, stage or "(unknown)")
+    phase_disp = _phase_map.get(_phase_key, _phase_key) if _phase_key else ""
     phase = str(last.get("phase", ""))
     done = last.get("i", last.get("done", last.get("n_done", 0)))
     total = last.get("n", last.get("total", last.get("n_total", 0)))
@@ -454,7 +518,7 @@ def _render_run_monitor(progress_path: Optional[Path]) -> None:
     # Header metrics
     cols = st.columns(4)
     with cols[0]:
-        st.metric("Stage", (f"{stage}:{phase}" if phase else stage) or "(unknown)")
+        st.metric("Stage", (f"{stage_disp} — {phase_disp}" if phase_disp else stage_disp) or "(unknown)")
     with cols[1]:
         try:
             st.metric("Progress", f"{int(done)}/{int(total)}")
@@ -553,6 +617,11 @@ def _render_run_monitor(progress_path: Optional[Path]) -> None:
 
 
 
+def _tail_text(lines: Iterable[str], n: int = 40) -> str:
+    xs = list(lines)[-max(0, int(n)) :]
+    return "".join(xs)
+
+
 def _run_cmd(
     cmd: List[str],
     *,
@@ -561,7 +630,12 @@ def _run_cmd(
     progress_path: Optional[Path] = None,
     refresh_hz: float = 4.0,
 ) -> None:
-    """Run a command and stream output + telemetry into the UI."""
+    """Run a command and stream output + telemetry into the UI.
+
+    Sprint 3 polish:
+    - Logs are hidden by default (toggle Debug in the sidebar)
+    - On failure, show a short summary + last output lines
+    """
     if not cmd:
         raise ValueError("Empty command")
 
@@ -569,11 +643,17 @@ def _run_cmd(
     if str(cmd[0]).lower() in {"python", "py", "py.exe", "python3"}:
         cmd = [PY, *cmd[1:]]
 
+    debug = bool(st.session_state.get("ui.debug", False))
+
     with st.expander(label, expanded=True):
-        st.code(" ".join(cmd), language="bash")
+        details = st.expander("Details (command + logs)", expanded=debug)
+        with details:
+            st.code(" ".join(cmd), language="bash")
+            if not debug:
+                st.caption("Debug is off — raw logs are hidden. Toggle Debug in the sidebar to view streaming output.")
+            log_ph = st.empty()
 
         mon_ph = st.empty()
-        log_ph = st.empty()
 
         # Spawn process
         t0 = time.time()
@@ -587,6 +667,7 @@ def _run_cmd(
         )
 
         q: "queue.Queue[str]" = queue.Queue()
+
         def _reader():
             try:
                 assert p.stdout is not None
@@ -598,12 +679,12 @@ def _run_cmd(
         th = threading.Thread(target=_reader, daemon=True)
         th.start()
 
-        lines = deque(maxlen=240)
+        lines = deque(maxlen=800)
         sleep_s = max(0.05, 1.0 / float(max(1.0, refresh_hz)))
 
         while p.poll() is None:
             # Drain output queue
-            for _ in range(200):
+            for _ in range(400):
                 try:
                     lines.append(q.get_nowait())
                 except Exception:
@@ -612,26 +693,199 @@ def _run_cmd(
             with mon_ph.container():
                 _render_run_monitor(progress_path)
 
-            if lines:
-                log_ph.code("".join(list(lines)[-120:]), language="text")
+            if debug and lines:
+                log_ph.code("".join(list(lines)[-140:]), language="text")
 
             time.sleep(sleep_s)
 
         # Final drain
-        for _ in range(2000):
+        for _ in range(8000):
             try:
                 lines.append(q.get_nowait())
             except Exception:
                 break
 
         dt = time.time() - t0
-        if lines:
-            log_ph.code("".join(lines), language="text")
-
         rc = int(p.returncode or 0)
-        if rc != 0:
-            raise RuntimeError(f"Command failed (code={rc}) after {dt:.1f}s")
 
+        # Always show logs on failure (even if debug is off)
+        if rc != 0:
+            tail = _tail_text(lines, n=60)
+            with details:
+                st.error(f"Failed (code={rc}) after {dt:.1f}s")
+                st.code(tail or "(no output captured)", language="text")
+            raise RuntimeError(f"{label} failed (code={rc}) after {dt:.1f}s")
+
+        # On success, only show full logs in debug mode
+        if debug and lines:
+            with details:
+                st.caption(f"Completed in {dt:.1f}s")
+                st.code("".join(lines), language="text")
+
+
+def _run_subprocess_stream(
+    cmd: List[str],
+    *,
+    cwd: Path,
+    label: str,
+    ui_ph: "st.delta_generator.DeltaGenerator",
+    progress_path: Optional[Path] = None,
+    refresh_hz: float = 4.0,
+    debug: Optional[bool] = None,
+) -> Tuple[int, float, str]:
+    """Run a command and stream progress/logs into a *single* UI panel.
+
+    Returns: (returncode, seconds, tail_text)
+    """
+    if not cmd:
+        raise ValueError("Empty command")
+
+    if str(cmd[0]).lower() in {"python", "py", "py.exe", "python3"}:
+        cmd = [PY, *cmd[1:]]
+
+    if debug is None:
+        debug = bool(st.session_state.get("ui.debug", False))
+
+    with ui_ph.container():
+        st.write(f"### {label}")
+        mon_ph = st.empty()
+        details = st.expander("Details (command + logs)", expanded=bool(debug))
+        with details:
+            st.code(" ".join(cmd), language="bash")
+            if not debug:
+                st.caption("Debug is off — streaming logs are hidden. Toggle Debug in the sidebar to view them.")
+            log_ph = st.empty()
+
+    # Spawn process
+    t0 = time.time()
+    p = subprocess.Popen(
+        cmd,
+        cwd=str(cwd),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+
+    q: "queue.Queue[str]" = queue.Queue()
+
+    def _reader():
+        try:
+            assert p.stdout is not None
+            for line in p.stdout:
+                q.put(line)
+        except Exception:
+            pass
+
+    th = threading.Thread(target=_reader, daemon=True)
+    th.start()
+
+    lines = deque(maxlen=800)
+    sleep_s = max(0.05, 1.0 / float(max(1.0, refresh_hz)))
+
+    while p.poll() is None:
+        for _ in range(400):
+            try:
+                lines.append(q.get_nowait())
+            except Exception:
+                break
+
+        with mon_ph.container():
+            if progress_path is not None:
+                _render_run_monitor(progress_path)
+            else:
+                st.info("Running…")
+
+        if bool(debug) and lines:
+            with details:
+                log_ph.code("".join(list(lines)[-140:]), language="text")
+
+        time.sleep(sleep_s)
+
+    # Final drain
+    for _ in range(8000):
+        try:
+            lines.append(q.get_nowait())
+        except Exception:
+            break
+
+    dt = time.time() - t0
+    rc = int(p.returncode or 0)
+    tail = _tail_text(lines, n=80)
+
+    if rc != 0:
+        with ui_ph.container():
+            st.error(f"{label} failed (code={rc}) after {dt:.1f}s")
+            with details:
+                st.code(tail or "(no output captured)", language="text")
+
+    return rc, dt, tail
+
+
+@dataclass
+class _PipelineStage:
+    key: str
+    label: str
+
+
+class _PipelineUI:
+    """A tiny 'lab monitor' that runs stages sequentially and keeps the UI clean.
+
+    - One stepper strip
+    - One active-stage panel (only one stage expanded at a time)
+    - Logs hidden by default (Debug toggle)
+    """
+
+    def __init__(self, stages: List[_PipelineStage], *, debug: Optional[bool] = None):
+        self.stages = stages
+        self.debug = bool(st.session_state.get("ui.debug", False)) if debug is None else bool(debug)
+        self.status: Dict[str, str] = {s.key: "pending" for s in stages}  # pending|running|done|fail
+        self.durations: Dict[str, float] = {}
+        self.stepper_ph = st.empty()
+        self.active_ph = st.empty()
+        self.render()
+
+    def _icon(self, stt: str) -> str:
+        return {
+            "pending": "⬜",
+            "running": "⏳",
+            "done": "✅",
+            "fail": "❌",
+        }.get(stt, "⬜")
+
+    def render(self) -> None:
+        with self.stepper_ph.container():
+            cols = st.columns(len(self.stages))
+            for col, s in zip(cols, self.stages):
+                stt = self.status.get(s.key, "pending")
+                icon = self._icon(stt)
+                dur = self.durations.get(s.key)
+                col.markdown(f"{icon} **{s.label}**")
+                if dur is not None:
+                    col.caption(f"{dur:.1f}s")
+
+    def run(self, key: str, cmd: List[str], *, cwd: Path, progress_path: Optional[Path] = None) -> None:
+        label = next((s.label for s in self.stages if s.key == key), key)
+        self.status[key] = "running"
+        self.render()
+
+        rc, dt, tail = _run_subprocess_stream(
+            cmd,
+            cwd=cwd,
+            label=label,
+            ui_ph=self.active_ph,
+            progress_path=progress_path,
+            debug=self.debug,
+        )
+        self.durations[key] = float(dt)
+
+        if rc != 0:
+            self.status[key] = "fail"
+            self.render()
+            raise RuntimeError(f"{label} failed (code={rc})")
+
+        self.status[key] = "done"
+        self.render()
 
 def _list_runs() -> List[Path]:
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1308,6 +1562,639 @@ def _write_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
             f.write(json.dumps(r, ensure_ascii=False, sort_keys=True, separators=(',', ':')))
             f.write('\n')
 
+
+# =============================================================================
+# Trust layer (Sprint 4): manifest + comparability + strategy pack export
+# =============================================================================
+
+MANIFEST_SCHEMA_VERSION = 2
+
+
+def _utc_iso(ts: float) -> str:
+    try:
+        return datetime.utcfromtimestamp(float(ts)).replace(microsecond=0).isoformat() + "Z"
+    except Exception:
+        return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def _try_git_head(repo_root: Path) -> Optional[str]:
+    """Best-effort git commit hash for receipts."""
+    try:
+        out = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(repo_root), stderr=subprocess.DEVNULL)
+        s = out.decode("utf-8", errors="ignore").strip()
+        return s if re.fullmatch(r"[0-9a-fA-F]{7,40}", s or "") else None
+    except Exception:
+        return None
+
+
+def _fingerprint_file(path: Path, *, full_max_bytes: int = 50_000_000, sample_bytes: int = 1_000_000) -> Dict[str, Any]:
+    """
+    Compute a stable-ish dataset fingerprint.
+    - Full sha256 for small files.
+    - Head+tail sha256 for large files.
+    """
+    stt = path.stat()
+    size = int(stt.st_size)
+    mtime = float(stt.st_mtime)
+
+    mode = "full" if size <= int(full_max_bytes) else "sample"
+    h = hashlib.sha256()
+
+    with open(path, "rb") as f:
+        if mode == "full":
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        else:
+            head = f.read(int(sample_bytes))
+            h.update(head)
+            if size > int(sample_bytes):
+                try:
+                    f.seek(max(0, size - int(sample_bytes)))
+                    tail = f.read(int(sample_bytes))
+                    h.update(tail)
+                except Exception:
+                    pass
+
+    fp: Dict[str, Any] = {
+        "algo": "sha256",
+        "mode": mode,
+        "digest": h.hexdigest(),
+        "size_bytes": size,
+        "mtime_utc": _utc_iso(mtime),
+    }
+    if mode == "sample":
+        fp["sample_bytes"] = int(sample_bytes)
+    return fp
+
+
+
+
+
+# -----------------------------------------------------------------------------
+# Trust layer helpers (Sprint 5)
+# -----------------------------------------------------------------------------
+def _safe_relpath(path: Optional[Path], base: Path) -> Optional[str]:
+    try:
+        if path is None:
+            return None
+        return path.resolve().relative_to(base.resolve()).as_posix()
+    except Exception:
+        return None
+
+
+def _dataset_quick_meta(path: Path, *, max_scan_bytes: int = 200_000_000, tail_lines: int = 2000) -> Dict[str, Any]:
+    """Best-effort dataset metadata for comparability (fast-ish, guarded for huge files)."""
+    meta: Dict[str, Any] = {}
+    try:
+        stt = path.stat()
+        if int(stt.st_size) > int(max_scan_bytes):
+            meta["note"] = "Skipped deep scan (file too large)."
+            return meta
+    except Exception:
+        return meta
+
+    # Columns + schema hash + row count
+    try:
+        import csv
+
+        with path.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            if header:
+                meta["columns"] = header
+                meta["schema_hash"] = hashlib.sha256(",".join(header).encode("utf-8")).hexdigest()
+                cnt = 0
+                for _ in reader:
+                    cnt += 1
+                meta["row_count"] = int(cnt)
+    except Exception:
+        pass
+
+    # Time range hint (head/tail sampling)
+    try:
+        head: List[str] = []
+        tail: deque[str] = deque(maxlen=int(tail_lines))
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            for i, line in enumerate(f):
+                if i < 2000:
+                    head.append(line)
+                tail.append(line)
+
+        cols = meta.get("columns") or []
+        cand = None
+        for c in ["ts", "timestamp", "dt", "date", "datetime"]:
+            if c in cols:
+                cand = c
+                break
+
+        if cand:
+            def _parse(lines: List[str]) -> Tuple[Optional[float], Optional[float]]:
+                if not lines:
+                    return (None, None)
+                try:
+                    df = pd.read_csv(io.StringIO("".join(lines)))
+                    if cand not in df.columns or df.empty:
+                        return (None, None)
+                    ser = df[cand]
+                    if cand in ("ts", "timestamp"):
+                        v = pd.to_numeric(ser, errors="coerce").dropna()
+                        if v.empty:
+                            return (None, None)
+                        return (float(v.min()), float(v.max()))
+                    v = pd.to_datetime(ser, errors="coerce", utc=True).dropna()
+                    if v.empty:
+                        return (None, None)
+                    return (float(v.min().timestamp()), float(v.max().timestamp()))
+                except Exception:
+                    return (None, None)
+
+            h0, h1 = _parse(head)
+            t0, t1 = _parse(list(tail))
+            xs = [x for x in [h0, h1, t0, t1] if x is not None]
+            if xs:
+                meta["time_range_hint_epoch"] = {"min": min(xs), "max": max(xs), "column": cand}
+    except Exception:
+        pass
+
+    return meta
+
+
+def _tests_signature(manifest: Dict[str, Any]) -> Dict[str, Any]:
+    tests = (manifest or {}).get("tests") or {}
+    rs_runs = tests.get("rolling_starts") or []
+    wf_runs = tests.get("walkforward") or []
+
+    def _pick_rs(m: Dict[str, Any]) -> Dict[str, Any]:
+        return {"start_step": m.get("start_step"), "min_bars": m.get("min_bars"), "top_n": m.get("top_n"), "windows_per_cfg": m.get("windows_per_cfg")}
+
+    def _pick_wf(m: Dict[str, Any]) -> Dict[str, Any]:
+        return {"window_days": m.get("window_days"), "step_days": m.get("step_days"), "min_bars": m.get("min_bars"), "top_n": m.get("top_n"), "windows": m.get("windows")}
+
+    rs_sigs = []
+    for r in rs_runs:
+        if isinstance(r, dict):
+            rs_sigs.append(_pick_rs((r.get("meta") or {})))
+    wf_sigs = []
+    for r in wf_runs:
+        if isinstance(r, dict):
+            wf_sigs.append(_pick_wf((r.get("meta") or {})))
+
+    def _uniq(xs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        seen = set()
+        out = []
+        for x in xs:
+            key = json.dumps(x, sort_keys=True, default=str)
+            if key not in seen:
+                seen.add(key)
+                out.append(x)
+        return out
+
+    return {"rolling_starts": _uniq(rs_sigs), "walkforward": _uniq(wf_sigs)}
+
+
+def _compare_manifests(a: Dict[str, Any], b: Dict[str, Any]) -> List[str]:
+    warns: List[str] = []
+
+    da = ((a or {}).get("dataset") or {}).get("fingerprint") or {}
+    db = ((b or {}).get("dataset") or {}).get("fingerprint") or {}
+    if str(da.get("digest") or "") and str(db.get("digest") or "") and str(da.get("digest")) != str(db.get("digest")):
+        warns.append("Dataset fingerprints differ between runs (results are not directly comparable).")
+
+    ga = str((a or {}).get("engine_git_head") or "")
+    gb = str((b or {}).get("engine_git_head") or "")
+    if ga and gb and ga != gb:
+        warns.append("Engine git differs between runs (behavior may differ).")
+
+    sa = _tests_signature(a)
+    sb = _tests_signature(b)
+    if json.dumps(sa.get("rolling_starts"), sort_keys=True) != json.dumps(sb.get("rolling_starts"), sort_keys=True):
+        warns.append("Rolling Starts parameters differ between runs.")
+    if json.dumps(sa.get("walkforward"), sort_keys=True) != json.dumps(sb.get("walkforward"), sort_keys=True):
+        warns.append("Walkforward parameters differ between runs.")
+
+    return warns
+
+
+def _update_runs_index(runs_root: Path) -> None:
+    """Maintain runs/_index.json for quick browsing + cross-run compare."""
+    items: List[Dict[str, Any]] = []
+    try:
+        for d in sorted([p for p in runs_root.glob("batch_*") if p.is_dir()], key=lambda p: p.stat().st_mtime, reverse=True):
+            mp = d / "manifest.json"
+            if not mp.exists():
+                continue
+            m = _read_json(mp)
+            ds = (m.get("dataset") or {}) if isinstance(m, dict) else {}
+            fp = (ds.get("fingerprint") or {}) if isinstance(ds, dict) else {}
+            dig = str(fp.get("digest") or "")
+            items.append(
+                {
+                    "run_id": d.name,
+                    "created_at": m.get("created_at") if isinstance(m, dict) else _utc_iso(d.stat().st_mtime),
+                    "dataset_digest": dig,
+                    "dataset_digest_short": (dig[:10] + "…" + dig[-6:]) if dig else "",
+                    "engine_git_head": (m.get("engine_git_head") if isinstance(m, dict) else None) or "",
+                    "tests": _tests_signature(m if isinstance(m, dict) else {}),
+                }
+            )
+    except Exception:
+        pass
+
+    try:
+        out = {"schema_version": 1, "updated_at": _utc_iso(time.time()), "items": items}
+        _write_json(runs_root / "_index.json", out)
+    except Exception:
+        pass
+def _scan_test_runs(run_dir: Path) -> Dict[str, Any]:
+    """Scan RS/WF output folders and collect meta for receipts + warnings."""
+    rs_root = run_dir / "rolling_starts"
+    wf_root = run_dir / "walkforward"
+
+    def _dirs(root: Path, pat: str) -> List[Path]:
+        if not root.exists():
+            return []
+        xs = [p for p in root.glob(pat) if p.is_dir()]
+        return sorted(xs, key=lambda p: p.stat().st_mtime)
+
+    rs_runs: List[Dict[str, Any]] = []
+    for d in _dirs(rs_root, "rs_*"):
+        rs_runs.append(
+            {
+                "dir": str(d),
+                "meta": _read_json(d / "rs_meta.json") if (d / "rs_meta.json").exists() else {},
+                "summary": str(d / "rolling_starts_summary.csv") if (d / "rolling_starts_summary.csv").exists() else None,
+                "detail": str(d / "rolling_starts_detail.csv") if (d / "rolling_starts_detail.csv").exists() else None,
+                "mtime_utc": _utc_iso(d.stat().st_mtime),
+            }
+        )
+
+    wf_runs: List[Dict[str, Any]] = []
+    for d in _dirs(wf_root, "wf_*"):
+        wf_runs.append(
+            {
+                "dir": str(d),
+                "meta": _read_json(d / "wf_meta.json") if (d / "wf_meta.json").exists() else {},
+                "summary": str(d / "wf_summary.csv") if (d / "wf_summary.csv").exists() else None,
+                "results": str(d / "wf_results.csv") if (d / "wf_results.csv").exists() else None,
+                "mtime_utc": _utc_iso(d.stat().st_mtime),
+            }
+        )
+
+    return {"rolling_starts": rs_runs, "walkforward": wf_runs}
+
+
+def _build_manifest(
+    run_dir: Path,
+    *,
+    compute_fingerprint: bool = True,
+    existing_fp: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    meta = _read_json(run_dir / "batch_meta.json") if (run_dir / "batch_meta.json").exists() else {}
+    data_path = Path(str(meta.get("data") or meta.get("data_path") or "")).expanduser()
+    dataset: Dict[str, Any] = {
+        "path_abs": str(data_path) if str(data_path) else None,
+        "path_rel_to_repo": _safe_relpath(data_path, REPO_ROOT) if str(data_path) else None,
+        "basename": data_path.name if str(data_path) else None,
+    }
+
+    if str(data_path) and data_path.exists():
+        # Avoid re-hashing on every UI rerun if an existing fingerprint is still valid.
+        if (not compute_fingerprint) and isinstance(existing_fp, dict) and existing_fp:
+            dataset["fingerprint"] = existing_fp
+        else:
+            dataset["fingerprint"] = _fingerprint_file(data_path)
+
+        # Extra metadata for comparability (best-effort; guarded for huge files)
+        try:
+            dataset["meta"] = _dataset_quick_meta(data_path)
+        except Exception:
+            dataset["meta"] = {}
+
+    created_guess = None
+    # Try parse run folder name: batch_YYYYMMDD_HHMMSS_...
+    m = re.match(r"batch_(\d{8})_(\d{6})_", run_dir.name)
+    if m:
+        try:
+            dt = datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
+            created_guess = dt.replace(tzinfo=None).isoformat() + "Z"
+        except Exception:
+            created_guess = None
+
+    app_fp = None
+    try:
+        app_fp = _fingerprint_file(Path(__file__).resolve(), full_max_bytes=5_000_000)
+    except Exception:
+        app_fp = None
+
+    run_dir_abs = run_dir.resolve()
+    manifest: Dict[str, Any] = {
+        "schema_version": int(MANIFEST_SCHEMA_VERSION),
+        "run_id": str(run_dir.name),
+        "created_at": created_guess or _utc_iso(run_dir.stat().st_mtime),
+        "repo_root": str(REPO_ROOT),
+        "run_dir": {"abs": str(run_dir_abs), "rel_to_repo": _safe_relpath(run_dir_abs, REPO_ROOT)},
+        "engine_git_head": _try_git_head(REPO_ROOT),
+        "app_file_fingerprint": app_fp,
+        "dataset": dataset,
+        "batch_meta": meta,
+        "tests": _scan_test_runs(run_dir),
+    }
+    return manifest
+def _ensure_manifest(run_dir: Path) -> Dict[str, Any]:
+    """Create/refresh manifest.json. Safe for old runs; avoids re-hashing unchanged datasets."""
+    path = run_dir / "manifest.json"
+    try:
+        existing = _read_json(path) if path.exists() else {}
+    except Exception:
+        existing = {}
+
+    # Decide whether we need to recompute the dataset hash (can be expensive for big CSVs).
+    compute_fp = True
+    existing_fp = None
+    try:
+        ds = (existing or {}).get("dataset") or {}
+        existing_fp = (ds.get("fingerprint") or {}) if isinstance(ds, dict) else None
+        p = ds.get("path_abs") or ds.get("path")
+        if p and isinstance(existing_fp, dict) and existing_fp:
+            data_path = Path(str(p)).expanduser()
+            if data_path.exists():
+                stt = data_path.stat()
+                cur_size = int(stt.st_size)
+                cur_mtime = _utc_iso(float(stt.st_mtime))
+                rec_size = int(existing_fp.get("size_bytes", -1))
+                rec_mtime = str(existing_fp.get("mtime_utc") or "")
+                if (rec_size != -1 and cur_size == rec_size) and (rec_mtime and cur_mtime == rec_mtime):
+                    compute_fp = False
+    except Exception:
+        compute_fp = True
+        existing_fp = None
+
+    new = _build_manifest(run_dir, compute_fingerprint=compute_fp, existing_fp=existing_fp)
+
+    # If an existing manifest exists, keep any unknown top-level keys.
+    merged = dict(existing or {})
+    merged.update(new)
+
+    try:
+        _write_json(path, merged)
+    except Exception:
+        # If writing fails (permissions), still return what we built.
+        return merged
+
+    # Update runs index (best-effort)
+    try:
+        _update_runs_index(REPO_ROOT / "runs")
+    except Exception:
+        pass
+
+    return merged
+def _comparability_warnings(manifest: Dict[str, Any]) -> List[str]:
+    warns: List[str] = []
+
+    ds = (manifest or {}).get("dataset") or {}
+    p = ds.get("path_abs") or ds.get("path")
+    fp = (ds.get("fingerprint") or {}) if isinstance(ds, dict) else {}
+
+    if not p:
+        warns.append("No dataset path recorded in manifest. Comparability is weaker.")
+        return warns
+
+    data_path = Path(str(p)).expanduser()
+    if not data_path.exists():
+        warns.append("Dataset file no longer exists at the recorded path. Comparability is weaker.")
+        return warns
+
+    # Quick check: size + mtime
+    try:
+        stt = data_path.stat()
+        cur_size = int(stt.st_size)
+        cur_mtime = _utc_iso(float(stt.st_mtime))
+        rec_size = int(fp.get("size_bytes", -1)) if isinstance(fp, dict) else -1
+        rec_mtime = str(fp.get("mtime_utc") or "")
+        drift = False
+        if rec_size != -1 and cur_size != rec_size:
+            warns.append("Dataset size differs from the recorded fingerprint (file may have changed).")
+            drift = True
+        if rec_mtime and cur_mtime != rec_mtime:
+            warns.append("Dataset modification time differs from the recorded fingerprint (file may have changed).")
+            drift = True
+        # Only compute a hash comparison if cheap checks suggest drift.
+        if drift:
+            cur_fp = _fingerprint_file(data_path)
+            rec_digest = str(fp.get("digest") or "")
+            if rec_digest and str(cur_fp.get("digest")) != rec_digest:
+                warns.append("Dataset fingerprint digest does not match (you are not running on the same data).")
+    except Exception:
+        warns.append("Could not validate dataset fingerprint. Comparability is weaker.")
+
+    # Multiple RS/WF parameter sets
+    tests = (manifest or {}).get("tests") or {}
+    rs_runs = tests.get("rolling_starts") or []
+    wf_runs = tests.get("walkforward") or []
+
+    def _rs_sig(m: Dict[str, Any]) -> str:
+        return f"step={m.get('start_step')}|min={m.get('min_bars')}|top_n={m.get('top_n')}|wins={m.get('windows_per_cfg')}"
+
+    def _wf_sig(m: Dict[str, Any]) -> str:
+        return f"win={m.get('window_days')}|step={m.get('step_days')}|min={m.get('min_bars')}|top_n={m.get('top_n')}|wins={m.get('windows')}"
+
+    try:
+        rs_sigs = {_rs_sig((r.get("meta") or {})) for r in rs_runs if isinstance(r, dict)}
+        rs_sigs = {s for s in rs_sigs if "None" not in s}
+        if len(rs_sigs) > 1:
+            warns.append("Multiple Rolling Starts evidence sets exist with different parameters. Verdicts depend on which evidence set is used.")
+    except Exception:
+        pass
+
+    try:
+        wf_sigs = {_wf_sig((r.get("meta") or {})) for r in wf_runs if isinstance(r, dict)}
+        wf_sigs = {s for s in wf_sigs if "None" not in s}
+        if len(wf_sigs) > 1:
+            warns.append("Multiple Walkforward evidence sets exist with different parameters. Verdicts depend on which evidence set is used.")
+    except Exception:
+        pass
+
+    return warns
+
+
+def _zip_add_bytes(zf: zipfile.ZipFile, arcname: str, data: bytes) -> None:
+    zf.writestr(arcname, data)
+
+
+def _zip_add_file(zf: zipfile.ZipFile, file_path: Path, arcname: str) -> None:
+    try:
+        zf.write(str(file_path), arcname=arcname)
+    except Exception:
+        # fallback: read bytes
+        try:
+            _zip_add_bytes(zf, arcname, file_path.read_bytes())
+        except Exception:
+            pass
+
+
+def _build_strategy_pack_zip(
+    *,
+    run_dir: Path,
+    run_name: str,
+    config_id: str,
+    manifest: Dict[str, Any],
+    candidate_row: Dict[str, Any],
+    cfg_norm: Dict[str, Any],
+    rs_dir: Optional[Path],
+    wf_dir: Optional[Path],
+    top_art_dir: Optional[Path],
+    include_replay: bool = True,
+    include_dataset: bool = False,
+) -> bytes:
+    """Strategy Pack v2: structured, portable, verifiable."""
+    buf = io.BytesIO()
+    index: Dict[str, Any] = {"pack_version": 2, "created_at": _utc_iso(time.time()), "files": {}}
+
+    def _sha256_bytes(b: bytes) -> str:
+        return hashlib.sha256(b).hexdigest()
+
+    def add_bytes(arc: str, b: bytes) -> None:
+        _zip_add_bytes(zf, arc, b)
+        index["files"][arc] = {"algo": "sha256", "digest": _sha256_bytes(b), "size_bytes": int(len(b))}
+
+    def add_file(fp: Path, arc: str, *, hash_limit_bytes: int = 50_000_000) -> None:
+        try:
+            _zip_add_file(zf, fp, arc)
+        except Exception:
+            return
+        try:
+            size = int(fp.stat().st_size)
+            digest = ""
+            if size <= int(hash_limit_bytes):
+                h = hashlib.sha256()
+                with fp.open("rb") as f:
+                    for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                        h.update(chunk)
+                digest = h.hexdigest()
+            index["files"][arc] = {"algo": "sha256", "digest": digest, "size_bytes": size}
+        except Exception:
+            pass
+
+    # Portable pack manifest (no absolute paths)
+    ds = (manifest.get("dataset") or {}) if isinstance(manifest, dict) else {}
+    ds_fp = (ds.get("fingerprint") or {}) if isinstance(ds, dict) else {}
+    ds_meta = (ds.get("meta") or {}) if isinstance(ds, dict) else {}
+
+    pack_manifest: Dict[str, Any] = {
+        "schema_version": 2,
+        "pack_version": 2,
+        "source_run_id": str(run_name),
+        "created_at": _utc_iso(time.time()),
+        "engine_git_head": (manifest.get("engine_git_head") if isinstance(manifest, dict) else None) or "",
+        "app_file_fingerprint": (manifest.get("app_file_fingerprint") if isinstance(manifest, dict) else None) or {},
+        "dataset": {
+            "basename": ds.get("basename") or (Path(str(ds.get("path_abs") or ds.get("path") or "")).name if (ds.get("path_abs") or ds.get("path")) else None),
+            "fingerprint": ds_fp,
+            "meta": ds_meta,
+            "included_in_pack": bool(include_dataset),
+        },
+        "selected_config_id": str(config_id),
+        "tests_signature": _tests_signature(manifest if isinstance(manifest, dict) else {}),
+        "notes": "Portable strategy pack. Absolute paths removed; verify dataset via fingerprint.",
+    }
+
+    # README
+    readme = f"""# Strategy Pack (v2)
+
+This bundle contains receipts for a single strategy config.
+
+- Source run: `{run_name}`
+- Config: `{str(config_id)}`
+- Engine git: `{pack_manifest.get('engine_git_head','')[:12]}`
+
+## Verify
+1. Use the in-app verifier to validate file hashes.
+2. To verify your dataset, compare its fingerprint digest to `manifest.json -> dataset -> fingerprint -> digest`.
+
+"""
+
+    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        add_bytes("README.md", readme.encode("utf-8"))
+        add_bytes("manifest.json", json.dumps(pack_manifest, indent=2, ensure_ascii=False).encode("utf-8"))
+
+        # Configs + evidence
+        add_bytes("config/config_normalized.json", json.dumps(cfg_norm or {}, indent=2, ensure_ascii=False).encode("utf-8"))
+        add_bytes("evidence/candidate_row.json", json.dumps(candidate_row or {}, indent=2, ensure_ascii=False).encode("utf-8"))
+
+        # Resolved config line
+        try:
+            cfg_line = next((r for r in _load_jsonl(run_dir / "configs_resolved.jsonl") if str(r.get("config_id")) == str(config_id)), None)
+            if cfg_line is not None:
+                add_bytes("config/config_resolved.json", json.dumps(cfg_line, indent=2, ensure_ascii=False).encode("utf-8"))
+        except Exception:
+            pass
+
+        # Batch meta
+        if (run_dir / "batch_meta.json").exists():
+            add_file(run_dir / "batch_meta.json", "meta/batch_meta.json")
+
+        # RS evidence (filtered)
+        if rs_dir is not None and rs_dir.exists():
+            if (rs_dir / "rs_meta.json").exists():
+                add_file(rs_dir / "rs_meta.json", "meta/rolling_starts/rs_meta.json")
+            try:
+                s = rs_dir / "rolling_starts_summary.csv"
+                d = rs_dir / "rolling_starts_detail.csv"
+                if s.exists():
+                    sdf = pd.read_csv(s)
+                    sdf["config_id"] = sdf["config_id"].astype(str)
+                    sdf1 = sdf[sdf["config_id"] == str(config_id)].copy()
+                    add_bytes("evidence/rolling_starts/summary_row.csv", sdf1.to_csv(index=False).encode("utf-8"))
+                if d.exists():
+                    ddf = pd.read_csv(d)
+                    ddf["config_id"] = ddf["config_id"].astype(str)
+                    ddf1 = ddf[ddf["config_id"] == str(config_id)].copy()
+                    add_bytes("evidence/rolling_starts/detail_rows.csv", ddf1.to_csv(index=False).encode("utf-8"))
+            except Exception:
+                pass
+
+        # WF evidence (filtered)
+        if wf_dir is not None and wf_dir.exists():
+            if (wf_dir / "wf_meta.json").exists():
+                add_file(wf_dir / "wf_meta.json", "meta/walkforward/wf_meta.json")
+            try:
+                s = wf_dir / "wf_summary.csv"
+                r = wf_dir / "wf_results.csv"
+                if s.exists():
+                    sdf = pd.read_csv(s)
+                    sdf["config_id"] = sdf["config_id"].astype(str)
+                    sdf1 = sdf[sdf["config_id"] == str(config_id)].copy()
+                    add_bytes("evidence/walkforward/summary_row.csv", sdf1.to_csv(index=False).encode("utf-8"))
+                if r.exists():
+                    rdf = pd.read_csv(r)
+                    rdf["config_id"] = rdf["config_id"].astype(str)
+                    rdf1 = rdf[rdf["config_id"] == str(config_id)].copy()
+                    add_bytes("evidence/walkforward/window_rows.csv", rdf1.to_csv(index=False).encode("utf-8"))
+            except Exception:
+                pass
+
+        # Replay/top artifacts
+        if include_replay and top_art_dir is not None and top_art_dir.exists():
+            for fp in top_art_dir.rglob("*"):
+                if fp.is_file():
+                    rel = fp.relative_to(top_art_dir).as_posix()
+                    add_file(fp, f"artifacts/{rel}", hash_limit_bytes=10_000_000)
+
+        # Optional: include dataset
+        if include_dataset:
+            try:
+                ds_path = ds.get("path_abs") or ds.get("path")
+                if ds_path:
+                    p = Path(str(ds_path)).expanduser()
+                    if p.exists():
+                        add_file(p, f"dataset/{p.name}", hash_limit_bytes=200_000_000)
+            except Exception:
+                pass
+
+        # Pack index last
+        add_bytes("meta/pack_index.json", json.dumps(index, indent=2, ensure_ascii=False).encode("utf-8"))
+
+    return buf.getvalue()
 def _baseline_row_from_base_json(base_path: Path) -> Dict[str, Any]:
     base = _read_json(base_path)
     if 'params' not in base or not isinstance(base['params'], dict):
@@ -1377,11 +2264,22 @@ with st.sidebar:
 
     if open_existing != "(new run)":
         st.session_state["selected_run"] = open_existing
+    else:
+        # Selecting "(new run)" should always drop you into the Build & Run flow.
+        st.session_state["ui.section"] = "1) Build & Run"
 
     st.divider()
-    st.header("Workflow")
+    st.header("App")
 
-    # Stage nav (simple stepper)
+    st.session_state.setdefault("ui.debug", False)
+    st.checkbox(
+        "Debug (show commands & logs)",
+        key="ui.debug",
+        help="Off by default to keep the UI clean. Turn on to see raw subprocess logs and full commands.",
+    )
+
+
+    # Keep stage keys for internal routing ("Next →" buttons, etc.)
     STAGES = [
         ("A) Batch", "batch"),
         ("B) Rolling Starts", "rs"),
@@ -1394,17 +2292,26 @@ with st.sidebar:
     st.session_state.setdefault("ui.stage", "batch")
     st.session_state.setdefault("ui.batch.scroll_to_inspect", False)
 
-    stage_map = {key: label for (label, key) in STAGES}
-    stage_pick = st.radio("Stage", options=stage_keys, format_func=lambda k: stage_map.get(k, k), key="ui.stage")
+    # MVP navigation: two sections only
+    SECTION_OPTS = ["1) Build & Run", "2) Results & Autopsy"]
+    if "ui.section" not in st.session_state:
+        st.session_state["ui.section"] = SECTION_OPTS[0] if open_existing == "(new run)" else SECTION_OPTS[1]
 
-    st.divider()
-    st.caption("Tip: start with Batch. Only run RS/WF once you have survivors.")
+    if "ui.section_next" in st.session_state:
+        st.session_state["ui.section"] = st.session_state.pop("ui.section_next")
+
+    st.radio("Section", options=SECTION_OPTS, key="ui.section")
+    st.caption("Build & Run = define strategy + run tests. Results & Autopsy = filter, compare, inspect.")
 
 # =============================================================================
 # New run wizard (when "(new run)" is selected)
 # =============================================================================
 
 if open_existing == "(new run)":
+    # This section is only the "Build & Run" half of the MVP UI.
+    if str(st.session_state.get("ui.section", "1) Build & Run")).startswith("2)"):
+        st.info("Results require an existing run. Switch to **Build & Run** to create one.")
+        st.stop()
     st.subheader("Create a new run")
 
     # Step state
@@ -1664,6 +2571,78 @@ if open_existing == "(new run)":
         )
         max_dd_filter = st.slider("Optional filter: max drawdown (0 disables)", 0.0, 0.99, 0.0, 0.01, key="new.max_dd_filter")
 
+
+        st.subheader("Optional: run robustness tests after Batch")
+        st.caption("These run *after* Batch completes, using the survivors from this run.")
+        colT1, colT2 = st.columns(2)
+        with colT1:
+            new_do_rs = st.checkbox("Rolling Starts (fragility)", value=False, key="new.do_rs")
+            st.caption("Checks if results depend on lucky start dates.")
+        with colT2:
+            new_do_wf = st.checkbox("Walkforward (discipline)", value=False, key="new.do_wf")
+            st.caption("Checks if it survives windowed time splits.")
+
+        # Rough bars/day hint for defaults
+        bars_per_day_hint = 1
+        try:
+            bar_ms_hint = _infer_bar_ms_from_csv(data_path)
+            if bar_ms_hint:
+                bars_per_day_hint = int(max(1, round(86_400_000 / float(bar_ms_hint))))
+        except Exception:
+            bars_per_day_hint = 1
+
+        if new_do_rs:
+            with st.expander("Rolling Starts settings", expanded=True):
+                preset = st.selectbox("Preset", ["Quick", "Standard", "Thorough"], index=1, key="new.rs.preset")
+                preset_prev = st.session_state.get("new.rs.preset_prev", None)
+                if preset != preset_prev:
+                    if preset == "Quick":
+                        step_days, min_days = 14, 180
+                    elif preset == "Thorough":
+                        step_days, min_days = 7, 365
+                    else:
+                        step_days, min_days = 10, 270
+                    st.session_state["new.rs.start_step"] = int(max(1, round(step_days * bars_per_day_hint)))
+                    st.session_state["new.rs.min_bars"] = int(max(30, round(min_days * bars_per_day_hint)))
+                    st.session_state["new.rs.preset_prev"] = preset
+
+                st.number_input(
+                    "Start step (bars)",
+                    1,
+                    500000,
+                    int(st.session_state.get("new.rs.start_step", max(1, int(round(7 * bars_per_day_hint))))),
+                    5,
+                    key="new.rs.start_step",
+                )
+                st.number_input(
+                    "Min bars per start",
+                    30,
+                    5000000,
+                    int(st.session_state.get("new.rs.min_bars", max(30, int(round(365 * bars_per_day_hint))))),
+                    10,
+                    key="new.rs.min_bars",
+                )
+
+        if new_do_wf:
+            with st.expander("Walkforward settings", expanded=True):
+                preset = st.selectbox("Preset", ["Quick", "Standard", "Thorough"], index=1, key="new.wf.preset")
+                preset_prev = st.session_state.get("new.wf.preset_prev", None)
+                if preset != preset_prev:
+                    if preset == "Quick":
+                        window_days, step_days = 30, 15
+                    elif preset == "Thorough":
+                        window_days, step_days = 180, 30
+                    else:
+                        window_days, step_days = 90, 30
+                    st.session_state["new.wf.window_days"] = int(window_days)
+                    st.session_state["new.wf.step_days"] = int(step_days)
+                    st.session_state["new.wf.preset_prev"] = preset
+
+                st.number_input("Window (days)", min_value=1, max_value=3650, step=1, key="new.wf.window_days")
+                st.number_input("Step (days)", min_value=1, max_value=3650, step=1, key="new.wf.step_days")
+                # We'll clamp min-bars at run-time once bars/day is known from the run meta
+                st.number_input("Min bars per window", min_value=1, max_value=5_000_000, step=1, key="new.wf.min_bars")
+                st.number_input("Jobs", min_value=1, max_value=64, step=1, value=8, key="new.wf.jobs")
         do_run = st.button("Run batch stress test", type="primary")
 
         if do_run:
@@ -1671,6 +2650,19 @@ if open_existing == "(new run)":
                 t0 = time.time()
                 tmp_run_dir = tmp_dir / f"run_{_now_slug()}"
                 tmp_run_dir.mkdir(parents=True, exist_ok=True)
+
+                # UI: unified run monitor (Sprint 3)
+                st.subheader("Run monitor")
+                stages: List[_PipelineStage] = [
+                    _PipelineStage("grid", "Variants"),
+                    _PipelineStage("batch", "Batch"),
+                    _PipelineStage("post", "Postprocess"),
+                ]
+                if bool(st.session_state.get("new.do_rs", False)):
+                    stages.append(_PipelineStage("rs", "Rolling Starts"))
+                if bool(st.session_state.get("new.do_wf", False)):
+                    stages.append(_PipelineStage("wf", "Walkforward"))
+                pipe = _PipelineUI(stages)
 
                 # 1) Write baseline
                 base_path = _write_baseline_json(
@@ -1706,7 +2698,7 @@ if open_existing == "(new run)":
                 else:
                     grid_cmd += ["--mode", "random"]
 
-                _run_cmd(grid_cmd, cwd=REPO_ROOT, label="1) Generate variants grid")
+                pipe.run("grid", grid_cmd, cwd=REPO_ROOT)
                 _ensure_grid_has_baseline(grid_path, base_path, total_n=int(st.session_state["new.grid_n"]))
 
                 # 3) Batch
@@ -1780,12 +2772,7 @@ if open_existing == "(new run)":
                 })
                 _write_json(meta_path, meta)
                 batch_cmd += ["--no-progress", "--progress-file", str(batch_progress), "--progress-every", "25"]
-                _run_cmd(
-                    batch_cmd,
-                    cwd=REPO_ROOT,
-                    label="2) Batch sweep + rerun",
-                    progress_path=batch_progress.parent,
-                )
+                pipe.run("batch", batch_cmd, cwd=REPO_ROOT, progress_path=batch_progress.parent)
 
                 run_dir = RUNS_DIR / str(run_name)
                 if not run_dir.exists():
@@ -1807,18 +2794,138 @@ if open_existing == "(new run)":
                 if max_dd_filter and float(max_dd_filter) > 0:
                     post_cmd += ["--max-dd", str(float(max_dd_filter))]
 
-                _run_cmd(post_cmd, cwd=REPO_ROOT, label="3) Postprocess (rank + top_ids)")
+                pipe.run("post", post_cmd, cwd=REPO_ROOT)
+
+                # 5) Optional: run Rolling Starts / Walkforward immediately after Batch
+                post_ok = True
+                try:
+                    do_rs = bool(st.session_state.get("new.do_rs", False))
+                    do_wf = bool(st.session_state.get("new.do_wf", False))
+                    if do_rs or do_wf:
+                        st.info("Running selected robustness tests…")
+
+                        frames2 = load_batch_frames(run_dir)
+                        survivors2, _src2 = pick_survivors(frames2)
+                        survivors_ids = survivors2["config_id"].astype(str).tolist()
+                        N = len(survivors_ids)
+
+                        ids_file = run_dir / "post" / "survivor_ids.txt"
+                        ids_file.parent.mkdir(parents=True, exist_ok=True)
+                        ids_file.write_text("\n".join(survivors_ids) + "\n", encoding="utf-8")
+
+                        bars_per_day = _bars_per_day_from_run_meta(run_dir)
+
+                        rs_root = run_dir / "rolling_starts"
+                        wf_root = run_dir / "walkforward"
+
+                        if do_rs and N > 0:
+                            start_step = int(st.session_state.get("new.rs.start_step", max(1, int(round(10 * bars_per_day)))))
+                            min_bars = int(st.session_state.get("new.rs.min_bars", max(30, int(round(270 * bars_per_day)))))
+
+                            rs_out_dir = rs_root / f"rs_step{start_step}_min{min_bars}_n{N}"
+                            rs_progress = rs_out_dir / "progress" / "rolling_starts.jsonl"
+                            rs_progress.parent.mkdir(parents=True, exist_ok=True)
+
+                            cmd = [
+                                PY,
+                                "-m",
+                                "research.rolling_starts",
+                                "--from-run",
+                                str(run_dir),
+                                "--out",
+                                str(rs_out_dir),
+                                "--ids",
+                                str(ids_file),                                "--top-n",
+                                str(N),
+                                "--start-step",
+                                str(start_step),
+                                "--min-bars",
+                                str(min_bars),
+                                "--seed",
+                                "1",
+                                "--starting-equity",
+                                str(float(st.session_state.get("new.starting_eq", 1000.0) or 1000.0)),
+                                "--jobs", "8",
+                                "--no-progress",
+                                "--progress-file",
+                                str(rs_progress),
+                                "--progress-every",
+                                "10",
+                            ]
+                            pipe.run("rs", cmd, cwd=REPO_ROOT, progress_path=rs_progress.parent)
+
+                        if do_wf and N > 0:
+                            window_days = int(st.session_state.get("new.wf.window_days", 90))
+                            step_days = int(st.session_state.get("new.wf.step_days", 30))
+                            min_bars = int(st.session_state.get("new.wf.min_bars", 1))
+                            expected_window_bars = int(max(1, round(window_days * bars_per_day)))
+                            min_bars_effective = int(min(int(min_bars), int(expected_window_bars)))
+                            jobs = int(st.session_state.get("new.wf.jobs", 8))
+
+                            wf_out_dir = wf_root / f"wf_win{window_days}_step{step_days}_min{min_bars_effective}_n{N}"
+                            wf_progress = wf_out_dir / "progress" / "walkforward.jsonl"
+                            wf_progress.parent.mkdir(parents=True, exist_ok=True)
+
+                            cmd = [
+                                PY,
+                                "-m",
+                                "engine.walkforward",
+                                "--from-run",
+                                str(run_dir),
+                                "--out",
+                                str(wf_out_dir),                                "--top-n",
+                                str(N),
+                                "--window-days",
+                                str(window_days),
+                                "--step-days",
+                                str(step_days),
+                                "--min-bars",
+                                str(min_bars_effective),
+                                "--seed",
+                                "1",
+                                "--starting-equity",
+                                str(float(st.session_state.get("new.starting_eq", 1000.0) or 1000.0)),
+                                "--jobs",
+                                str(jobs),
+                                "--no-progress",
+                                "--progress-file",
+                                str(wf_progress),
+                                "--progress-every",
+                                "10",
+                            ]
+                            pipe.run("wf", cmd, cwd=REPO_ROOT, progress_path=wf_progress.parent)
+
+                except Exception as e:
+                    post_ok = False
+                    st.warning(f"Post-batch tests failed: {e}")
+
+
+                # Trust layer: write/refresh manifest.json for this run
+                try:
+                    _ensure_manifest(run_dir)
+                except Exception:
+                    pass
 
                 st.success(f"Done in {time.time()-t0:.1f}s. Run saved to: {run_dir.name}")
 
-                # Switch to opening this run
+                # Switch to opening this run (so Results can find it)
                 st.session_state["selected_run"] = run_dir.name
                 st.session_state["ui.open_run_next"] = run_dir.name  # set on next rerun before widget instantiates
 
                 # Reset wizard
                 st.session_state["new.step"] = 0
 
-                st.rerun()
+                if post_ok:
+                    # After a successful full run, jump to Results by default
+                    st.session_state["ui.section_next"] = "2) Results & Autopsy"
+                    st.session_state.setdefault("ui.stage", "batch")
+                    st.rerun()
+                else:
+                    st.info("Some selected robustness tests failed. Review the logs above, then open the run in Results when ready.")
+                    if st.button("Open Results & Autopsy", key="run.goto_results_after_fail"):
+                        st.session_state["ui.section_next"] = "2) Results & Autopsy"
+                        st.session_state.setdefault("ui.stage", "batch")
+                        st.rerun()
 
             except Exception as e:
                 st.error(str(e))
@@ -1878,6 +2985,399 @@ wf_root = run_dir / "walkforward"
 rs_latest = _pick_latest_dir(rs_root, "rs_*") if rs_root.exists() else None
 wf_latest = _pick_latest_dir(wf_root, "wf_*") if wf_root.exists() else None
 
+# =============================================================================
+# MVP navigation: Build & Run vs Results
+# =============================================================================
+
+section_pick = str(st.session_state.get("ui.section", "2) Results & Autopsy"))
+
+if section_pick.startswith("1)"):
+    st.header("Build & Run")
+
+    st.caption("Run additional stress tests on the *current* run’s survivors. Results live in the Results & Autopsy section.")
+    st.write(f"Survivors detected: **{len(survivors):,}** (source: **{survivor_source}**).")
+
+    bars_per_day = _bars_per_day_from_run_meta(run_dir)
+
+    # ---- Test selection
+    st.subheader("Choose tests to run")
+    col_a, col_b = st.columns(2)
+    with col_a:
+        do_rs = st.checkbox("Rolling Starts (start-date fragility)", value=False, key="runner.do_rs")
+        st.caption("Same strategy, many start dates → reveals ‘lucky start’ dependence.")
+    with col_b:
+        do_wf = st.checkbox("Walkforward (out-of-sample-ish windows)", value=False, key="runner.do_wf")
+        st.caption("Repeats training/testing through time → reveals generalization vs overfit.")
+
+    # ---- Config panels
+    rs_out_dir = None
+    wf_out_dir = None
+    ids_file = None
+
+    survivors_ids = survivors["config_id"].astype(str).tolist()
+    N = len(survivors_ids)
+
+    # Persist survivor ids for reproducible replays
+    ids_file = run_dir / "post" / "survivor_ids.txt"
+    ids_file.parent.mkdir(parents=True, exist_ok=True)
+    ids_file.write_text("\n".join(survivors_ids) + "\n", encoding="utf-8")
+
+    if do_rs:
+        st.markdown("#### Rolling Starts settings")
+        with st.expander("Rolling Starts settings", expanded=True):
+            preset = st.selectbox("Preset", ["Quick", "Standard", "Thorough"], index=1, key="rs.preset")
+            # Apply preset defaults once per change (mirrors RS page behavior)
+            preset_prev = st.session_state.get("rs.preset_prev", None)
+            if preset != preset_prev:
+                if preset == "Quick":
+                    step_days, min_days = 14, 180
+                elif preset == "Thorough":
+                    step_days, min_days = 7, 365
+                else:
+                    step_days, min_days = 10, 270
+                st.session_state["rs.start_step"] = int(max(1, round(step_days * bars_per_day)))
+                st.session_state["rs.min_bars"] = int(max(30, round(min_days * bars_per_day)))
+                st.session_state["rs.preset_prev"] = preset
+
+            start_step = int(
+                st.number_input(
+                    "Start step (bars)",
+                    1,
+                    500000,
+                    int(st.session_state.get("rs.start_step", max(1, int(round(7 * bars_per_day))))),
+                    5,
+                    key="rs.start_step",
+                )
+            )
+            min_bars = int(
+                st.number_input(
+                    "Min bars per start",
+                    30,
+                    5000000,
+                    int(st.session_state.get("rs.min_bars", max(30, int(round(365 * bars_per_day))))),
+                    10,
+                    key="rs.min_bars",
+                )
+            )
+
+            rs_out_dir = rs_root / f"rs_step{start_step}_min{min_bars}_n{N}"
+            st.caption(f"Output: {rs_out_dir}")
+
+    if do_wf:
+        st.markdown("#### Walkforward settings")
+        with st.expander("Walkforward settings", expanded=True):
+            preset = st.selectbox("Preset", ["Quick", "Standard", "Thorough"], index=1, key="wf.preset")
+            preset_prev = st.session_state.get("wf.preset_prev", None)
+            if preset != preset_prev:
+                if preset == "Quick":
+                    window_days, step_days = 30, 15
+                elif preset == "Thorough":
+                    window_days, step_days = 180, 30
+                else:
+                    window_days, step_days = 90, 30
+                st.session_state["wf.window_days"] = int(window_days)
+                st.session_state["wf.step_days"] = int(step_days)
+                st.session_state["wf.preset_prev"] = preset
+
+            window_days = int(st.number_input("Window (days)", min_value=1, max_value=3650, step=1, key="wf.window_days"))
+            step_days = int(st.number_input("Step (days)", min_value=1, max_value=3650, step=1, key="wf.step_days"))
+
+            expected_window_bars = int(max(1, round(window_days * bars_per_day)))
+            st.caption(f"Expected bars per window: ~{expected_window_bars:,}. (Min bars must be ≤ this.)")
+
+            max_mb = int(max(1, expected_window_bars))
+            if "wf.min_bars" not in st.session_state:
+                st.session_state["wf.min_bars"] = int(max_mb)
+            if int(st.session_state.get("wf.min_bars", 1)) > int(max_mb):
+                st.session_state["wf.min_bars"] = int(max_mb)
+
+            min_bars = int(st.number_input(
+                "Min bars per window",
+                min_value=1,
+                max_value=max_mb,
+                step=1,
+                key="wf.min_bars",
+            ))
+            if "wf.jobs" not in st.session_state:
+                st.session_state["wf.jobs"] = 8
+            jobs = int(st.number_input("Jobs", min_value=1, max_value=64, step=1, key="wf.jobs"))
+
+            min_bars_effective = int(min(int(min_bars), int(expected_window_bars)))
+            if int(min_bars) != int(min_bars_effective):
+                st.warning(
+                    f"Min bars ({min_bars}) exceeds expected bars/window (~{expected_window_bars}). "
+                    f"Will clamp to {min_bars_effective}."
+                )
+
+            wf_out_dir = wf_root / f"wf_win{window_days}_step{step_days}_min{min_bars_effective}_n{N}"
+            st.caption(f"Output: {wf_out_dir}")
+
+    st.divider()
+
+    run_btn = st.button("Run selected tests", type="primary", disabled=(not do_rs and not do_wf))
+    if run_btn:
+        try:
+            st.subheader("Run monitor")
+            stages: List[_PipelineStage] = []
+            if do_rs and rs_out_dir is not None:
+                stages.append(_PipelineStage("rs", "Rolling Starts"))
+            if do_wf and wf_out_dir is not None:
+                stages.append(_PipelineStage("wf", "Walkforward"))
+            pipe = _PipelineUI(stages)
+
+            if do_rs and rs_out_dir is not None:
+                rs_progress = rs_out_dir / "progress" / "rolling_starts.jsonl"
+                rs_progress.parent.mkdir(parents=True, exist_ok=True)
+                cmd = [
+                    PY,
+                    "-m",
+                    "research.rolling_starts",
+                    "--from-run",
+                    str(run_dir),
+                    "--out",
+                    str(rs_out_dir),
+                    "--ids",
+                    str(ids_file),
+                    "--top-n",
+                    str(N),
+                    "--start-step",
+                    str(int(st.session_state.get("rs.start_step", 1))),
+                    "--min-bars",
+                    str(int(st.session_state.get("rs.min_bars", 30))),
+                    "--seed",
+                    "1",
+                    "--starting-equity",
+                    str(float(meta.get("starting_equity", 1000.0) or 1000.0)),
+                    "--jobs", "8",
+                    "--no-progress",
+                    "--progress-file",
+                    str(rs_progress),
+                    "--progress-every",
+                    "10",
+                ]
+                pipe.run("rs", cmd, cwd=REPO_ROOT, progress_path=rs_progress.parent)
+
+            if do_wf and wf_out_dir is not None:
+                wf_progress = wf_out_dir / "progress" / "walkforward.jsonl"
+                wf_progress.parent.mkdir(parents=True, exist_ok=True)
+                window_days = int(st.session_state.get("wf.window_days", 90))
+                step_days = int(st.session_state.get("wf.step_days", 30))
+                min_bars = int(st.session_state.get("wf.min_bars", 1))
+                expected_window_bars = int(max(1, round(window_days * bars_per_day)))
+                min_bars_effective = int(min(int(min_bars), int(expected_window_bars)))
+                cmd = [
+                    PY,
+                    "-m",
+                    "engine.walkforward",
+                    "--from-run",
+                    str(run_dir),
+                    "--out",
+                    str(wf_out_dir),
+                    "--top-n",
+                    str(N),
+                    "--window-days",
+                    str(window_days),
+                    "--step-days",
+                    str(step_days),
+                    "--min-bars",
+                    str(min_bars_effective),
+                    "--seed",
+                    "1",
+                    "--starting-equity",
+                    str(float(meta.get("starting_equity", 1000.0) or 1000.0)),
+                    "--jobs",
+                    str(int(st.session_state.get("wf.jobs", 8))),
+                    "--no-progress",
+                    "--progress-file",
+                    str(wf_progress),
+                    "--progress-every",
+                    "10",
+                ]
+                pipe.run("wf", cmd, cwd=REPO_ROOT, progress_path=wf_progress.parent)
+
+            st.success("Selected tests completed.")
+
+            # Trust layer: refresh manifest now that RS/WF evidence may have changed
+            try:
+                _ensure_manifest(run_dir)
+            except Exception:
+                pass
+            st.session_state["ui.section_next"] = "2) Results & Autopsy"
+            if do_wf:
+                st.session_state["ui.stage"] = "wf"
+            elif do_rs:
+                st.session_state["ui.stage"] = "rs"
+            else:
+                st.session_state["ui.stage"] = "grand"
+            st.rerun()
+
+        except Exception as e:
+            st.error(str(e))
+            st.stop()
+
+    st.stop()
+
+# ---- Results section
+st.header("Results & Autopsy")
+
+# -----------------------------------------------------------------------------
+# Run status strip (MVP contract: Results is view-only)
+# -----------------------------------------------------------------------------
+total_cfg = int(len(survivors)) if survivors is not None else 0
+
+# Batch is "ready" if we have a run loaded.
+batch_icon = "✅"
+batch_label = "ready"
+
+# Rolling Starts coverage
+rs_done = 0
+try:
+    if rs_latest is not None:
+        _rs_sum_status = load_rs_summary(run_dir, rs_latest)
+        if _rs_sum_status is not None and not _rs_sum_status.empty and "config_id" in _rs_sum_status.columns:
+            rs_done = int(_rs_sum_status["config_id"].astype(str).nunique())
+except Exception:
+    rs_done = 0
+
+if rs_done <= 0:
+    rs_icon = "⚠️"
+    rs_label = "missing"
+elif total_cfg > 0 and rs_done < total_cfg:
+    rs_icon = "⚠️"
+    rs_label = f"partial ({rs_done}/{total_cfg})"
+else:
+    rs_icon = "✅"
+    rs_label = "ready"
+
+# Walkforward coverage
+wf_done = 0
+try:
+    if wf_latest is not None:
+        _wf_sum_status = load_wf_summary(wf_latest)
+        if _wf_sum_status is not None and not _wf_sum_status.empty and "config_id" in _wf_sum_status.columns:
+            wf_done = int(_wf_sum_status["config_id"].astype(str).nunique())
+except Exception:
+    wf_done = 0
+
+if wf_done <= 0:
+    wf_icon = "⚠️"
+    wf_label = "missing"
+elif total_cfg > 0 and wf_done < total_cfg:
+    wf_icon = "⚠️"
+    wf_label = f"partial ({wf_done}/{total_cfg})"
+else:
+    wf_icon = "✅"
+    wf_label = "ready"
+
+missing_rs = (rs_done <= 0) or (total_cfg > 0 and rs_done < total_cfg)
+missing_wf = (wf_done <= 0) or (total_cfg > 0 and wf_done < total_cfg)
+
+strip1, strip2, strip3, strip4 = st.columns([1.1, 1.5, 1.2, 1.6])
+with strip1:
+    st.markdown(f"**Batch:** {batch_icon} {batch_label}")
+with strip2:
+    st.markdown(f"**Rolling Starts:** {rs_icon} {rs_label}")
+with strip3:
+    st.markdown(f"**Walkforward:** {wf_icon} {wf_label}")
+with strip4:
+    if missing_rs or missing_wf:
+        if st.button("Go run missing tests", type="primary", key="results.go_run_missing"):
+            st.session_state["runner.do_rs"] = bool(missing_rs)
+            st.session_state["runner.do_wf"] = bool(missing_wf)
+            st.session_state["ui.section_next"] = "1) Build & Run"
+            st.rerun()
+    else:
+        st.caption("Results is view-only. Run tests from Build & Run.")
+
+
+# -----------------------------------------------------------------------------
+# Trust & comparability (Sprint 4/5)
+# -----------------------------------------------------------------------------
+manifest = {}
+try:
+    manifest = _ensure_manifest(run_dir)
+except Exception:
+    manifest = {}
+
+warns = []
+try:
+    warns = _comparability_warnings(manifest)
+except Exception:
+    warns = []
+
+# Optional cross-run compare (Sprint 5)
+compare_warns: List[str] = []
+compare_manifest: Dict[str, Any] = {}
+compare_run = None
+try:
+    runs_root = REPO_ROOT / "runs"
+    other_runs = [p.name for p in runs_root.glob("batch_*") if p.is_dir() and p.name != run_dir.name]
+    other_runs = sorted(other_runs, reverse=True)
+except Exception:
+    other_runs = []
+
+with st.container(border=True):
+    st.markdown("#### Trust & comparability")
+    ds = (manifest.get("dataset") or {}) if isinstance(manifest, dict) else {}
+    ds_path = ds.get("path_abs") or ds.get("path")
+    fp = (ds.get("fingerprint") or {}) if isinstance(ds, dict) else {}
+    git_head = (manifest.get("engine_git_head") if isinstance(manifest, dict) else None) or "unknown"
+
+    cA, cB, cC = st.columns([1.4, 1.2, 1.2])
+    with cA:
+        st.caption("Dataset")
+        st.code(str(ds_path or "unknown"), language="text")
+    with cB:
+        st.caption("Fingerprint")
+        dig = str(fp.get("digest") or "")
+        st.code((dig[:10] + "…" + dig[-10:]) if dig else "unknown", language="text")
+    with cC:
+        st.caption("Engine git")
+        gh = str(git_head or "")
+        st.code((gh[:10] + "…" + gh[-6:]) if gh and gh != "unknown" else "unknown", language="text")
+
+    if other_runs:
+        compare_run = st.selectbox("Compare to another run (optional)", ["(none)"] + other_runs, index=0, key="trust.compare_run")
+        if compare_run and compare_run != "(none)":
+            try:
+                compare_manifest = _ensure_manifest(runs_root / compare_run)
+                compare_warns = _compare_manifests(manifest if isinstance(manifest, dict) else {}, compare_manifest if isinstance(compare_manifest, dict) else {})
+            except Exception:
+                compare_warns = ["Could not load/compare the selected run manifest."]
+
+    if warns:
+        for w in warns:
+            st.warning(w)
+    else:
+        st.success("Manifest present. Dataset + test parameters look comparable.")
+
+    if compare_run and compare_run != "(none)":
+        if compare_warns:
+            st.info("Cross-run comparability warnings:")
+            for w in compare_warns:
+                st.warning(w)
+        else:
+            st.success("Selected run appears comparable (dataset + test parameters match).")
+
+    try:
+        st.download_button(
+            "Download manifest.json",
+            data=json.dumps(manifest, indent=2, ensure_ascii=False).encode("utf-8"),
+            file_name=f"{selected_run_name}_manifest.json",
+            key="dl.manifest",
+        )
+    except Exception:
+        pass
+
+    with st.expander("Show manifest (raw JSON)", expanded=False):
+        st.json(manifest)
+
+
+# Force cockpit mode: show the unified Grand Verdict cockpit only.
+st.session_state["ui.stage"] = "grand"
+stage_pick = "grand"
+
+st.divider()
 # =============================================================================
 # Stage A: Batch
 # =============================================================================
@@ -2777,10 +4277,7 @@ Rule of thumb: prefer strategies with a **decent p10** (survives bad starts), no
                 "--from-run",
                 str(run_dir),
                 "--out",
-                str(rs_out_dir),
-                "--ids",
-                str(ids_file),
-                "--top-n",
+                str(rs_out_dir),                "--top-n",
                 str(len(survivors_ids)),
                 "--start-step",
                 str(start_step),
@@ -2790,6 +4287,7 @@ Rule of thumb: prefer strategies with a **decent p10** (survives bad starts), no
                 "1",
                 "--starting-equity",
                 str(float(meta.get("starting_equity", 1000.0) or 1000.0)),
+                "--jobs", "8",
             ]
             rs_progress = rs_out_dir / "progress" / "rolling_starts.jsonl"
             rs_progress.parent.mkdir(parents=True, exist_ok=True)
@@ -3767,24 +5265,11 @@ def _grand_score_row(r: Dict[str, Any]) -> float:
 
 
 if stage_pick == "grand":
-    st.write("### D) Grand verdict (Batch + RS + WF)")
-    st.caption(
-        "This is the final filter + ranking stage. You pick your pain limits first (target profile), "
-        "then the lab finds the strategies that survive *all* stress tests."
-    )
-
-    with st.expander("How to read Grand Verdict", expanded=False):
-        st.markdown(
-            """
-- **PASS / WARN / FAIL** are driven by the question sets below.
-- **PASS** means the strategy stays within your limits.
-- **WARN** means it violates *soft* constraints (it might be OK, but it’s suspicious).
-- **FAIL** means it violates *hard* constraints.
-- If Rolling Starts or Walkforward are **UNMEASURED**, you can either ignore them or require them.
-
-The ranking is intentionally **worst‑case aware**: it prefers strategies with good *p10* outcomes and tolerable *p90* drawdowns.
-            """.strip()
-        )
+    # -------------------------------------------------------------------------
+    # Cockpit view (MVP): preferences → shortlist → evidence
+    # -------------------------------------------------------------------------
+    st.subheader("Cockpit")
+    st.caption("Define your pain limits first → then pick survivors → then inspect evidence. Results are view-only.")
 
     # Load latest RS/WF if present
     rs_dir_effective = rs_latest
@@ -3796,58 +5281,148 @@ The ranking is intentionally **worst‑case aware**: it prefers strategies with 
     df = survivors.copy()
     df = _ensure_config_id(df)
 
-    # --- Target profile presets ---
-    preset = st.selectbox(
-        "Target profile preset",
-        options=["None", "Balanced", "Conservative", "Aggressive"],
-        index=1,
-        key="grand.profile_preset",
-        help="Sets default choices for the filters below. You can still tweak anything.",
-    )
-    c1, c2 = st.columns([1, 3])
-    with c1:
-        if st.button("Apply preset", key="grand.apply_preset_btn"):
-            _apply_grand_preset(str(preset))
-            st.rerun()
-    with c2:
-        st.caption("Presets just set defaults for the radios below. They don’t change your data, only the filters.")
+    # =========================
+    # Preferences wedge
+    # =========================
+    with st.container(border=True):
+        st.markdown("#### Preferences (your wedge)")
 
-    # Stage A verdict
-    with st.expander("Batch questions (used in grand verdict)", expanded=False):
-        batch_ans = _question_ui(batch_questions(), key_prefix="q.grand.batch")
-    df = apply_stage_eval(df, stage_key="batch", questions=batch_questions(), answers=batch_ans)
+        preset = st.selectbox(
+            "Target profile preset",
+            options=["Balanced", "Conservative", "Aggressive", "Custom"],
+            index=0,
+            key="grand.profile_preset_v2",
+            help="Presets set sane defaults for the limit radios below. 'Custom' keeps your current choices.",
+        )
 
-    # Stage B verdict (if measured)
-    if rs_sum is not None and not rs_sum.empty:
-        df = merge_stage(df, rs_sum, on="config_id", suffix="rs")
-        with st.expander("Rolling-start questions (used in grand verdict)", expanded=False):
-            rs_ans = _question_ui(rolling_questions(), key_prefix="q.grand.rs")
-        df = apply_stage_eval(df, stage_key="rsq", questions=rolling_questions(), answers=rs_ans)
-    else:
-        df["rs.measured"] = False
-        df["rsq.verdict"] = "UNMEASURED"
+        c1, c2, c3 = st.columns([1, 1, 2])
+        with c1:
+            if st.button("Apply preset", key="grand.apply_preset_btn_v2", disabled=(preset == "Custom")):
+                # Capture current answers → apply preset → compute diff (so users can see what changed)
+                bqs = batch_questions()
+                rqs = rolling_questions()
+                wqs = walkforward_questions()
 
-    # Stage C verdict (if measured)
-    if wf_sum is not None and not wf_sum.empty:
-        df = merge_stage(df, wf_sum, on="config_id", suffix="wf")
-        with st.expander("Walkforward questions (used in grand verdict)", expanded=False):
-            wf_ans = _question_ui(walkforward_questions(), key_prefix="q.grand.wf")
-        df = apply_stage_eval(df, stage_key="wfq", questions=walkforward_questions(), answers=wf_ans)
-    else:
-        df["wf.measured"] = False
-        df["wfq.verdict"] = "UNMEASURED"
+                def _get_idx(prefix: str, q) -> int:
+                    key = f"{prefix}.{q.id}"
+                    try:
+                        return int(st.session_state.get(key, int(q.default_index)))
+                    except Exception:
+                        return int(getattr(q, "default_index", 0) or 0)
 
-    st.divider()
-    st.subheader("Grand filter rules")
+                def _choice_label(q, idx: int) -> str:
+                    try:
+                        idx2 = max(0, min(int(idx), len(q.choices) - 1))
+                        return str(q.choices[idx2].label)
+                    except Exception:
+                        return str(idx)
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        req_batch = st.selectbox("Require Batch", options=["PASS only", "PASS or WARN", "Ignore"], index=1, key="grand.req_batch")
-    with col2:
-        req_rs = st.selectbox("Require Rolling Starts", options=["PASS only", "PASS or WARN", "Ignore"], index=1, key="grand.req_rs")
-    with col3:
-        req_wf = st.selectbox("Require Walkforward", options=["PASS only", "PASS or WARN", "Ignore"], index=1, key="grand.req_wf")
+                before = {}
+                for q in bqs:
+                    before[("Batch", q.id)] = _get_idx("q.grand.batch", q)
+                for q in rqs:
+                    before[("Rolling Starts", q.id)] = _get_idx("q.grand.rs", q)
+                for q in wqs:
+                    before[("Walkforward", q.id)] = _get_idx("q.grand.wf", q)
 
+                _apply_grand_preset(str(preset))
+
+                changes = []
+                for q in bqs:
+                    a = _get_idx("q.grand.batch", q)
+                    b = int(before.get(("Batch", q.id), a))
+                    if a != b:
+                        changes.append(("Batch", str(getattr(q, "title", getattr(q, "id", ""))), _choice_label(q, b), _choice_label(q, a)))
+                for q in rqs:
+                    a = _get_idx("q.grand.rs", q)
+                    b = int(before.get(("Rolling Starts", q.id), a))
+                    if a != b:
+                        changes.append(("Rolling Starts", str(getattr(q, "title", getattr(q, "id", ""))), _choice_label(q, b), _choice_label(q, a)))
+                for q in wqs:
+                    a = _get_idx("q.grand.wf", q)
+                    b = int(before.get(("Walkforward", q.id), a))
+                    if a != b:
+                        changes.append(("Walkforward", str(getattr(q, "title", getattr(q, "id", ""))), _choice_label(q, b), _choice_label(q, a)))
+
+                st.session_state["grand.last_preset_applied"] = str(preset)
+                st.session_state["grand.last_preset_changes"] = list(changes)
+        with c2:
+            show_help = st.checkbox("Show explainer", value=False, key="grand.show_help")
+        with c3:
+            st.caption("Presets only change filters. They never modify your data or rerun anything.")
+
+
+        last_preset = st.session_state.get("grand.last_preset_applied")
+        last_changes = st.session_state.get("grand.last_preset_changes")
+        if last_preset and isinstance(last_changes, list):
+            if len(last_changes) == 0:
+                st.info(f"Preset **{last_preset}** matched your current limits (no changes).")
+            else:
+                st.success(f"Applied preset **{last_preset}** → updated {len(last_changes)} limit choices.")
+                with st.expander("Show what the preset changed", expanded=True):
+                    # Keep it readable: show the first N changes.
+                    for section, q_label, old_label, new_label in last_changes[:40]:
+                        st.write(f"**{section}** · {q_label}: `{old_label}` → `{new_label}`")
+                    if len(last_changes) > 40:
+                        st.caption(f"(Showing 40 of {len(last_changes)} changes.)")
+
+        if show_help:
+            st.markdown('''
+- **PASS / WARN / FAIL** are driven by the limit radios below.  
+- **PASS** = within limits. **WARN** = suspicious but maybe acceptable. **FAIL** = exceeds hard limits.  
+- If Rolling Starts / Walkforward are **missing**, either ignore them (early exploration) or require them (trust mode).
+'''.strip())
+
+        # Limit radios (collapsed by default; the preset sets defaults)
+        with st.expander("Batch limits", expanded=True):
+            batch_ans = _question_ui(batch_questions(), key_prefix="q.grand.batch")
+        df = apply_stage_eval(df, stage_key="batch", questions=batch_questions(), answers=batch_ans)
+
+        rs_ans: Dict[str, int] = {}
+        if rs_sum is not None and not rs_sum.empty:
+            df = merge_stage(df, rs_sum, on="config_id", suffix="rs")
+            with st.expander("Rolling Starts limits", expanded=True):
+                rs_ans = _question_ui(rolling_questions(), key_prefix="q.grand.rs")
+            df = apply_stage_eval(df, stage_key="rsq", questions=rolling_questions(), answers=rs_ans)
+        else:
+            df["rs.measured"] = False
+            df["rsq.verdict"] = "UNMEASURED"
+
+        wf_ans: Dict[str, int] = {}
+        if wf_sum is not None and not wf_sum.empty:
+            df = merge_stage(df, wf_sum, on="config_id", suffix="wf")
+            with st.expander("Walkforward limits", expanded=True):
+                wf_ans = _question_ui(walkforward_questions(), key_prefix="q.grand.wf")
+            df = apply_stage_eval(df, stage_key="wfq", questions=walkforward_questions(), answers=wf_ans)
+        else:
+            df["wf.measured"] = False
+            df["wfq.verdict"] = "UNMEASURED"
+
+        st.divider()
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            req_batch = st.selectbox("Require Batch", options=["PASS only", "PASS or WARN", "Ignore"], index=1, key="grand.req_batch")
+        with col2:
+            req_rs = st.selectbox("Require Rolling Starts", options=["PASS only", "PASS or WARN", "Ignore"], index=1, key="grand.req_rs")
+        with col3:
+            req_wf = st.selectbox("Require Walkforward", options=["PASS only", "PASS or WARN", "Ignore"], index=1, key="grand.req_wf")
+
+        # Verdict visibility toggles (global)
+        vc1, vc2, vc3 = st.columns(3)
+        with vc1:
+            show_pass = st.checkbox("Show PASS", value=True, key="grand.show_pass")
+        with vc2:
+            show_warn = st.checkbox("Show WARN", value=True, key="grand.show_warn")
+        with vc3:
+            show_fail = st.checkbox("Show FAIL/UNMEASURED", value=False, key="grand.show_fail")
+
+        st.markdown("#### Ranking")
+        st.caption("The score is a ranking hint. The evidence tabs are the receipts.")
+
+    # =========================
+    # Build the shortlist (unified candidates table)
+    # =========================
     def _keep(verdict: str, rule: str) -> bool:
         if rule.startswith("Ignore"):
             return True
@@ -3889,7 +5464,6 @@ The ranking is intentionally **worst‑case aware**: it prefers strategies with 
 
         keep_mask.append(bool(ok))
 
-        # Combine into a single grand verdict (for readability)
         if "FAIL" in stage_vs or "UNMEASURED" in stage_vs:
             gv = "FAIL" if "UNMEASURED" not in stage_vs else "UNMEASURED"
         elif "WARN" in stage_vs:
@@ -3901,31 +5475,11 @@ The ranking is intentionally **worst‑case aware**: it prefers strategies with 
     df["grand.verdict"] = grand_verdicts
     df2 = df[pd.Series(keep_mask, index=df.index)].copy()
 
-    st.success(f"Grand survivors: {len(df2)}/{len(df)}")
+    if not df2.empty:
+        df2["score.grand_robust"] = [_grand_score_row(r) for r in df2.to_dict(orient="records")]
+        df2["score.grand_robust"] = pd.to_numeric(df2["score.grand_robust"], errors="coerce")
 
-    # --- Scoring / ranking ---
-    st.subheader("Ranking")
-
-    # Compute a worst-case aware score (visible + exportable)
-    df2["score.grand_robust"] = [_grand_score_row(r) for r in df2.to_dict(orient="records")]
-    df2["score.grand_robust"] = pd.to_numeric(df2["score.grand_robust"], errors="coerce")
-
-    with st.expander("What is the 'Grand robust score'?", expanded=False):
-        st.markdown(
-            """
-It’s a deliberately boring scoring function:
-
-- rewards **p10 returns** (worst‑typical outcomes)  
-- penalizes **p90 drawdowns** (bad‑typical pain)  
-- lightly penalizes **underwater time** (in years)
-
-Walkforward matters most, Rolling Starts second, Batch third.
-
-It’s not a magic number — it’s a ranking hint. The receipts (charts + artifacts) still win.
-            """.strip()
-        )
-
-    sort_opts = []
+    sort_opts: List[str] = []
     for c in [
         "score.grand_robust",
         "score.calmar_equity",
@@ -3943,12 +5497,163 @@ It’s not a magic number — it’s a ranking hint. The receipts (charts + arti
     ]:
         if c in df2.columns and c not in sort_opts:
             sort_opts.append(c)
+    if not sort_opts:
+        sort_opts = ["config_id"]
 
     sort_by = st.selectbox("Sort by", options=sort_opts, index=0, key="grand.sort_by")
     ascending = st.checkbox("Ascending", value=False, key="grand.asc")
-    if sort_by in df2.columns:
+    if sort_by in df2.columns and not df2.empty:
         df2[sort_by] = pd.to_numeric(df2[sort_by], errors="coerce")
         df2 = df2.sort_values(sort_by, ascending=bool(ascending))
+
+    mask_v: List[bool] = []
+    for v in df2.get("grand.verdict", pd.Series([], dtype=str)).astype(str):
+        if v == "PASS" and show_pass:
+            mask_v.append(True)
+        elif v == "WARN" and show_warn:
+            mask_v.append(True)
+        elif v in {"FAIL", "UNMEASURED"} and show_fail:
+            mask_v.append(True)
+        else:
+            mask_v.append(False)
+
+    df_show = df2[pd.Series(mask_v, index=df2.index)] if (len(mask_v) == len(df2)) else df2
+
+
+    # =========================
+    # Run story (population-level explainability)
+    # =========================
+    with st.container(border=True):
+        st.markdown("#### Run story (what happened to the whole run)")
+        st.caption("After your preferences are applied, these charts summarize how the *population* of strategies behaved — not just one config.")
+
+        show_story = st.checkbox("Show run story charts", value=True, key="story.show")
+        if not show_story:
+            st.caption("Run story hidden.")
+        elif px is None or go is None:
+            st.info("Plotly is not available in this environment, so charts are disabled.")
+        else:
+            df_all = df.copy()
+            df_req = df2.copy()
+            df_vis = df_show.copy()
+
+            # Funnel: evaluated → meets requirements → visible
+            funnel = pd.DataFrame(
+                {
+                    "Stage": ["Survivors evaluated", "Meets requirements", "Visible now"],
+                    "Count": [int(len(df_all)), int(len(df_req)), int(len(df_vis))],
+                }
+            )
+            fig_funnel = go.Figure(
+                go.Funnel(
+                    y=funnel["Stage"],
+                    x=funnel["Count"],
+                    textinfo="value+percent initial",
+                    marker=dict(color=[ACCENT_BLUE, WARN_COLOR, PASS_COLOR]),
+                )
+            )
+            _style_fig(fig_funnel, title="Survivor funnel")
+
+            # Verdict distribution by stage (stacked)
+            rows = []
+            for stage_label, col in [
+                ("Batch", "batch.verdict"),
+                ("Rolling Starts", "rsq.verdict"),
+                ("Walkforward", "wfq.verdict"),
+                ("Grand", "grand.verdict"),
+            ]:
+                if col in df_all.columns:
+                    vc = df_all[col].fillna("UNMEASURED").astype(str).value_counts()
+                    for v, cnt in vc.items():
+                        rows.append({"Stage": stage_label, "Verdict": str(v), "Count": int(cnt)})
+            df_stage = pd.DataFrame(rows)
+
+            fig_stage = None
+            if not df_stage.empty:
+                fig_stage = px.bar(
+                    df_stage,
+                    x="Stage",
+                    y="Count",
+                    color="Verdict",
+                    barmode="stack",
+                    color_discrete_map={k: _verdict_color(k) for k in df_stage["Verdict"].unique()},
+                )
+                _style_fig(fig_stage, title="Verdict mix by stage")
+                fig_stage.update_layout(xaxis_title=None, yaxis_title=None)
+
+            c1, c2 = st.columns([1.0, 1.2])
+            with c1:
+                st.plotly_chart(fig_funnel, use_container_width=True)
+            with c2:
+                if fig_stage is not None:
+                    st.plotly_chart(fig_stage, use_container_width=True)
+                else:
+                    st.caption("No verdict columns found to build stage distribution.")
+
+            # Risk/return map (drawdown vs return), highlight the currently-visible shortlist
+            dd_col = _pick_col(df_all, ["performance.max_drawdown_equity", "performance.max_drawdown", "equity.max_drawdown"])
+            ret_col = _pick_col(df_all, ["performance.twr_total_return", "equity.net_profit_ex_cashflows", "equity.net_profit"])
+            if dd_col and ret_col and dd_col in df_all.columns and ret_col in df_all.columns:
+                base = df_all.copy()
+                base[dd_col] = pd.to_numeric(base[dd_col], errors="coerce")
+                base[ret_col] = pd.to_numeric(base[ret_col], errors="coerce")
+                base = base.dropna(subset=[dd_col, ret_col])
+
+                hi = df_vis.copy()
+                if dd_col in hi.columns and ret_col in hi.columns:
+                    hi[dd_col] = pd.to_numeric(hi[dd_col], errors="coerce")
+                    hi[ret_col] = pd.to_numeric(hi[ret_col], errors="coerce")
+                    hi = hi.dropna(subset=[dd_col, ret_col])
+
+                fig_rr = go.Figure()
+                fig_rr.add_trace(
+                    go.Scatter(
+                        x=base[dd_col],
+                        y=base[ret_col],
+                        mode="markers",
+                        name="All survivors",
+                        marker=dict(size=6, color="rgba(17,24,39,0.12)"),
+                        hoverinfo="skip",
+                        showlegend=False,
+                    )
+                )
+
+                if not hi.empty and "grand.verdict" in hi.columns:
+                    for v, g in hi.groupby(hi["grand.verdict"].astype(str)):
+                        fig_rr.add_trace(
+                            go.Scatter(
+                                x=g[dd_col],
+                                y=g[ret_col],
+                                mode="markers",
+                                name=str(v),
+                                marker=dict(size=9, color=_verdict_color(v), line=dict(width=0.5, color="rgba(17,24,39,0.35)")),
+                                text=g.get("config_id"),
+                                hovertemplate="config=%{text}<br>dd=%{x:.2%}<br>ret=%{y:.2%}<extra></extra>",
+                            )
+                        )
+
+                _style_fig(fig_rr, title="Risk/return map (population view)")
+                fig_rr.update_xaxes(title="Max drawdown (lower is better)", tickformat=".0%")
+                fig_rr.update_yaxes(title="Total return (higher is better)", tickformat=".0%")
+                st.plotly_chart(fig_rr, use_container_width=True)
+            else:
+                st.caption("Risk/return map unavailable (missing drawdown/return columns).")
+
+            # Robustness distribution (grand robust score)
+            score_col = "score.grand_robust" if "score.grand_robust" in df_req.columns else None
+            if score_col:
+                s = pd.to_numeric(df_req[score_col], errors="coerce").dropna()
+                if len(s) > 0:
+                    fig_hist = go.Figure(go.Histogram(x=s, nbinsx=35, marker=dict(color=ACCENT_BLUE)))
+                    _style_fig(fig_hist, title="Robustness score distribution (after requirements)")
+                    fig_hist.update_xaxes(title="Robustness score (higher is better)")
+                    fig_hist.update_yaxes(title="Count")
+                    st.plotly_chart(fig_hist, use_container_width=True)
+    st.markdown("#### Unified candidates table")
+    st.caption(f"Candidates shown: **{len(df_show):,}** / Survivors evaluated: **{len(df):,}**")
+    if df_show.empty:
+        st.info("No candidates under current rules. Relax constraints or run missing tests.")
+        st.stop()
 
     show_cols = [
         "config_id",
@@ -3971,158 +5676,413 @@ It’s not a magic number — it’s a ranking hint. The receipts (charts + arti
         "performance.max_drawdown_equity",
         "equity.net_profit_ex_cashflows",
     ]
-    show_cols = [c for c in show_cols if c in df2.columns]
+    show_cols = [c for c in show_cols if c in df_show.columns]
 
-    # Verdict visibility toggles
-    vc1, vc2, vc3 = st.columns(3)
-    with vc1:
-        show_pass = st.checkbox("Show PASS", value=True, key="grand.show_pass")
-    with vc2:
-        show_warn = st.checkbox("Show WARN", value=True, key="grand.show_warn")
-    with vc3:
-        show_fail = st.checkbox("Show FAIL/UNMEASURED", value=False, key="grand.show_fail")
-
-    mask_v = []
-    for v in df2.get("grand.verdict", pd.Series([], dtype=str)).astype(str):
-        if v == "PASS" and show_pass:
-            mask_v.append(True)
-        elif v == "WARN" and show_warn:
-            mask_v.append(True)
-        elif v in {"FAIL", "UNMEASURED"} and show_fail:
-            mask_v.append(True)
-        else:
-            mask_v.append(False)
-
-    df_show = df2[pd.Series(mask_v, index=df2.index)] if len(mask_v) == len(df2) else df2
-
-    st.dataframe(df_show[show_cols], use_container_width=True, height=520)
-
-    st.download_button(
-        "Download grand survivors (CSV)",
-        data=df2.to_csv(index=False).encode("utf-8"),
-        file_name=f"{selected_run_name}_grand_survivors.csv",
-    )
-
-    # =============================================================================
-    # Deep dive (grand)
-    # =============================================================================
-    st.divider()
-    st.subheader("Deep dive")
-
-    if df2.empty:
-        st.info("No grand survivors under the current rules. Relax constraints or run RS/WF.")
-        st.stop()
+    st.dataframe(df_show.reindex(columns=show_cols), use_container_width=True, height=520)
 
     pick = st.selectbox(
-        "Pick a strategy",
-        options=df2["config_id"].astype(str).tolist()[:5000],
+        "Select a strategy to inspect",
+        options=df_show["config_id"].astype(str).tolist()[:5000],
         index=0,
-        key="deep.pick",
+        key="cockpit.pick",
     )
     if not pick:
         st.stop()
 
-    # Row for this strategy (for stage receipts)
     row = df2[df2["config_id"].astype(str) == str(pick)].iloc[0].to_dict()
 
-    # Stage receipts: show verdict + reasons
-    st.write("#### Receipts (why this passed/warned/failed)")
-
-    def _stage_receipt(title: str, verdict_key: str, q_fn, ans: Dict[str, int]) -> None:
-        out = evaluate_row_with_questions(row, q_fn(), ans)
-        badge = out.verdict
-        st.markdown(f"**{title}: `{badge}`**  —  {out.crits} crit, {out.warns} warn, {out.missing} missing")
-        if out.violations:
-            # Show a compact table
-            vdf = pd.DataFrame(out.violations)
-            keep = [c for c in ["severity", "metric", "value", "op", "threshold", "message"] if c in vdf.columns]
-            st.dataframe(vdf[keep], use_container_width=True, height=220)
-        elif out.missing_metrics:
-            st.caption("No violations, but some metrics were missing for this stage.")
-            st.code(", ".join(out.missing_metrics))
-        else:
-            st.caption("No violations.")
-
-    with st.expander("Batch receipts", expanded=False):
-        _stage_receipt("Batch", "batch.verdict", batch_questions, batch_ans)
-    if rs_sum is not None and not rs_sum.empty:
-        with st.expander("Rolling Starts receipts", expanded=False):
-            _stage_receipt("Rolling Starts", "rsq.verdict", rolling_questions, rs_ans)
-    if wf_sum is not None and not wf_sum.empty:
-        with st.expander("Walkforward receipts", expanded=False):
-            _stage_receipt("Walkforward", "wfq.verdict", walkforward_questions, wf_ans)
-
-    # Load config details
     cfg_map = {r.get("config_id"): r.get("normalized") for r in _load_jsonl(run_dir / "configs_resolved.jsonl")}
     cfg_norm = cfg_map.get(str(pick), {})
-    if cfg_norm:
-        with st.expander("Config (normalized)", expanded=False):
-            st.json(cfg_norm)
 
-    # --- Replay artifacts (top-k OR on-demand cache) ---
     art_dir = top_map.get(str(pick))
     if not (art_dir and art_dir.exists()):
         cache_dir = run_dir / "replay_cache" / str(pick)
         if cache_dir.exists():
             art_dir = cache_dir
 
-    if art_dir and art_dir.exists():
-        eq_path = art_dir / "equity_curve.csv"
-        cfg_path = art_dir / "config.json"
-        met_path = art_dir / "metrics.json"
-        tr_path = art_dir / "trades.csv"
-        fi_path = art_dir / "fills.csv"
-        if cfg_path.exists():
-            with st.expander("Config (artifact config.json)", expanded=False):
-                st.json(_read_json(cfg_path))
-        if eq_path.exists():
-            eq = _load_csv(eq_path)
-            if eq is not None and not eq.empty:
-                if "dt" in eq.columns:
-                    eq["dt"] = pd.to_datetime(eq["dt"], errors="coerce", utc=True)
-                if px is not None and "equity" in eq.columns:
-                    fig = px.line(eq, x="dt" if "dt" in eq.columns else None, y="equity", title="Equity curve (Batch replay)")
-                    st.plotly_chart(fig, use_container_width=True)
-                st.download_button("Download equity_curve.csv", data=eq_path.read_bytes(), file_name=f"{pick}_equity_curve.csv")
+    st.divider()
+    st.subheader("Evidence")
 
-        cdl1, cdl2, cdl3 = st.columns(3)
-        with cdl1:
-            if met_path.exists():
-                st.download_button("Download metrics.json", data=met_path.read_bytes(), file_name=f"{pick}_metrics.json")
-        with cdl2:
+    tab_autopsy, tab_batch, tab_rs, tab_wf, tab_exports = st.tabs(
+        ["Autopsy", "Batch evidence", "Rolling Starts evidence", "Walkforward evidence", "Exports"]
+    )
+
+    with tab_autopsy:
+        st.markdown("#### Receipts (why the verdict is what it is)")
+
+        def _stage_receipt_block(title: str, q_fn, ans: Dict[str, int]) -> None:
+            out = evaluate_row_with_questions(row, q_fn(), ans)
+            badge = out.verdict
+            st.markdown(f"**{title}: `{badge}`**  —  {out.crits} crit, {out.warns} warn, {out.missing} missing")
+            if out.violations:
+                vdf = pd.DataFrame(out.violations)
+                keep = [c for c in ["severity", "metric", "value", "op", "threshold", "message"] if c in vdf.columns]
+                st.dataframe(vdf[keep], use_container_width=True, height=240)
+            elif out.missing_metrics:
+                st.caption("No violations, but some metrics were missing for this stage.")
+                st.code(", ".join(out.missing_metrics))
+            else:
+                st.caption("No violations.")
+
+        _stage_receipt_block("Batch", batch_questions, batch_ans)
+        if rs_sum is not None and not rs_sum.empty:
+            _stage_receipt_block("Rolling Starts", rolling_questions, rs_ans)
+        else:
+            st.info("Rolling Starts evidence is missing for this run (run it from Build & Run).")
+        if wf_sum is not None and not wf_sum.empty:
+            _stage_receipt_block("Walkforward", walkforward_questions, wf_ans)
+        else:
+            st.info("Walkforward evidence is missing for this run (run it from Build & Run).")
+
+        if cfg_norm:
+            with st.expander("Config (normalized)", expanded=False):
+                st.json(cfg_norm)
+
+    with tab_batch:
+        st.markdown("#### Batch replay artifacts")
+        if art_dir and art_dir.exists():
+            eq_path = art_dir / "equity_curve.csv"
+            cfg_path = art_dir / "config.json"
+            met_path = art_dir / "metrics.json"
+            tr_path = art_dir / "trades.csv"
+            fi_path = art_dir / "fills.csv"
+
+            if cfg_path.exists():
+                with st.expander("Config (artifact config.json)", expanded=False):
+                    st.json(_read_json(cfg_path))
+
+            if eq_path.exists():
+                eq = _load_csv(eq_path)
+                if eq is not None and not eq.empty:
+                    if "dt" in eq.columns:
+                        eq["dt"] = pd.to_datetime(eq["dt"], errors="coerce", utc=True)
+
+                    # Sleek explainer chart: equity + drawdown (underwater)
+                    if go is not None and make_subplots is not None and "equity" in eq.columns:
+                        try:
+                            eq2 = eq.copy()
+                            eq2["equity"] = pd.to_numeric(eq2["equity"], errors="coerce")
+                            eq2 = eq2.dropna(subset=["equity"])
+                            if not eq2.empty:
+                                peak = eq2["equity"].cummax()
+                                eq2["drawdown"] = (eq2["equity"] / peak) - 1.0
+                                xcol = "dt" if "dt" in eq2.columns else None
+                                fig2 = make_subplots(
+                                    rows=2,
+                                    cols=1,
+                                    shared_xaxes=True,
+                                    vertical_spacing=0.06,
+                                    row_heights=[0.68, 0.32],
+                                    subplot_titles=("Equity", "Drawdown (underwater)"),
+                                )
+                                fig2.add_trace(
+                                    go.Scatter(
+                                        x=eq2[xcol] if xcol else None,
+                                        y=eq2["equity"],
+                                        mode="lines",
+                                        name="Equity",
+                                        line=dict(width=3, color=ACCENT_BLUE),
+                                    ),
+                                    row=1,
+                                    col=1,
+                                )
+                                fig2.add_trace(
+                                    go.Scatter(
+                                        x=eq2[xcol] if xcol else None,
+                                        y=eq2["drawdown"],
+                                        mode="lines",
+                                        name="Drawdown",
+                                        line=dict(width=2, color=FAIL_COLOR),
+                                        fill="tozeroy",
+                                        fillcolor="rgba(255,23,68,0.18)",
+                                    ),
+                                    row=2,
+                                    col=1,
+                                )
+                                fig2.update_yaxes(tickformat=".0f", row=1, col=1)
+                                fig2.update_yaxes(tickformat=".0%", row=2, col=1)
+                                _style_fig(fig2, title="Equity + drawdown (easy read)")
+                                st.plotly_chart(fig2, use_container_width=True)
+                        except Exception:
+                            pass
+
+                    # Raw equity line (optional)
+                    if px is not None and "equity" in eq.columns:
+                        fig = px.line(eq, x="dt" if "dt" in eq.columns else None, y="equity", title="Equity curve (raw)")
+                        _style_fig(fig, title="Equity curve (raw)")
+                        with st.expander("Show raw equity curve (line)", expanded=False):
+                            st.plotly_chart(fig, use_container_width=True)
+                    st.download_button("Download equity_curve.csv", data=eq_path.read_bytes(), file_name=f"{pick}_equity_curve.csv")
+            else:
+                st.info("No equity_curve.csv found in artifacts for this config.")
+
+
+            # Trade outcomes (easy read)
             if tr_path.exists():
-                st.download_button("Download trades.csv", data=tr_path.read_bytes(), file_name=f"{pick}_trades.csv")
-        with cdl3:
-            if fi_path.exists():
-                st.download_button("Download fills.csv", data=fi_path.read_bytes(), file_name=f"{pick}_fills.csv")
-    else:
-        st.info("No saved artifacts for this config yet. Generate a replay to inspect it.")
-        replay_script = REPO_ROOT / "tools" / "generate_replay_artifacts.py"
-        if replay_script.exists():
-            if st.button("Generate replay artifacts", key="replay.gen"):
+                tr = _load_csv(tr_path)
+                if tr is not None and not tr.empty:
+                    st.markdown("##### Trade outcomes (Batch)")
+                    pnl_col = _pick_col(tr, ["net_pnl", "gross_pnl", "pnl", "profit"])
+                    if pnl_col and pnl_col in tr.columns and go is not None:
+                        pnl = pd.to_numeric(tr[pnl_col], errors="coerce").dropna()
+                        if len(pnl) > 0:
+                            win_rate = float((pnl > 0).mean())
+                            avg = float(pnl.mean())
+                            med = float(pnl.median())
+                            m1, m2, m3 = st.columns(3)
+                            with m1:
+                                st.metric("Win rate", f"{win_rate*100:.1f}%")
+                            with m2:
+                                st.metric("Avg trade PnL", f"{avg:.2f}")
+                            with m3:
+                                st.metric("Median trade PnL", f"{med:.2f}")
+
+                            figp = go.Figure(go.Histogram(x=pnl, nbinsx=40, marker=dict(color=ACCENT_BLUE)))
+                            _style_fig(figp, title="Trade PnL distribution")
+                            figp.update_xaxes(title=f"{pnl_col}")
+                            figp.update_yaxes(title="Count")
+                            st.plotly_chart(figp, use_container_width=True)
+
+                    if "exit_reason" in tr.columns and go is not None:
+                        vc = tr["exit_reason"].astype(str).value_counts().head(12)
+                        if len(vc) > 0:
+                            figx = go.Figure(go.Bar(x=vc.index.tolist(), y=vc.values.tolist(), marker=dict(color=PASS_COLOR)))
+                            _style_fig(figx, title="Exit reasons (top)")
+                            figx.update_xaxes(title=None)
+                            figx.update_yaxes(title="Count")
+                            st.plotly_chart(figx, use_container_width=True)
+            cdl1, cdl2, cdl3 = st.columns(3)
+            with cdl1:
+                if met_path.exists():
+                    st.download_button("Download metrics.json", data=met_path.read_bytes(), file_name=f"{pick}_metrics.json")
+            with cdl2:
+                if tr_path.exists():
+                    st.download_button("Download trades.csv", data=tr_path.read_bytes(), file_name=f"{pick}_trades.csv")
+            with cdl3:
+                if fi_path.exists():
+                    st.download_button("Download fills.csv", data=fi_path.read_bytes(), file_name=f"{pick}_fills.csv")
+        else:
+            st.info("No saved artifacts for this config yet.")
+            replay_script = REPO_ROOT / "tools" / "generate_replay_artifacts.py"
+            can_replay = (run_dir / "configs_resolved.jsonl").exists() and replay_script.exists()
+            if st.button("Generate replay artifacts (cached)", key="replay.gen", disabled=(not can_replay)):
                 cmd = [PY, str(replay_script), "--from-run", str(run_dir), "--config-id", str(pick)]
                 _run_cmd(cmd, cwd=REPO_ROOT, label="Replay: generate artifacts")
                 st.rerun()
+
+    with tab_rs:
+        st.markdown("#### Rolling Starts detail")
+        if rs_dir_effective and (rs_dir_effective / "rolling_starts_detail.csv").exists():
+            rs_det = load_rs_detail(run_dir, rs_dir_effective)
+            if rs_det is not None and not rs_det.empty and "config_id" in rs_det.columns:
+                d = rs_det[rs_det["config_id"].astype(str) == str(pick)].copy()
+                if d.empty:
+                    st.info("No Rolling Starts detail rows for this config.")
+                else:
+                    if "start_dt" in d.columns:
+                        d["start_dt"] = pd.to_datetime(d.get("start_dt"), errors="coerce", utc=True)
+                    if px is not None and "performance.twr_total_return" in d.columns:
+                        fig = px.histogram(
+                            d,
+                            x="performance.twr_total_return",
+                            nbins=40,
+                            title="Rolling-start TWR distribution (detail)",
+                        )
+                        _style_fig(fig, title="Rolling-start TWR distribution (detail)")
+                        st.plotly_chart(fig, use_container_width=True)
+
+
+                    # Timeline view: start date → outcome (helps spot "bad eras")
+                    if go is not None and "start_dt" in d.columns and "performance.twr_total_return" in d.columns:
+                        try:
+                            dd = d.copy()
+                            dd["performance.twr_total_return"] = pd.to_numeric(dd["performance.twr_total_return"], errors="coerce")
+                            dd = dd.dropna(subset=["performance.twr_total_return", "start_dt"])
+                            if not dd.empty:
+                                figt = go.Figure()
+                                figt.add_trace(
+                                    go.Scatter(
+                                        x=dd["start_dt"],
+                                        y=dd["performance.twr_total_return"],
+                                        mode="markers",
+                                        marker=dict(size=7, color=ACCENT_BLUE, opacity=0.8),
+                                        name="Rolling starts",
+                                        hovertemplate="%{x|%Y-%m-%d}<br>return=%{y:.2%}<extra></extra>",
+                                    )
+                                )
+                                _style_fig(figt, title="Rolling Starts timeline (each dot = a different start date)")
+                                figt.update_yaxes(tickformat=".0%", title="Total return")
+                                figt.update_xaxes(title="Start date")
+                                st.plotly_chart(figt, use_container_width=True)
+                        except Exception:
+                            pass
+                    st.download_button(
+                        "Download rolling_starts_detail.csv (full)",
+                        data=(rs_dir_effective / "rolling_starts_detail.csv").read_bytes(),
+                        file_name=f"{selected_run_name}_rolling_starts_detail.csv",
+                    )
         else:
-            st.warning("Missing tools/generate_replay_artifacts.py (add it to enable replay generation).")
+            st.info("Rolling Starts evidence not available for this run (run it from Build & Run).")
 
-    # Rolling detail plot (lightweight)
-    if rs_dir_effective and (rs_dir_effective / "rolling_starts_detail.csv").exists():
-        rs_det = load_rs_detail(run_dir, rs_dir_effective)
-        if rs_det is not None and not rs_det.empty and "config_id" in rs_det.columns:
-            d = rs_det[rs_det["config_id"].astype(str) == str(pick)].copy()
-            if not d.empty and px is not None and "performance.twr_total_return" in d.columns:
-                d["start_dt"] = pd.to_datetime(d.get("start_dt"), errors="coerce", utc=True)
-                fig = px.histogram(d, x="performance.twr_total_return", nbins=40, title="Rolling-start TWR distribution (detail)")
-                st.plotly_chart(fig, use_container_width=True)
+    with tab_wf:
+        st.markdown("#### Walkforward detail")
+        if wf_dir_effective and (wf_dir_effective / "wf_results.csv").exists():
+            wf_rows = load_wf_results(wf_dir_effective)
+            if wf_rows is not None and not wf_rows.empty and "config_id" in wf_rows.columns:
+                d = wf_rows[wf_rows["config_id"].astype(str) == str(pick)].copy()
+                if d.empty:
+                    st.info("No Walkforward detail rows for this config.")
+                else:
 
-    # Walkforward plot (lightweight)
-    if wf_dir_effective and (wf_dir_effective / "wf_results.csv").exists():
-        wf_rows = load_wf_results(wf_dir_effective)
-        if wf_rows is not None and not wf_rows.empty and "config_id" in wf_rows.columns:
-            d = wf_rows[wf_rows["config_id"].astype(str) == str(pick)].copy()
-            if not d.empty and px is not None:
-                if "window_return" in d.columns:
-                    fig = px.line(d, x="window_idx", y="window_return", title="Walkforward window returns (detail)")
-                    st.plotly_chart(fig, use_container_width=True)
 
+                    if go is not None and "window_return" in d.columns:
+                        try:
+                            dd = d.copy()
+                            dd["window_return"] = pd.to_numeric(dd["window_return"], errors="coerce")
+                            dd = dd.dropna(subset=["window_return"])
+                            if not dd.empty:
+                                x = dd["window_idx"] if "window_idx" in dd.columns else list(range(len(dd)))
+                                cols = [PASS_COLOR if float(v) >= 0.0 else FAIL_COLOR for v in dd["window_return"].tolist()]
+                                fig = go.Figure(go.Bar(x=x, y=dd["window_return"], marker_color=cols))
+                                _style_fig(fig, title="Walkforward window returns (detail)")
+                                fig.update_yaxes(tickformat=".0%", title="Window return")
+                                fig.update_xaxes(title="Window")
+                                st.plotly_chart(fig, use_container_width=True)
+                        except Exception:
+                            pass
+                    elif px is not None and "window_return" in d.columns:
+                        fig = px.line(d, x="window_idx", y="window_return", title="Walkforward window returns (detail)")
+                        _style_fig(fig, title="Walkforward window returns (detail)")
+                        st.plotly_chart(fig, use_container_width=True)
+                    st.download_button(
+                        "Download wf_results.csv (full)",
+                        data=(wf_dir_effective / "wf_results.csv").read_bytes(),
+                        file_name=f"{selected_run_name}_wf_results.csv",
+                    )
+        else:
+            st.info("Walkforward evidence not available for this run (run it from Build & Run).")
+
+    with tab_exports:
+        st.markdown("#### Exports")
+
+        st.download_button(
+            "Download candidates (CSV)",
+            data=df2.to_csv(index=False).encode("utf-8"),
+            file_name=f"{selected_run_name}_candidates.csv",
+        )
+
+        st.download_button(
+            "Download manifest.json",
+            data=json.dumps(manifest, indent=2, ensure_ascii=False).encode("utf-8"),
+            file_name=f"{selected_run_name}_manifest.json",
+            key="exports.manifest",
+        )
+
+        st.divider()
+        st.markdown("#### Strategy pack (.zip)")
+        st.caption("Portable bundle for one strategy: manifest + config + filtered Batch/RS/WF evidence, with verifiable hashes (Pack v2).")
+
+        copt1, copt2 = st.columns(2)
+        with copt1:
+            include_replay = st.checkbox("Include replay/top artifacts", value=True, key="pack.include_replay")
+        with copt2:
+            include_dataset = st.checkbox("Include dataset file (usually off)", value=False, key="pack.include_dataset")
+
+        pack_key = f"pack.bytes.{selected_run_name}.{pick}.v2"
+        if st.button("Build strategy pack", key="pack.build", type="primary"):
+            try:
+                pack_bytes = _build_strategy_pack_zip(
+                    run_dir=run_dir,
+                    run_name=str(selected_run_name),
+                    config_id=str(pick),
+                    manifest=manifest,
+                    candidate_row=row,
+                    cfg_norm=cfg_norm,
+                    rs_dir=rs_dir_effective if isinstance(rs_dir_effective, Path) else None,
+                    wf_dir=wf_dir_effective if isinstance(wf_dir_effective, Path) else None,
+                    top_art_dir=art_dir if (art_dir and art_dir.exists()) else None,
+                    include_replay=bool(include_replay),
+                    include_dataset=bool(include_dataset),
+                )
+                st.session_state[pack_key] = pack_bytes
+                st.success("Strategy pack is ready.")
+            except Exception as e:
+                st.error(f"Failed to build strategy pack: {e}")
+
+        if pack_key in st.session_state:
+            st.download_button(
+                "Download strategy pack (.zip)",
+                data=st.session_state[pack_key],
+                file_name=f"{selected_run_name}_strategy_pack_v2_{str(pick)[:10]}.zip",
+                key="pack.download",
+            )
+
+        st.divider()
+        st.markdown("#### Verify a strategy pack (.zip)")
+        up = st.file_uploader("Upload a strategy pack to verify", type=["zip"], key="pack.verify.upload")
+        if up is not None:
+            try:
+                z = zipfile.ZipFile(io.BytesIO(up.getvalue()), "r")
+                names = set(z.namelist())
+                missing = [p for p in ["manifest.json", "meta/pack_index.json", "README.md"] if p not in names]
+                if missing:
+                    st.warning("Missing required files: " + ", ".join(missing))
+
+                pack_index = {}
+                try:
+                    pack_index = json.loads(z.read("meta/pack_index.json").decode("utf-8"))
+                except Exception:
+                    pack_index = {}
+
+                ok = True
+                mismatches = []
+                files = (pack_index.get("files") or {}) if isinstance(pack_index, dict) else {}
+                if files:
+                    for arc, rec in files.items():
+                        try:
+                            b = z.read(arc)
+                            dig = hashlib.sha256(b).hexdigest()
+                            exp = str((rec or {}).get("digest") or "")
+                            if exp and dig != exp:
+                                ok = False
+                                mismatches.append((arc, exp, dig))
+                        except KeyError:
+                            ok = False
+                            mismatches.append((arc, "missing", "missing"))
+                        except Exception:
+                            pass
+                else:
+                    st.info("No pack_index hashes found; cannot fully verify integrity.")
+
+                if ok and files:
+                    st.success("Pack integrity verified (hashes match).")
+                elif mismatches:
+                    st.error("Pack integrity issues found.")
+                    for arc, exp, got in mismatches[:20]:
+                        st.write(f"- {arc}: expected {exp[:10]}… got {got[:10]}…")
+
+                # Dataset verification (optional)
+                try:
+                    man = json.loads(z.read("manifest.json").decode("utf-8"))
+                except Exception:
+                    man = {}
+                ds = (man.get("dataset") or {}) if isinstance(man, dict) else {}
+                fp = (ds.get("fingerprint") or {}) if isinstance(ds, dict) else {}
+                exp_digest = str(fp.get("digest") or "")
+
+                if exp_digest:
+                    st.caption("Optional: verify a local dataset file against this pack's dataset fingerprint.")
+                    ds_path = st.text_input("Local dataset path", value="", key="pack.verify.dataset_path")
+                    if st.button("Verify dataset fingerprint", key="pack.verify.dataset_btn") and ds_path:
+                        p = Path(ds_path).expanduser()
+                        if not p.exists():
+                            st.error("Dataset file not found at that path.")
+                        else:
+                            cur = _fingerprint_file(p)
+                            got = str(cur.get("digest") or "")
+                            if got == exp_digest:
+                                st.success("Dataset fingerprint matches (comparable).")
+                            else:
+                                st.error("Dataset fingerprint does NOT match.")
+            except Exception as e:
+                st.error(f"Could not verify pack: {e}")

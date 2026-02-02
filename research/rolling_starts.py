@@ -5,6 +5,9 @@ import json
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
 
 import numpy as np
 import pandas as pd
@@ -237,6 +240,118 @@ def _util_mean(eq_df: pd.DataFrame) -> float:
     util = util.clip(lower=0.0, upper=1.0)
     return float(util.mean()) if len(util) else 0.0
 
+
+# ============================================================
+# Parallelization: per-config multiprocessing (optional)
+# ============================================================
+
+_W_DF_FEAT = None
+_W_TEMPLATE_CLS = None
+_W_CONSTRAINTS = None
+_W_ENGINE_CFG = None
+_W_SEED = 1
+_W_STARTING_EQUITY = 1000.0
+_W_STARTS = None
+_W_MIN_BARS = 365
+
+
+def _worker_init(
+    df_feat_parquet: str,
+    template: str,
+    starts: List[int],
+    min_bars: int,
+    seed: int,
+    starting_equity: float,
+) -> None:
+    """Initializer for ProcessPool workers."""
+    global _W_DF_FEAT, _W_TEMPLATE_CLS, _W_CONSTRAINTS, _W_ENGINE_CFG, _W_SEED, _W_STARTING_EQUITY, _W_STARTS, _W_MIN_BARS
+    _W_DF_FEAT = pd.read_parquet(df_feat_parquet)
+    _W_TEMPLATE_CLS = _import_symbol(str(template))
+    _W_CONSTRAINTS = _make_constraints()
+    _W_ENGINE_CFG = BacktestConfig(market_mode="spot")
+    _W_SEED = int(seed)
+    _W_STARTING_EQUITY = float(starting_equity)
+    _W_STARTS = list(starts)
+    _W_MIN_BARS = int(min_bars)
+
+
+def _process_one_config(payload: Tuple[str, Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]], float]:
+    """Run all rolling starts for one config. Returns (config_id, rows, median_twr)."""
+    cid, cfg_payload = payload
+    assert _W_DF_FEAT is not None
+    assert _W_TEMPLATE_CLS is not None
+    assert _W_CONSTRAINTS is not None
+    assert _W_ENGINE_CFG is not None
+    assert _W_STARTS is not None
+
+    cfg = StrategyConfig(
+        strategy_name=str(cfg_payload.get("strategy_name", "dca_swing")),
+        side=str(cfg_payload.get("side", "long")),
+        params=dict(cfg_payload.get("params") or {}),
+    )
+
+    rows_for_cfg: List[Dict[str, Any]] = []
+    twrs: List[float] = []
+
+    df_feat = _W_DF_FEAT
+    for s in _W_STARTS:
+        df_w = df_feat.iloc[int(s):]
+        if len(df_w) < int(_W_MIN_BARS):
+            continue
+
+        strategy = _instantiate_template(_W_TEMPLATE_CLS, cfg)
+
+        metrics, _fills, eq_df, _trades, _guard = run_backtest_once(
+            df=df_w,
+            strategy=strategy,
+            seed=int(_W_SEED),
+            starting_equity=float(_W_STARTING_EQUITY),
+            constraints=_W_CONSTRAINTS,
+            cfg=_W_ENGINE_CFG,
+            show_progress=False,
+            features_ready=True,
+            record_fills=False,
+            record_equity_curve=True,
+        )
+
+        eq = metrics.get("equity", {}) if isinstance(metrics, dict) else {}
+        perf = _build_cashflow_performance_stats(df_w, eq_df)
+
+        uw_days = (
+            _max_underwater_days(eq_df["equity"])
+            if (eq_df is not None and "equity" in eq_df.columns)
+            else 0.0
+        )
+        util_mean = _util_mean(eq_df)
+
+        twr = float(perf.get("twr_total_return", np.nan))
+        twrs.append(twr)
+
+        row = {
+            "config_id": str(cid),
+            "start_i": int(s),
+            "start_dt": str(df_feat["dt"].iloc[int(s)]) if "dt" in df_feat.columns else "",
+            "bars": int(len(df_w)),
+            "equity.end": float(eq.get("end", np.nan)),
+            "equity.cashflow_total": float(eq.get("cashflow_total", np.nan)),
+            "equity.net_profit_ex_cashflows": float(eq.get("net_profit_ex_cashflows", np.nan)),
+            "performance.twr_total_return": twr,
+            "performance.annualized_return": float(perf.get("annualized_return", np.nan)),
+            "performance.max_drawdown_equity": float(perf.get("max_drawdown_equity", np.nan)),
+            "uw_max_days": float(uw_days),
+            "util_mean": float(util_mean),
+        }
+        rows_for_cfg.append(row)
+
+    try:
+        _vals = np.array([float(x) for x in twrs], dtype=float)
+        cfg_score = float(np.nanmedian(_vals)) if _vals.size else float("nan")
+    except Exception:
+        cfg_score = float("nan")
+
+    return str(cid), rows_for_cfg, float(cfg_score)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Rolling-start sensitivity (bar-step starts)")
     ap.add_argument("--from-run", required=True, help="Batch run folder: runs/batch_...")
@@ -251,6 +366,7 @@ def main() -> int:
         help="Optional path to ids file (default: from-run/post/top_ids.txt)",
     )
     ap.add_argument("--top-n", type=int, default=50)
+    ap.add_argument("--jobs", type=int, default=1, help="Number of worker processes (parallel configs).")
     ap.add_argument("--start-step", type=int, default=30, help="Bars between start points")
     ap.add_argument("--min-bars", type=int, default=365, help="Min bars per run")
     ap.add_argument("--seed", type=int, default=1)
@@ -324,9 +440,7 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     progress = ProgressWriter(args.progress_file)
-    progress.write({"stage": "rolling_starts", "phase": "init", "done": 0, "total": 0, "out_dir": str(out_dir)})
-
-
+    progress.write({"stage": "rolling_starts", "phase": "init", "done": 0, "total": int(len(config_ids)), "out_dir": str(out_dir)})
     # Accumulation: load prior results if they exist and parameters match
     meta_path = out_dir / "rs_meta.json"
     detail_path = out_dir / "rolling_starts_detail.csv"
@@ -379,7 +493,7 @@ def main() -> int:
 
 
     rs_total = int(len(cfgs))
-    rs_done = 0
+    rs_done = int(len(already_done)) if accumulate_ok else 0
     rs_windows_per_cfg = int(len(starts))
     rs_windows_total = int(rs_total * rs_windows_per_cfg)
     rs_last_emit = 0
@@ -396,117 +510,196 @@ def main() -> int:
         }
     )
 
-    # Progress bar (optional)
-    it_cfgs = cfgs
-    if not args.no_progress:
-        try:
-            from tqdm import tqdm
 
-            it_cfgs = tqdm(cfgs, total=len(cfgs), desc="RollingStarts", unit="cfg")
-        except Exception:
-            pass
+    # Progress bar (optional) / Parallelization
+    jobs = int(max(1, int(getattr(args, "jobs", 1) or 1)))
+    cfgs_run = [(cid, cfg, _norm) for (cid, cfg, _norm) in cfgs if not (accumulate_ok and str(cid) in already_done)]
+    rs_done0 = int(rs_done)
+    emit_every = int(max(1, int(getattr(args, "progress_every", 1) or 1)))
 
     details: List[Dict[str, Any]] = []
-
     best_score: Optional[float] = None
-    recent_best: List[Tuple[str, float]] = []  # (config_id, cfg_score) top few
+    recent_best: List[Tuple[str, float]] = []
 
-    for cid, cfg, _norm in it_cfgs:
-        if accumulate_ok and str(cid) in already_done:
-            continue
-        rows_for_cfg: List[Dict[str, Any]] = []
+    if jobs <= 1 or len(cfgs_run) <= 1:
+        it_cfgs = cfgs_run
+        if not args.no_progress:
+            try:
+                from tqdm import tqdm
+                it_cfgs = tqdm(cfgs_run, total=len(cfgs_run), desc="RollingStarts", unit="cfg")
+            except Exception:
+                pass
 
-        for s in starts:
-            df_w = df_feat.iloc[s:]
-            if len(df_w) < min_bars:
-                continue
+        for cid, cfg, _norm in it_cfgs:
+            rows_for_cfg: List[Dict[str, Any]] = []
 
-            # IMPORTANT: new strategy instance per window (no state leakage)
-            strategy = _instantiate_template(template_cls, cfg)
+            for s in starts:
+                df_w = df_feat.iloc[int(s):]
+                if len(df_w) < min_bars:
+                    continue
 
-            metrics, _fills, eq_df, _trades, _guard = run_backtest_once(
-                df=df_w,
-                strategy=strategy,
-                seed=int(args.seed),
-                starting_equity=float(args.starting_equity),
-                constraints=constraints,
-                cfg=engine_cfg,
-                show_progress=False,
-                features_ready=True,
-                record_fills=False,
-                record_equity_curve=True,
-            )
+                # IMPORTANT: new strategy instance per window (no state leakage)
+                strategy = _instantiate_template(template_cls, cfg)
 
-            eq = metrics.get("equity", {}) if isinstance(metrics, dict) else {}
-            perf = _build_cashflow_performance_stats(df_w, eq_df)
+                metrics, _fills, eq_df, _trades, _guard = run_backtest_once(
+                    df=df_w,
+                    strategy=strategy,
+                    seed=int(args.seed),
+                    starting_equity=float(args.starting_equity),
+                    constraints=constraints,
+                    cfg=engine_cfg,
+                    show_progress=False,
+                    features_ready=True,
+                    record_fills=False,
+                    record_equity_curve=True,
+                )
 
-            uw_days = _max_underwater_days(eq_df["equity"]) if (eq_df is not None and "equity" in eq_df.columns) else 0.0
-            util_mean = _util_mean(eq_df)
+                eq = metrics.get("equity", {}) if isinstance(metrics, dict) else {}
+                perf = _build_cashflow_performance_stats(df_w, eq_df)
 
-            row = {
-                "config_id": str(cid),
-                "start_i": int(s),
-                "start_dt": str(df_feat["dt"].iloc[s]) if "dt" in df_feat.columns else "",
-                "bars": int(len(df_w)),
-                "equity.end": float(eq.get("end", np.nan)),
-                "equity.cashflow_total": float(eq.get("cashflow_total", np.nan)),
-                "equity.net_profit_ex_cashflows": float(
-                    eq.get("net_profit_ex_cashflows", np.nan)
-                ),
-                "performance.twr_total_return": float(perf.get("twr_total_return", np.nan)),
-                "performance.annualized_return": float(perf.get("annualized_return", np.nan)),
-                "performance.max_drawdown_equity": float(
-                    perf.get("max_drawdown_equity", np.nan)
-                ),
-                "uw_max_days": float(uw_days),
-                "util_mean": float(util_mean),
-            }
-            rows_for_cfg.append(row)
-            details.append(row)
+                uw_days = _max_underwater_days(eq_df["equity"]) if (eq_df is not None and "equity" in eq_df.columns) else 0.0
+                util_mean = _util_mean(eq_df)
 
-
-        # A quick per-config score so the UI can show 'best so far' while the run cooks.
-        try:
-            _vals = np.array([float(r.get('performance.twr_total_return', np.nan)) for r in rows_for_cfg], dtype=float)
-            cfg_score = float(np.nanmedian(_vals)) if _vals.size else float('nan')
-        except Exception:
-            cfg_score = float('nan')
-        if best_score is None or (np.isfinite(cfg_score) and cfg_score > float(best_score)):
-            best_score = float(cfg_score)
-        if np.isfinite(cfg_score):
-            recent_best.append((str(cid), float(cfg_score)))
-            # keep only top 5 by score
-            recent_best = sorted(recent_best, key=lambda x: x[1], reverse=True)[:5]
-
-        rs_done += 1
-        pe = int(getattr(args, "progress_every", 1) or 1)
-        if progress.enabled and ((rs_done - rs_last_emit) >= pe or rs_done >= rs_total):
-            rs_last_emit = int(rs_done)
-            elapsed = float(__import__("time").time() - t_prog0)
-            progress.write(
-                {
-                    "stage": "rolling_starts",
-                    "phase": "run",
-                    "done": int(rs_done),
-                    "total": int(rs_total),
-                    "rate": float(rs_done / max(1e-9, elapsed)),
-                    "windows_per_cfg": int(rs_windows_per_cfg),
-                    "windows_done": int(rs_done * rs_windows_per_cfg),
-                    "windows_total": int(rs_windows_total),
-                    "best": (float(best_score) if best_score is not None else None),
-                    "best_metric": "median_twr_total_return",
-                    "best_detail": {"metric": "median_twr_total_return", "value": (float(best_score) if best_score is not None else None), "top5": list(recent_best)},
-                    "message": f"last_cfg={cid}",
-                    "windows_rate": float((rs_done * rs_windows_per_cfg) / max(1e-9, elapsed)),
+                row = {
                     "config_id": str(cid),
-                    "cfg_score": float(cfg_score) if np.isfinite(cfg_score) else None,
-                    "best": float(best_score) if (best_score is not None and np.isfinite(best_score)) else None,
-                    "message": f"cfg {str(cid)}  score={cfg_score:.4g}" if np.isfinite(cfg_score) else f"cfg {str(cid)}",
-                    "top": recent_best,
+                    "start_i": int(s),
+                    "start_dt": str(df_feat["dt"].iloc[int(s)]) if "dt" in df_feat.columns else "",
+                    "bars": int(len(df_w)),
+                    "equity.end": float(eq.get("end", np.nan)),
+                    "equity.cashflow_total": float(eq.get("cashflow_total", np.nan)),
+                    "equity.net_profit_ex_cashflows": float(eq.get("net_profit_ex_cashflows", np.nan)),
+                    "performance.twr_total_return": float(perf.get("twr_total_return", np.nan)),
+                    "performance.annualized_return": float(perf.get("annualized_return", np.nan)),
+                    "performance.max_drawdown_equity": float(perf.get("max_drawdown_equity", np.nan)),
+                    "uw_max_days": float(uw_days),
+                    "util_mean": float(util_mean),
                 }
+                rows_for_cfg.append(row)
+                details.append(row)
+
+            # Per-config score: median TWR across starts
+            try:
+                _vals = np.array([float(r.get("performance.twr_total_return", np.nan)) for r in rows_for_cfg], dtype=float)
+                cfg_score = float(np.nanmedian(_vals)) if _vals.size else float("nan")
+            except Exception:
+                cfg_score = float("nan")
+
+            if best_score is None or (np.isfinite(cfg_score) and cfg_score > float(best_score)):
+                best_score = float(cfg_score)
+            if np.isfinite(cfg_score):
+                recent_best.append((str(cid), float(cfg_score)))
+                recent_best = sorted(recent_best, key=lambda x: x[1], reverse=True)[:5]
+
+            rs_done += 1
+
+            if progress.enabled and ((rs_done - rs_done0) % emit_every == 0 or rs_done >= rs_total):
+                elapsed = float(time.time() - t_prog0)
+                progress.write(
+                    {
+                        "stage": "rolling_starts",
+                        "phase": "run",
+                        "done": int(rs_done),
+                        "total": int(rs_total),
+                        "rate": float((rs_done - rs_done0) / max(1e-9, elapsed)),
+                        "windows_per_cfg": int(rs_windows_per_cfg),
+                        "windows_done": int(rs_done * rs_windows_per_cfg),
+                        "windows_total": int(rs_windows_total),
+                        "best": (float(best_score) if (best_score is not None and np.isfinite(best_score)) else None),
+                        "top": list(recent_best),
+                        "config_id": str(cid),
+                        "cfg_score": (float(cfg_score) if np.isfinite(cfg_score) else None),
+                        "jobs": int(jobs),
+                        "message": (f"cfg {str(cid)} score={cfg_score:.4g}" if np.isfinite(cfg_score) else f"cfg {str(cid)}"),
+                    }
+                )
+
+    else:
+        # Parallel across configs (each worker runs all start points for one config)
+        df_feat_path = run_dir / "df_feat.parquet"
+        if not df_feat_path.exists():
+            try:
+                df_feat.to_parquet(df_feat_path, index=False)
+            except Exception:
+                pass
+
+        payloads: List[Tuple[str, Dict[str, Any]]] = []
+        for cid, cfg, _norm in cfgs_run:
+            payloads.append(
+                (
+                    str(cid),
+                    {
+                        "strategy_name": getattr(cfg, "strategy_name", "dca_swing"),
+                        "side": getattr(cfg, "side", "long"),
+                        "params": dict(getattr(cfg, "params", {}) or {}),
+                    },
+                )
             )
 
-        # No per-config summary here; we recompute summary from accumulated detail at end.
+        max_workers = int(min(int(jobs), max(1, len(payloads))))
+        with ProcessPoolExecutor(
+            max_workers=max_workers,
+            initializer=_worker_init,
+            initargs=(
+                str(df_feat_path),
+                str(args.template),
+                list(starts),
+                int(min_bars),
+                int(args.seed),
+                float(args.starting_equity),
+            ),
+        ) as ex:
+            futs = {ex.submit(_process_one_config, p): p[0] for p in payloads}
+
+            for fut in as_completed(futs):
+                cid = futs.get(fut, "")
+                try:
+                    cid2, rows_for_cfg, cfg_score = fut.result()
+                except Exception as e:
+                    rs_done += 1
+                    progress.write(
+                        {
+                            "stage": "rolling_starts",
+                            "phase": "run",
+                            "done": int(rs_done),
+                            "total": int(rs_total),
+                            "jobs": int(max_workers),
+                            "error": f"{cid}: {e}",
+                        }
+                    )
+                    continue
+
+                details.extend(list(rows_for_cfg))
+
+                if best_score is None or (np.isfinite(cfg_score) and cfg_score > float(best_score)):
+                    best_score = float(cfg_score)
+                if np.isfinite(cfg_score):
+                    recent_best.append((str(cid2), float(cfg_score)))
+                    recent_best = sorted(recent_best, key=lambda x: x[1], reverse=True)[:5]
+
+                rs_done += 1
+
+                if progress.enabled and ((rs_done - rs_done0) % emit_every == 0 or rs_done >= rs_total):
+                    elapsed = float(time.time() - t_prog0)
+                    progress.write(
+                        {
+                            "stage": "rolling_starts",
+                            "phase": "run",
+                            "done": int(rs_done),
+                            "total": int(rs_total),
+                            "rate": float((rs_done - rs_done0) / max(1e-9, elapsed)),
+                            "windows_per_cfg": int(rs_windows_per_cfg),
+                            "windows_done": int(rs_done * rs_windows_per_cfg),
+                            "windows_total": int(rs_windows_total),
+                            "best": (float(best_score) if (best_score is not None and np.isfinite(best_score)) else None),
+                            "top": list(recent_best),
+                            "config_id": str(cid2),
+                            "cfg_score": (float(cfg_score) if np.isfinite(cfg_score) else None),
+                            "jobs": int(max_workers),
+                            "message": (f"cfg {str(cid2)} score={cfg_score:.4g}" if np.isfinite(cfg_score) else f"cfg {str(cid2)}"),
+                        }
+                    )
+
+    progress.write({"stage": "rolling_starts", "phase": "done", "done": int(rs_done), "total": int(rs_total), "jobs": int(jobs)})
 
     df_new_detail = pd.DataFrame(details)
 
@@ -522,6 +715,10 @@ def main() -> int:
             df_all_detail["config_id"] = df_all_detail["config_id"].astype(str)
             df_all_detail["start_i"] = pd.to_numeric(df_all_detail["start_i"], errors="coerce").fillna(-1).astype(int)
             df_all_detail = df_all_detail.drop_duplicates(subset=["config_id", "start_i"], keep="last")
+            try:
+                df_all_detail = df_all_detail.sort_values(["config_id", "start_i"]).reset_index(drop=True)
+            except Exception:
+                pass
 
     df_sum = _summarize_from_detail(df_all_detail) if not df_all_detail.empty else pd.DataFrame([])
 
