@@ -1299,19 +1299,31 @@ def walkforward_questions() -> List[QuestionSpec]:
 # =============================================================================
 
 def _ensure_config_id(df: pd.DataFrame) -> pd.DataFrame:
+    """Guarantee a canonical string config_id column.
+
+    We strongly prefer the flattened column name from the batch runner (config.id),
+    because some artifacts may include a legacy/config_id column that is not stable
+    across stages. This keeps RS/WF joins and evidence lookups consistent.
+    """
     if df is None or df.empty:
         return df
     out = df.copy()
-    if "config_id" not in out.columns:
-        if "config.id" in out.columns:
-            out["config_id"] = out["config.id"].astype(str)
-        elif "config_id" in out.columns:
-            out["config_id"] = out["config_id"].astype(str)
+
+    if "config.id" in out.columns:
+        out["config_id"] = out["config.id"].astype(str).str.strip()
+    elif "config_id" in out.columns:
+        out["config_id"] = out["config_id"].astype(str).str.strip()
     else:
-        out["config_id"] = out["config_id"].astype(str)
+        # last-resort fallbacks (rare)
+        for alt in ["config.id", "config_id", "id", "cfg_id"]:
+            if alt in out.columns:
+                out["config_id"] = out[alt].astype(str).str.strip()
+                break
+
     if "config.label" in out.columns:
         out["config.label"] = out["config.label"].astype(str)
     return out
+
 
 
 def load_batch_frames(run_dir: Path) -> Dict[str, Optional[pd.DataFrame]]:
@@ -1362,7 +1374,7 @@ def load_rs_summary(run_dir: Path, rs_dir: Optional[Path]) -> Optional[pd.DataFr
         return df
     df = df.copy()
     if "config_id" in df.columns:
-        df["config_id"] = df["config_id"].astype(str)
+        df["config_id"] = df["config_id"].astype(str).str.strip()
     return df
 
 
@@ -1375,7 +1387,7 @@ def load_rs_detail(run_dir: Path, rs_dir: Optional[Path]) -> Optional[pd.DataFra
         return df
     df = df.copy()
     if "config_id" in df.columns:
-        df["config_id"] = df["config_id"].astype(str)
+        df["config_id"] = df["config_id"].astype(str).str.strip()
     return df
 
 
@@ -1388,7 +1400,7 @@ def load_wf_summary(wf_dir: Optional[Path]) -> Optional[pd.DataFrame]:
         return df
     df = df.copy()
     if "config_id" in df.columns:
-        df["config_id"] = df["config_id"].astype(str)
+        df["config_id"] = df["config_id"].astype(str).str.strip()
     # normalize pct column name for our questions (keep original too)
     if "pct_profitable_windows" in df.columns:
         df["pct_profitable_windows"] = pd.to_numeric(df["pct_profitable_windows"], errors="coerce")
@@ -1404,7 +1416,7 @@ def load_wf_results(wf_dir: Optional[Path]) -> Optional[pd.DataFrame]:
         return df
     df = df.copy()
     if "config_id" in df.columns:
-        df["config_id"] = df["config_id"].astype(str)
+        df["config_id"] = df["config_id"].astype(str).str.strip()
     return df
 
 
@@ -1493,8 +1505,12 @@ def build_dca_baseline_params() -> Dict[str, Any]:
         )
 
         with st.expander("Advanced risk controls", expanded=False):
-            sl_pct = float(st.slider("Stop loss % (0 disables)", 0.0, 0.80, 0.0, 0.01, key="new.sl_pct"))
-            tp_pct = float(st.slider("Take profit % (0 disables)", 0.0, 2.0, 0.0, 0.01, key="new.tp_pct"))
+            st.caption("Risk controls are expressed as % moves from your average entry price. (10 = 10%).")
+            sl_ui = float(st.slider("Stop loss (%) (0 disables)", 0.0, 50.0, 0.0, 0.25, key="new.sl_pct_ui"))
+            tp_ui = float(st.slider("Take profit (%) (0 disables)", 0.0, 200.0, 0.0, 0.5, key="new.tp_pct_ui"))
+            # Store as fractions in params (0.10 == 10%)
+            sl_pct = sl_ui / 100.0
+            tp_pct = tp_ui / 100.0
             tp_sell_fraction = float(st.slider("TP sell fraction", 0.0, 1.0, 1.0, 0.05, key="new.tp_sell_frac"))
             reserve_frac = float(st.slider("Reserve fraction of TP proceeds", 0.0, 1.0, 0.0, 0.05, key="new.reserve_frac"))
 
@@ -1507,10 +1523,10 @@ def build_dca_baseline_params() -> Dict[str, Any]:
         "ema_len": int(ema_len),
         "rsi_thr": float(rsi_thr),
         "max_alloc_pct": float(max_alloc_pct),
-        "sl_pct": float(st.session_state.get("new.sl_pct", 0.0)),
-        "tp_pct": float(st.session_state.get("new.tp_pct", 0.0)),
-        "tp_sell_fraction": float(st.session_state.get("new.tp_sell_frac", 1.0)),
-        "reserve_frac_of_proceeds": float(st.session_state.get("new.reserve_frac", 0.0)),
+        "sl_pct": float(sl_pct),
+        "tp_pct": float(tp_pct),
+        "tp_sell_fraction": float(tp_sell_fraction),
+        "reserve_frac_of_proceeds": float(reserve_frac),
     }
 
     # Plan summary (plain English)
@@ -1523,6 +1539,11 @@ def build_dca_baseline_params() -> Dict[str, Any]:
     elif buy_filter == "rsi_below":
         parts.append(f"Only buy if RSI < {params['rsi_thr']:.0f}.")
     parts.append(f"Never allocate more than {_fmt_pct(params['max_alloc_pct'], digits=0)} of equity.")
+    # Risk controls
+    if params.get("sl_pct", 0.0) > 0:
+        parts.append("Stop loss: {:.2f}%.".format(params["sl_pct"] * 100))
+    if params.get("tp_pct", 0.0) > 0:
+        parts.append("Take profit: {:.2f}% (sell {}% per hit).".format(params["tp_pct"] * 100, int(round(params["tp_sell_fraction"] * 100))))
     st.info(" ".join(parts))
 
     return params
@@ -2142,12 +2163,12 @@ This bundle contains receipts for a single strategy config.
                 d = rs_dir / "rolling_starts_detail.csv"
                 if s.exists():
                     sdf = pd.read_csv(s)
-                    sdf["config_id"] = sdf["config_id"].astype(str)
+                    sdf["config_id"] = sdf["config_id"].astype(str).str.strip()
                     sdf1 = sdf[sdf["config_id"] == str(config_id)].copy()
                     add_bytes("evidence/rolling_starts/summary_row.csv", sdf1.to_csv(index=False).encode("utf-8"))
                 if d.exists():
                     ddf = pd.read_csv(d)
-                    ddf["config_id"] = ddf["config_id"].astype(str)
+                    ddf["config_id"] = ddf["config_id"].astype(str).str.strip()
                     ddf1 = ddf[ddf["config_id"] == str(config_id)].copy()
                     add_bytes("evidence/rolling_starts/detail_rows.csv", ddf1.to_csv(index=False).encode("utf-8"))
             except Exception:
@@ -2162,12 +2183,12 @@ This bundle contains receipts for a single strategy config.
                 r = wf_dir / "wf_results.csv"
                 if s.exists():
                     sdf = pd.read_csv(s)
-                    sdf["config_id"] = sdf["config_id"].astype(str)
+                    sdf["config_id"] = sdf["config_id"].astype(str).str.strip()
                     sdf1 = sdf[sdf["config_id"] == str(config_id)].copy()
                     add_bytes("evidence/walkforward/summary_row.csv", sdf1.to_csv(index=False).encode("utf-8"))
                 if r.exists():
                     rdf = pd.read_csv(r)
-                    rdf["config_id"] = rdf["config_id"].astype(str)
+                    rdf["config_id"] = rdf["config_id"].astype(str).str.strip()
                     rdf1 = rdf[rdf["config_id"] == str(config_id)].copy()
                     add_bytes("evidence/walkforward/window_rows.csv", rdf1.to_csv(index=False).encode("utf-8"))
             except Exception:
@@ -3569,7 +3590,7 @@ if stage_pick == "batch":
     n = len(heat_base)
 
     heat = pd.DataFrame()
-    heat["config_id"] = heat_base["config_id"].astype(str)
+    heat["config_id"] = heat_base["config_id"].astype(str).str.strip()
     if label_col:
         heat["label"] = heat_base[label_col].astype(str)
     if verdict_col:
@@ -5844,13 +5865,44 @@ if stage_pick == "grand":
                             st.plotly_chart(figp, use_container_width=True)
 
                     if "exit_reason" in tr.columns and go is not None:
-                        vc = tr["exit_reason"].astype(str).value_counts().head(12)
-                        if len(vc) > 0:
-                            figx = go.Figure(go.Bar(x=vc.index.tolist(), y=vc.values.tolist(), marker=dict(color=PASS_COLOR)))
-                            _style_fig(figx, title="Exit reasons (top)")
+                        # Only show SL/TP exits (user-legible). Many internal reasons (plan_flat, eod, etc.)
+                        # are useful for debugging but confusing for humans.
+                        def _bucket_exit(r: Any) -> Optional[str]:
+                            s = str(r).strip().lower()
+                            if not s or s == "nan":
+                                return None
+                            if "stop" in s or s in {"sl", "stop_loss", "stoploss"}:
+                                return "Stop loss"
+                            if "tp" in s or "take" in s or "profit" in s:
+                                return "Take profit"
+                            return None
+
+                        buckets = tr["exit_reason"].map(_bucket_exit)
+                        total_exits = int(len(tr))
+                        stp = buckets.dropna()
+                        if not stp.empty:
+                            vc = stp.value_counts()
+                            # enforce stable ordering
+                            vc = vc.reindex(["Stop loss", "Take profit"]).dropna()
+                            pct = (vc / max(1, int(vc.sum())) * 100.0).round(1)
+
+                            figx = go.Figure(
+                                go.Bar(
+                                    x=vc.index.tolist(),
+                                    y=pct.values.tolist(),
+                                    text=[f"{p:.1f}%" for p in pct.values.tolist()],
+                                    textposition="inside",
+                                    marker=dict(color=PASS_COLOR),
+                                )
+                            )
+                            _style_fig(figx, title="Exit reasons (SL vs TP)")
                             figx.update_xaxes(title=None)
-                            figx.update_yaxes(title="Count")
+                            figx.update_yaxes(title="% of SL/TP exits")
+                            st.caption(f"Showing only exits triggered by Stop loss / Take profit: **{int(vc.sum()):,}** of **{total_exits:,}** total exits.")
                             st.plotly_chart(figx, use_container_width=True)
+                        else:
+                            st.info("No Stop loss / Take profit exits found for this replay (exits were EOD/flatten/other).")
+
             cdl1, cdl2, cdl3 = st.columns(3)
             with cdl1:
                 if met_path.exists():
@@ -5929,7 +5981,31 @@ if stage_pick == "grand":
         if wf_dir_effective and (wf_dir_effective / "wf_results.csv").exists():
             wf_rows = load_wf_results(wf_dir_effective)
             if wf_rows is not None and not wf_rows.empty and "config_id" in wf_rows.columns:
-                d = wf_rows[wf_rows["config_id"].astype(str) == str(pick)].copy()
+                pick_eff = str(pick).strip()
+
+                # Fallback: if user picked something non-canonical (e.g., a legacy integer id),
+                # try to map it to the real config_id using the current candidates table.
+                if ("config.id" in df2.columns) and (pick_eff.isdigit() or (pick_eff and not pick_eff.startswith("cfg_"))):
+                    # 1) If it's a config line number, map line_no -> config_id
+                    if pick_eff.isdigit() and ("config.line_no" in df2.columns):
+                        try:
+                            li = int(pick_eff)
+                            m = df2[df2["config.line_no"].astype(int) == li]
+                            if len(m) == 1:
+                                pick_eff = str(m["config_id"].iloc[0]).strip()
+                        except Exception:
+                            pass
+
+                    # 2) If it's an index-like integer, treat it as 1-based row id into df_show (common confusion).
+                    if pick_eff.isdigit():
+                        try:
+                            i = int(pick_eff)
+                            if 1 <= i <= len(df_show):
+                                pick_eff = str(df_show["config_id"].astype(str).iloc[i - 1]).strip()
+                        except Exception:
+                            pass
+
+                d = wf_rows[wf_rows["config_id"].astype(str).str.strip() == str(pick_eff)].copy()
                 if d.empty:
                     st.info("No Walkforward detail rows for this config.")
                 else:

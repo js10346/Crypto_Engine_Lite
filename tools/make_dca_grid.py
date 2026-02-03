@@ -156,8 +156,8 @@ def _normalize_base_params(base: Dict[str, Any]) -> Dict[str, Any]:
         "ema_len": _as_int(params_in.get("ema_len"), 200),
         "rsi_thr": _as_float(params_in.get("rsi_thr"), 40.0),
         "max_alloc_pct": _as_float(params_in.get("max_alloc_pct"), 1.0),
-        "sl_pct": _as_float(params_in.get("sl_pct"), 0.20),
-        "tp_pct": _as_float(params_in.get("tp_pct"), 0.20),
+        "sl_pct": _as_float(params_in.get("sl_pct"), 0.0),
+        "tp_pct": _as_float(params_in.get("tp_pct"), 0.0),
         "tp_sell_fraction": _as_float(params_in.get("tp_sell_fraction"), 0.50),
         "reserve_frac_of_proceeds": _as_float(
             params_in.get("reserve_frac_of_proceeds"), 0.50
@@ -359,8 +359,8 @@ def generate_grid_neighborhood(
     # Wider money bins than the old random generator, but still reasonable for spot.
     money_bins = [0.0, 10.0, 25.0, 50.0, 100.0, 200.0, 400.0]
     alloc_bins = [0.25, 0.50, 0.75, 0.90, 1.0]
-    sl_bins = [0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30]
-    tp_bins = [0.0, 0.05, 0.10, 0.15, 0.20, 0.30, 0.40]
+    sl_bins = [0.0, 0.01, 0.02, 0.05, 0.08, 0.10, 0.15, 0.20, 0.30, 0.40, 0.50]
+    tp_bins = [0.0, 0.01, 0.02, 0.05, 0.10, 0.15, 0.20, 0.30, 0.40, 0.60, 0.80, 1.00, 1.50, 2.00]
     frac_bins = [0.0, 0.25, 0.50, 0.75, 1.0]
     ema_lens = [50, 100, 200]
     rsi_thrs = [25.0, 30.0, 35.0, 40.0, 45.0, 50.0]
