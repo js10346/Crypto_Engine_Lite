@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
+import numpy as np
 
 
 def _repo_root() -> Path:
@@ -332,6 +333,154 @@ def _run_replay_once(
     return eq_df, fills_df, trades_df, metrics
 
 
+# =========================
+# Events (price + actions)
+# =========================
+
+_EVENT_COLS = ["dt", "event", "side", "price", "qty", "reason", "detail"]
+
+
+def _pick_first_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+
+def _to_dt_utc(x: Any) -> Optional[pd.Timestamp]:
+    try:
+        ts = pd.to_datetime(x, errors="coerce", utc=True)
+        if pd.isna(ts):
+            return None
+        return ts
+    except Exception:
+        return None
+
+
+def _build_events_df(fills_df: Optional[pd.DataFrame], trades_df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """Best-effort event log derived from fills/trades.
+
+    Produces events.csv used by the UI to overlay entries/exits/TPs on the price chart.
+    This is NOT trading advice; it's just labeling what the backtest engine did.
+    """
+    events: List[Dict[str, Any]] = []
+
+    if fills_df is None or fills_df.empty:
+        return pd.DataFrame(columns=_EVENT_COLS)
+
+    f = fills_df.copy()
+
+    dt_col = _pick_first_col(f, ["dt", "fill_dt", "ts", "timestamp", "time"])
+    side_col = _pick_first_col(f, ["side", "action"])
+    price_col = _pick_first_col(f, ["price", "fill_price", "px"])
+    qty_col = _pick_first_col(f, ["qty", "base_qty", "asset_qty", "filled_qty", "q"])
+
+    reason_col = _pick_first_col(f, ["reason", "tag", "label", "message"])
+
+    if dt_col is None or side_col is None:
+        return pd.DataFrame(columns=_EVENT_COLS)
+
+    # Normalize dt
+    if dt_col == "ts":
+        s = pd.to_numeric(f[dt_col], errors="coerce")
+        mx = float(s.dropna().max()) if not s.dropna().empty else 0.0
+        unit = "ms" if mx > 1e12 else "s"
+        f["_dt"] = pd.to_datetime(s, unit=unit, errors="coerce", utc=True)
+    else:
+        f["_dt"] = pd.to_datetime(f[dt_col], errors="coerce", utc=True)
+
+    f = f.dropna(subset=["_dt"]).sort_values("_dt")
+
+    # Running position to classify partial sells as TP vs full exit.
+    pos = 0.0
+    eps = 1e-12
+
+    for _, r in f.iterrows():
+        dt = r["_dt"]
+        side = str(r.get(side_col) or "").strip().lower()
+
+        try:
+            qty = float(r.get(qty_col)) if qty_col is not None else float("nan")
+        except Exception:
+            qty = float("nan")
+        if not (qty == qty) or qty <= 0:
+            qty = float("nan")
+
+        try:
+            price = float(r.get(price_col)) if price_col is not None else float("nan")
+        except Exception:
+            price = float("nan")
+        if not (price == price):
+            price = float("nan")
+
+        reason = str(r.get(reason_col) or "").strip() if reason_col is not None else ""
+        detail = ""
+
+        is_buy = side in {"buy", "b", "long", "entry", "open"}
+        is_sell = side in {"sell", "s", "exit", "close"}
+
+        if not is_buy and not is_sell:
+            continue
+
+        before = pos
+        if is_buy:
+            pos = pos + (qty if qty == qty else 0.0)
+            ev = "ENTRY" if before <= eps else "ADD"
+        else:
+            pos = pos - (qty if qty == qty else 0.0)
+            ev = "TP" if pos > eps else "EXIT"
+
+        events.append(
+            {
+                "dt": dt.isoformat(),
+                "event": ev,
+                "side": "buy" if is_buy else "sell",
+                "price": None if not (price == price) else float(price),
+                "qty": None if not (qty == qty) else float(qty),
+                "reason": reason,
+                "detail": detail,
+            }
+        )
+
+    df_events = pd.DataFrame(events)
+
+    if df_events.empty:
+        return pd.DataFrame(columns=_EVENT_COLS)
+
+    # Enrich sell events with exit reason from trades_df if available.
+    if trades_df is not None and not trades_df.empty:
+        t = trades_df.copy()
+        exit_dt_col = _pick_first_col(t, ["exit_dt", "dt_exit", "exit_time", "exit_ts"])
+        exit_reason_col = _pick_first_col(t, ["exit_reason", "reason", "exit_reason_detail", "exit_type"])
+        if exit_dt_col is not None and exit_reason_col is not None:
+            t["_exit_dt"] = pd.to_datetime(t[exit_dt_col], errors="coerce", utc=True)
+            t = t.dropna(subset=["_exit_dt"]).sort_values("_exit_dt")
+            if not t.empty:
+                exit_ns = t["_exit_dt"].astype("int64").to_numpy()
+                exit_reason = t[exit_reason_col].astype(str).to_numpy()
+
+                # Update EXIT/TP reasons by nearest exit_dt within tolerance.
+                tol_ns = int(2 * 24 * 3600 * 1e9)  # 2 days
+                ev_dt = pd.to_datetime(df_events["dt"], errors="coerce", utc=True)
+                ev_ns = ev_dt.astype("int64").to_numpy()
+
+                for i_ev in range(len(df_events)):
+                    if df_events.loc[i_ev, "event"] not in {"TP", "EXIT"}:
+                        continue
+                    ns = int(ev_ns[i_ev])
+                    j = int(np.argmin(np.abs(exit_ns - ns))) if exit_ns.size else -1
+                    if j >= 0 and abs(int(exit_ns[j]) - ns) <= tol_ns:
+                        rr = str(exit_reason[j] or "").strip()
+                        if rr:
+                            df_events.loc[i_ev, "reason"] = rr
+
+    # Ensure columns + stable order
+    for c in _EVENT_COLS:
+        if c not in df_events.columns:
+            df_events[c] = None
+    df_events = df_events[_EVENT_COLS].copy()
+    return df_events
+
 def main() -> int:
     _ensure_repo_on_syspath()
 
@@ -391,6 +540,19 @@ def main() -> int:
         eq_df.to_csv(out_dir / "equity_curve.csv", index=False)
 
     (out_dir / "metrics.json").write_text(json.dumps(_to_jsonable(metrics), indent=2), encoding="utf-8")
+
+    # Write event tape for UI overlays (price + actions)
+    try:
+        events_df = _build_events_df(fills_df, trades_df)
+        # Always write the file so the UI can detect regeneration, even if empty.
+        events_df.to_csv(out_dir / "events.csv", index=False)
+    except Exception as e:
+        # Don't fail replay artifacts if event tape generation breaks.
+        try:
+            pd.DataFrame(columns=_EVENT_COLS).to_csv(out_dir / "events.csv", index=False)
+        except Exception:
+            pass
+        _progress_write(progress_path, {"stage": "replay", "phase": "events_error", "err": str(e)})
 
     _progress_write(progress_path, {"stage": "replay", "phase": "write", "sec": float(time.time() - t0)})
     print(f"Replay artifacts written: {out_dir}")

@@ -1706,6 +1706,7 @@ def run_backtest_once(
             "entry_dt": entry_dt,
             "exit_dt": None,
             "exit_reason": None,
+            "exit_reason_detail": None,
             "side": None,
             "entry_price": None,
             "qty_initial": None,
@@ -1946,7 +1947,13 @@ def run_backtest_once(
             if closed:
                 baseline_qty_abs = 0.0
                 tps_hit = 0
-                finalize_trade(exit_dt=dt, reason="plan_flat")
+                meta2 = dict(active_plan.metadata or {}) if (active_plan and active_plan.metadata) else {}
+                exit_tag = meta2.get("exit_tag") or meta2.get("exit_reason")
+                if isinstance(exit_tag, str):
+                    exit_tag = exit_tag.strip().lower()
+                else:
+                    exit_tag = None
+                finalize_trade(exit_dt=dt, reason=str(exit_tag) if exit_tag else "plan_flat")
 
                 guard2 = active_plan.guardrails if active_plan is not None else None
                 if trades and trades[-1]["exit_dt"] is not None:
@@ -2113,6 +2120,7 @@ def run_backtest_once(
 
                         tr["stop_hit_was_moved"] = bool(moved)
                         tr["stop_last"] = sN
+                        tr["exit_reason_detail"] = (dict(active_plan.metadata or {}).get("stop_kind") if (active_plan and active_plan.metadata) else None)
 
                     finalize_trade(exit_dt=dt, reason="stop")
                     baseline_qty_abs = 0.0

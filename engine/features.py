@@ -7,6 +7,17 @@ MS_1M = 60_000
 def _ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
 
+
+def _macd_features(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.DataFrame:
+    """Compute MACD, signal, histogram (TradingView defaults: 12,26,9)."""
+    ema_fast = _ema(series, fast)
+    ema_slow = _ema(series, slow)
+    macd = ema_fast - ema_slow
+    sig = _ema(macd, signal)
+    hist = macd - sig
+    return pd.DataFrame({"macd": macd, "signal": sig, "hist": hist})
+
+
 def _infer_bar_ms(df: pd.DataFrame) -> float:
     if "ts" not in df.columns:
         return float("nan")
@@ -199,6 +210,43 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     df["atr_pct"] = (df["atr_14"] / df["close"]) * 100.0
     
     feat_cols.extend(["atr_14", "atr_pct"])
+
+    # --- TA Pack (base timeframe) ---
+    # These are "TradingView classics" that users expect on daily bars.
+    try:
+        macd_df = _macd_features(df["close"], fast=12, slow=26, signal=9)
+        df["macd_12_26"] = macd_df["macd"]
+        df["macd_signal_12_26_9"] = macd_df["signal"]
+        df["macd_hist_12_26_9"] = macd_df["hist"]
+        feat_cols.extend(["macd_12_26", "macd_signal_12_26_9", "macd_hist_12_26_9"])
+    except Exception:
+        pass
+
+    # Only compute these on non-1m datasets (1m gets HTF versions later).
+    if not _is_1m_bars(df):
+        try:
+            df["adx_14"] = _adx(df, 14)
+            feat_cols.append("adx_14")
+        except Exception:
+            pass
+
+        try:
+            bb = _bb_features(df["close"], 20)
+            df["bb_width_20"] = bb["bb_width"]
+            df["bb_z_20"] = bb["bb_z"]
+            feat_cols.extend(["bb_width_20", "bb_z_20"])
+        except Exception:
+            pass
+
+        try:
+            donch = _donchian_features(df, 20)
+            df["donch_hi_20"] = donch["donch_hi"]
+            df["donch_lo_20"] = donch["donch_lo"]
+            df["donch_pos_20"] = donch["donch_pos"]
+            feat_cols.extend(["donch_hi_20", "donch_lo_20", "donch_pos_20"])
+        except Exception:
+            pass
+
 
     # 4. Volume Flow
     if "volume" in df.columns:

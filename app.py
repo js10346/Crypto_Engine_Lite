@@ -6,6 +6,7 @@ import zipfile
 import io
 import hashlib
 import os
+import shutil
 import math
 import re
 import subprocess
@@ -13,7 +14,7 @@ import sys
 import time
 import threading
 import queue
-from collections import deque
+from collections import deque, defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +24,12 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 import streamlit.components.v1 as components
+
+# Optional: used for Build-step “reality check” stats (TA filters)
+try:
+    from engine.features import add_features as _add_features
+except Exception:  # pragma: no cover
+    _add_features = None
 
 try:
     import plotly.express as px
@@ -298,6 +305,23 @@ def _read_csv_cached(path: str, mtime: float) -> pd.DataFrame:
     return pd.read_csv(path)
 
 
+@st.cache_data(show_spinner=False)
+def _add_features_cached(path: str, mtime: float) -> Optional[pd.DataFrame]:
+    """Load CSV + compute features once per dataset version (used only for UI context)."""
+    _ = mtime  # cache buster
+    if _add_features is None:
+        return None
+    df = pd.read_csv(path)
+    try:
+        df.columns = [str(c).strip().lower() for c in df.columns]
+    except Exception:
+        pass
+    need = {"open", "high", "low", "close"}
+    if not need.issubset(set(df.columns)):
+        return None
+    return _add_features(df)
+
+
 def _load_csv(path: Path) -> Optional[pd.DataFrame]:
     if not path.exists():
         return None
@@ -406,6 +430,156 @@ def _load_jsonl(path: Path) -> List[Dict[str, Any]]:
         return []
     return _read_jsonl_cached(str(path), path.stat().st_mtime)
 
+
+def _summarize_grid_composition(grid_path: Path) -> Dict[str, Any]:
+    """Summarize what kind of population we generated (for the run-story 'dopamine loop').
+
+    This is NOT advice; it's just a factual breakdown of the variant set.
+    """
+    from datetime import datetime as _dt
+
+    total = 0
+    logic = 0
+    always = 0
+    filter_counts = defaultdict(int)
+
+    trail = 0
+    time_stop = 0
+    sl = 0
+    tp = 0
+
+    # Extra: characterize logic complexity (bounded + readable)
+    logic_clauses_sum = 0
+    logic_conds_sum = 0
+
+    if not grid_path.exists():
+        return {"total": 0, "generated_at": _dt.utcnow().isoformat()}
+
+    with open(grid_path, "r", encoding="utf-8-sig") as f:
+        for line in f:
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                row = json.loads(s)
+            except Exception:
+                continue
+            total += 1
+            params = row.get("params") or {}
+            bf = str(params.get("buy_filter", "none") or "none").strip().lower()
+            el = params.get("entry_logic") if isinstance(params.get("entry_logic"), dict) else None
+            clauses = []
+            if isinstance(el, dict):
+                clauses = el.get("clauses") or []
+            # Heuristic:
+            # - "logic-builder" = buy_filter is none AND entry_logic has at least one non-empty clause
+            # - "always"       = buy_filter none AND entry_logic clauses empty
+            # - otherwise      = simple buy_filter mode
+            if bf in {"none", ""}:
+                if clauses and any(isinstance(c, list) and len(c) > 0 for c in clauses):
+                    logic += 1
+                    logic_clauses_sum += int(len(clauses))
+                    logic_conds_sum += int(sum(len(c) for c in clauses if isinstance(c, list)))
+                else:
+                    always += 1
+            else:
+                filter_counts[bf] += 1
+
+            try:
+                if float(params.get("trail_pct", 0.0) or 0.0) > 0.0:
+                    trail += 1
+            except Exception:
+                pass
+            try:
+                if int(params.get("max_hold_bars", 0) or 0) > 0:
+                    time_stop += 1
+            except Exception:
+                pass
+            try:
+                if float(params.get("sl_pct", 0.0) or 0.0) > 0.0:
+                    sl += 1
+            except Exception:
+                pass
+            try:
+                if float(params.get("tp_pct", 0.0) or 0.0) > 0.0:
+                    tp += 1
+            except Exception:
+                pass
+
+    comp: Dict[str, Any] = {
+        "generated_at": _dt.utcnow().isoformat(),
+        "total": int(total),
+        "entry": {
+            "logic_builder": int(logic),
+            "always": int(always),
+            "simple_filters": {k: int(v) for k, v in sorted(filter_counts.items(), key=lambda kv: (-kv[1], kv[0]))},
+            "logic_avg_clauses": (logic_clauses_sum / logic) if logic else 0.0,
+            "logic_avg_conditions": (logic_conds_sum / logic) if logic else 0.0,
+        },
+        "exits": {
+            "trailing_stop_enabled": int(trail),
+            "time_stop_enabled": int(time_stop),
+            "stop_loss_enabled": int(sl),
+            "take_profit_enabled": int(tp),
+        },
+    }
+    return comp
+
+
+def _render_grid_composition(comp: Dict[str, Any]) -> None:
+    """Small UI block: what did we generate?"""
+    total = int(comp.get("total", 0) or 0)
+    if total <= 0:
+        st.info("No grid composition available.")
+        return
+
+    entry = comp.get("entry") or {}
+    exits = comp.get("exits") or {}
+
+    def _pct(x: int) -> str:
+        return f"{(100.0 * float(x) / float(total)):.0f}%"
+
+    logic_n = int(entry.get("logic_builder", 0) or 0)
+    always_n = int(entry.get("always", 0) or 0)
+    trail_n = int(exits.get("trailing_stop_enabled", 0) or 0)
+    time_n = int(exits.get("time_stop_enabled", 0) or 0)
+
+    st.markdown("### Generated composition")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total variants", f"{total:,}")
+    c2.metric("Logic-builder", f"{_pct(logic_n)}", f"{logic_n:,}")
+    c3.metric("Trailing stop enabled", f"{_pct(trail_n)}", f"{trail_n:,}")
+    c4.metric("Time stop enabled", f"{_pct(time_n)}", f"{time_n:,}")
+
+    # Simple filter breakdown (only show if present)
+    sf = entry.get("simple_filters") or {}
+    if isinstance(sf, dict) and len(sf) > 0:
+        nice = {
+            "below_ema": "Dip below EMA",
+            "rsi_below": "RSI low",
+            "bb_z_below": "BB z (oversold)",
+            "macd_bull": "MACD bullish",
+            "adx_above": "ADX trending",
+            "donch_pos_below": "Donchian bottom",
+        }
+        parts = []
+        for k, v in sf.items():
+            try:
+                v = int(v)
+            except Exception:
+                continue
+            parts.append(f"{nice.get(k, k)}: {v} ({_pct(v)})")
+        if parts:
+            st.caption("Simple filters: " + " · ".join(parts))
+
+    # Always-buy share (explicit, because it matters for interpretability)
+    st.caption(f"Always-buy (no entry filter): {always_n} ({_pct(always_n)})")
+
+    # Logic complexity (just factual)
+    avg_c = float(entry.get("logic_avg_clauses", 0.0) or 0.0)
+    avg_k = float(entry.get("logic_avg_conditions", 0.0) or 0.0)
+    if logic_n > 0:
+        st.caption(f"Logic-builder complexity (avg): {avg_c:.2f} clauses · {avg_k:.2f} conditions")
 
 def _tail_jsonl(path: Path, *, max_lines: int = 400) -> List[Dict[str, Any]]:
     """Read the last N JSONL rows (best-effort)."""
@@ -1443,8 +1617,284 @@ def merge_stage(
 # New run wizard: DCA/Swing baseline builder
 # =============================================================================
 
+def _filter_true_pct(
+    df_feat: pd.DataFrame,
+    buy_filter: str,
+    *,
+    ema_len: int = 200,
+    rsi_thr: float = 40.0,
+    macd_hist_thr: float = 0.0,
+    bb_z_thr: float = -1.0,
+    adx_thr: float = 20.0,
+    donch_pos_thr: float = 0.20,
+) -> Optional[float]:
+    """Percent of bars where the entry filter is true (for Build-step context)."""
+    if df_feat is None or df_feat.empty:
+        return None
+    f = str(buy_filter or "none").strip().lower()
+
+    try:
+        close = df_feat["close"].astype(float)
+    except Exception:
+        return None
+
+    mask = None
+    if f in {"none", ""}:
+        mask = pd.Series(True, index=df_feat.index)
+    elif f == "below_ema":
+        col = f"ema_{int(ema_len)}"
+        if col in df_feat.columns:
+            mask = close <= pd.to_numeric(df_feat[col], errors="coerce")
+    elif f == "rsi_below":
+        col = "rsi_14"
+        if col in df_feat.columns:
+            mask = pd.to_numeric(df_feat[col], errors="coerce") <= float(rsi_thr)
+    elif f == "macd_bull":
+        col = "macd_hist_12_26_9"
+        if col in df_feat.columns:
+            mask = pd.to_numeric(df_feat[col], errors="coerce") >= float(macd_hist_thr)
+    elif f == "bb_z_below":
+        col = "bb_z_20"
+        if col in df_feat.columns:
+            mask = pd.to_numeric(df_feat[col], errors="coerce") <= float(bb_z_thr)
+    elif f == "adx_above":
+        col = "adx_14"
+        if col in df_feat.columns:
+            mask = pd.to_numeric(df_feat[col], errors="coerce") >= float(adx_thr)
+    elif f == "donch_pos_below":
+        col = "donch_pos_20"
+        if col in df_feat.columns:
+            mask = pd.to_numeric(df_feat[col], errors="coerce") <= float(donch_pos_thr)
+
+    if mask is None:
+        return None
+    try:
+        return float(mask.mean() * 100.0)
+    except Exception:
+        return None
+
+
+
+def _simple_filter_to_entry_logic(
+    buy_filter: str,
+    *,
+    ema_len: int = 200,
+    rsi_thr: float = 40.0,
+    macd_hist_thr: float = 0.0,
+    bb_z_thr: float = -1.0,
+    adx_thr: float = 20.0,
+    donch_pos_thr: float = 0.20,
+) -> Dict[str, Any]:
+    """
+    Translate legacy single buy_filter into entry_logic (regime=[], clauses=[...]).
+    entry_logic condition schema matches dca_swing_strategy_overhaul_v1.py:
+      - indicator (lhs)
+      - operator
+      - threshold (rhs literal OR offset when ref_indicator used)
+      - ref_indicator (optional rhs indicator)
+    """
+    f = str(buy_filter or "none").strip().lower()
+    regime: List[Dict[str, Any]] = []
+    clauses: List[List[Dict[str, Any]]] = []
+
+    if f in {"none", ""}:
+        return {"regime": regime, "clauses": clauses}  # no triggers => always allowed
+
+    if f == "below_ema":
+        clauses = [[{"indicator": "close", "operator": "<=", "ref_indicator": f"ema_{int(ema_len)}", "threshold": 0.0}]]
+    elif f == "rsi_below":
+        clauses = [[{"indicator": "rsi_14", "operator": "<=", "threshold": float(rsi_thr)}]]
+    elif f == "bb_z_below":
+        clauses = [[{"indicator": "bb_z_20", "operator": "<=", "threshold": float(bb_z_thr)}]]
+    elif f == "macd_bull":
+        clauses = [[{"indicator": "macd_hist_12_26_9", "operator": ">=", "threshold": float(macd_hist_thr)}]]
+    elif f == "adx_above":
+        clauses = [[{"indicator": "adx_14", "operator": ">=", "threshold": float(adx_thr)}]]
+    elif f == "donch_pos_below":
+        clauses = [[{"indicator": "donch_pos_20", "operator": "<=", "threshold": float(donch_pos_thr)}]]
+
+    return {"regime": regime, "clauses": clauses}
+
+
+def _cond_mask(df_feat: pd.DataFrame, cond: Dict[str, Any]) -> Optional[pd.Series]:
+    """Vectorized mask for one condition against df_feat. Returns None if missing columns."""
+    if df_feat is None or df_feat.empty or not isinstance(cond, dict):
+        return None
+
+    ind = cond.get("indicator") or cond.get("feature") or cond.get("lhs")
+    op = str(cond.get("operator") or cond.get("op") or "").strip()
+    thr = cond.get("threshold", cond.get("value", 0.0))
+    ref = cond.get("ref_indicator") or cond.get("rhs") or cond.get("rhs_indicator")
+
+    if op not in {"<", "<=", ">", ">="}:
+        return None
+
+    name = str(ind or "").strip()
+    if not name:
+        return None
+
+    # lhs
+    if name.lower() in {"open", "high", "low", "close", "volume", "vol"}:
+        if name.lower() == "open":
+            lhs = pd.to_numeric(df_feat.get("open"), errors="coerce")
+        elif name.lower() == "high":
+            lhs = pd.to_numeric(df_feat.get("high"), errors="coerce")
+        elif name.lower() == "low":
+            lhs = pd.to_numeric(df_feat.get("low"), errors="coerce")
+        elif name.lower() == "close":
+            lhs = pd.to_numeric(df_feat.get("close"), errors="coerce")
+        else:
+            lhs = pd.to_numeric(df_feat.get("volume"), errors="coerce")
+    else:
+        if name not in df_feat.columns:
+            return None
+        lhs = pd.to_numeric(df_feat[name], errors="coerce")
+
+    # rhs: literal OR ref indicator (+ offset)
+    if ref is not None and str(ref).strip():
+        r = str(ref).strip()
+        if r not in df_feat.columns and r.lower() not in {"open", "high", "low", "close", "volume", "vol"}:
+            return None
+        if r.lower() == "open":
+            rhs0 = pd.to_numeric(df_feat.get("open"), errors="coerce")
+        elif r.lower() == "high":
+            rhs0 = pd.to_numeric(df_feat.get("high"), errors="coerce")
+        elif r.lower() == "low":
+            rhs0 = pd.to_numeric(df_feat.get("low"), errors="coerce")
+        elif r.lower() == "close":
+            rhs0 = pd.to_numeric(df_feat.get("close"), errors="coerce")
+        elif r.lower() in {"volume", "vol"}:
+            rhs0 = pd.to_numeric(df_feat.get("volume"), errors="coerce")
+        else:
+            rhs0 = pd.to_numeric(df_feat.get(r), errors="coerce")
+        off = float(thr or 0.0)
+        rhs = rhs0 + off
+    else:
+        rhs = float(thr)
+
+    if op == "<":
+        m = lhs < rhs
+    elif op == "<=":
+        m = lhs <= rhs
+    elif op == ">":
+        m = lhs > rhs
+    else:
+        m = lhs >= rhs
+
+    return m.fillna(False)
+
+
+def _entry_logic_masks(df_feat: pd.DataFrame, entry_logic: Dict[str, Any]) -> Optional[Tuple[pd.Series, pd.Series, pd.Series]]:
+    """Return (regime_mask, entry_mask, combined_mask)."""
+    if df_feat is None or df_feat.empty or not isinstance(entry_logic, dict):
+        return None
+
+    idx = df_feat.index
+    regime_mask = pd.Series(True, index=idx)
+    for c in entry_logic.get("regime", []) or []:
+        cm = _cond_mask(df_feat, c)
+        if cm is None:
+            return None
+        regime_mask &= cm
+
+    clauses = entry_logic.get("clauses", []) or []
+    if not clauses:
+        entry_mask = pd.Series(True, index=idx)
+    else:
+        entry_mask = pd.Series(False, index=idx)
+        for clause in clauses:
+            if not clause:
+                entry_mask |= True
+                continue
+            cm_all = pd.Series(True, index=idx)
+            for c in clause:
+                cm = _cond_mask(df_feat, c)
+                if cm is None:
+                    return None
+                cm_all &= cm
+            entry_mask |= cm_all
+
+    combined = regime_mask & entry_mask
+    return regime_mask, entry_mask, combined
+
+
+def _entry_logic_true_pcts(df_feat: pd.DataFrame, entry_logic: Dict[str, Any]) -> Optional[Tuple[float, float, float]]:
+    """(regime%, entry%, combined%)"""
+    masks = _entry_logic_masks(df_feat, entry_logic)
+    if masks is None:
+        return None
+    r, e, c = masks
+    return float(r.mean() * 100.0), float(e.mean() * 100.0), float(c.mean() * 100.0)
+
+
+def _human_condition(cond: Dict[str, Any]) -> str:
+    if not isinstance(cond, dict):
+        return ""
+    ind = cond.get("indicator") or cond.get("feature") or cond.get("lhs")
+    op = cond.get("operator") or cond.get("op")
+    thr = cond.get("threshold", cond.get("value", 0.0))
+    ref = cond.get("ref_indicator") or cond.get("rhs") or cond.get("rhs_indicator")
+
+    ind = str(ind or "").strip()
+    op = str(op or "").strip()
+    if ref is not None and str(ref).strip():
+        r = str(ref).strip()
+        off = float(thr or 0.0)
+        if abs(off) < 1e-12:
+            return f"{ind} {op} {r}"
+        sign = "+" if off >= 0 else "-"
+        return f"{ind} {op} {r} {sign} {abs(off):g}"
+    else:
+        try:
+            v = float(thr)
+            # prettier ints
+            if abs(v - round(v)) < 1e-9:
+                return f"{ind} {op} {int(round(v))}"
+            return f"{ind} {op} {v:g}"
+        except Exception:
+            return f"{ind} {op} {thr}"
+
+
+def _human_entry_logic(entry_logic: Dict[str, Any]) -> str:
+    if not isinstance(entry_logic, dict):
+        return ""
+    parts: List[str] = []
+    regime = entry_logic.get("regime", []) or []
+    clauses = entry_logic.get("clauses", []) or []
+
+    if regime:
+        parts.append("Regime: " + " AND ".join([_human_condition(c) for c in regime if isinstance(c, dict)]))
+
+    if not clauses:
+        parts.append("Entry: (always allowed)")
+    else:
+        clause_strs = []
+        for cl in clauses:
+            if not cl:
+                clause_strs.append("(always)")
+            else:
+                clause_strs.append("(" + " AND ".join([_human_condition(c) for c in cl if isinstance(c, dict)]) + ")")
+        parts.append("Entry: " + " OR ".join(clause_strs))
+
+    return " · ".join([p for p in parts if p.strip()])
+
+
+
 def build_dca_baseline_params() -> Dict[str, Any]:
     st.subheader("Baseline plan (DCA/Swing)")
+
+    # Build-step context (optional): compute indicator columns to show “how often will this trigger?”
+    df_feat = None
+    data_path_str = st.session_state.get("new.data_path")
+    if data_path_str:
+        try:
+            p = Path(str(data_path_str))
+            if p.exists():
+                df_feat = _add_features_cached(str(p), p.stat().st_mtime)
+        except Exception:
+            df_feat = None
+
+    build_atr_med = None
 
     colA, colB = st.columns(2)
     with colA:
@@ -1478,76 +1928,341 @@ def build_dca_baseline_params() -> Dict[str, Any]:
             key="new.buy_amount",
         )
 
+    # -------------------------
+    # Entry logic (simple vs builder)
+    # -------------------------
     with colB:
-        buy_filter = st.selectbox(
-            "Only buy when…",
-            options=[
-                "none",
-                "below_ema",
-                "rsi_below",
-            ],
+        st.caption("Entry gating controls whether scheduled buys are allowed to fire. This is about mechanics, not recommendations.")
+
+        entry_mode = st.radio(
+            "Entry logic mode",
+            options=["Simple (one filter)", "Logic builder (regime + triggers)"],
             index=0,
-            key="new.buy_filter",
+            horizontal=True,
+            key="new.entry_mode",
         )
+
+        # Defaults for legacy knobs (used in simple mode and as defaults in the builder)
+        buy_filter = "none"
         ema_len = 200
         rsi_thr = 40.0
-        if buy_filter == "below_ema":
-            ema_len = int(
-                st.number_input("EMA length", min_value=5, max_value=600, value=200, step=5, key="new.ema_len")
+        macd_hist_thr = 0.0
+        bb_z_thr = -1.0
+        adx_thr = 20.0
+        donch_pos_thr = 0.20
+
+        entry_logic: Dict[str, Any] = {"regime": [], "clauses": []}
+
+        def _cond_ui(prefix: str) -> Optional[Dict[str, Any]]:
+            """
+            Builder UI for one condition. Returns condition dict or None if disabled.
+            We keep condition types tight so we only reference known feature columns.
+            """
+            cond_type = st.selectbox(
+                "Condition",
+                options=[
+                    "— (disabled)",
+                    "Price vs EMA",
+                    "RSI(14)",
+                    "Bollinger z-score(20)",
+                    "MACD histogram(12,26,9)",
+                    "ADX(14)",
+                    "Donchian position(20)",
+                ],
+                index=0,
+                key=f"{prefix}.type",
             )
-        if buy_filter == "rsi_below":
-            rsi_thr = float(
-                st.number_input("RSI threshold (buy when RSI < threshold)", min_value=5.0, max_value=80.0, value=40.0, step=1.0, key="new.rsi_thr")
+            if cond_type.startswith("—"):
+                return None
+
+            # Operators (restricted per type to reduce foot-guns)
+            if cond_type == "Price vs EMA":
+                op = st.selectbox("Operator", options=["<=", ">="], index=0, key=f"{prefix}.op")
+                ln = int(st.selectbox("EMA length", options=[10, 20, 50, 100, 200], index=4, key=f"{prefix}.ema_len"))
+                return {"indicator": "close", "operator": op, "ref_indicator": f"ema_{ln}", "threshold": 0.0}
+
+            if cond_type == "RSI(14)":
+                op = st.selectbox("Operator", options=["<=", ">="], index=0, key=f"{prefix}.op")
+                thr = float(st.slider("Threshold", 5.0, 95.0, 40.0, 1.0, key=f"{prefix}.thr"))
+                return {"indicator": "rsi_14", "operator": op, "threshold": thr}
+
+            if cond_type == "Bollinger z-score(20)":
+                op = st.selectbox("Operator", options=["<=", ">="], index=0, key=f"{prefix}.op")
+                thr = float(st.slider("Threshold", -3.0, 3.0, -1.0, 0.1, key=f"{prefix}.thr"))
+                return {"indicator": "bb_z_20", "operator": op, "threshold": thr}
+
+            if cond_type == "MACD histogram(12,26,9)":
+                op = st.selectbox("Operator", options=[">=", "<="], index=0, key=f"{prefix}.op")
+                thr = float(st.number_input("Threshold", value=0.0, step=0.1, key=f"{prefix}.thr"))
+                return {"indicator": "macd_hist_12_26_9", "operator": op, "threshold": thr}
+
+            if cond_type == "ADX(14)":
+                op = st.selectbox("Operator", options=[">=", "<="], index=0, key=f"{prefix}.op")
+                thr = float(st.slider("Threshold", 1.0, 80.0, 20.0, 1.0, key=f"{prefix}.thr"))
+                return {"indicator": "adx_14", "operator": op, "threshold": thr}
+
+            if cond_type == "Donchian position(20)":
+                op = st.selectbox("Operator", options=["<=", ">="], index=0, key=f"{prefix}.op")
+                thr = float(st.slider("Threshold", 0.0, 1.0, 0.20, 0.05, key=f"{prefix}.thr"))
+                return {"indicator": "donch_pos_20", "operator": op, "threshold": thr}
+
+            return None
+
+        if entry_mode.startswith("Simple"):
+            FILTER_LABELS = {
+                "none": "🟦 Always buy (no filter)",
+                "below_ema": "📉 Buy dips below EMA",
+                "rsi_below": "😮‍💨 Oversold (RSI low)",
+                "bb_z_below": "🎯 Oversold (Bollinger stretch)",
+                "macd_bull": "🚀 Momentum (MACD bullish)",
+                "adx_above": "🧭 Trend strength (ADX)",
+                "donch_pos_below": "🏷️ Range bottom (Donchian)",
+            }
+            FILTER_DESC = {
+                "none": "Buys fire on schedule (subject to max allocation).",
+                "below_ema": "Only buy when price is below a moving average (dip gate).",
+                "rsi_below": "Only buy when RSI is below a threshold (oversold gate).",
+                "bb_z_below": "Only buy when price is stretched below its Bollinger midline (z‑score).",
+                "macd_bull": "Only buy when momentum is bullish (MACD histogram ≥ threshold).",
+                "adx_above": "Only buy when trend strength is above a threshold (ADX).",
+                "donch_pos_below": "Only buy near the bottom of the recent Donchian range.",
+            }
+
+            buy_filter = st.selectbox(
+                "Entry filter (TradingView‑style)",
+                options=[
+                    "none",
+                    "below_ema",
+                    "rsi_below",
+                    "bb_z_below",
+                    "macd_bull",
+                    "adx_above",
+                    "donch_pos_below",
+                ],
+                index=0,
+                key="new.buy_filter",
+                format_func=lambda v: FILTER_LABELS.get(v, v),
             )
+            st.caption(FILTER_DESC.get(buy_filter, ""))
+
+            if buy_filter == "below_ema":
+                ema_len = int(st.selectbox("EMA length", options=[10, 20, 50, 100, 200], index=4, key="new.ema_len"))
+            elif buy_filter == "rsi_below":
+                rsi_thr = float(st.slider("RSI threshold (buy when RSI ≤ threshold)", 5.0, 80.0, 40.0, 1.0, key="new.rsi_thr"))
+            elif buy_filter == "bb_z_below":
+                bb_z_thr = float(st.slider("Bollinger z-score threshold (buy when z ≤ threshold)", -3.0, 0.0, -1.0, 0.1, key="new.bb_z_thr"))
+            elif buy_filter == "macd_bull":
+                macd_hist_thr = float(st.number_input("MACD histogram threshold (hist ≥ threshold)", value=0.0, step=0.1, key="new.macd_hist_thr"))
+            elif buy_filter == "adx_above":
+                adx_thr = float(st.slider("ADX threshold (buy when ADX ≥ threshold)", 5.0, 60.0, 20.0, 1.0, key="new.adx_thr"))
+            elif buy_filter == "donch_pos_below":
+                donch_pos_thr = float(st.slider("Donchian position threshold (pos ≤ threshold)", 0.0, 1.0, 0.20, 0.05, key="new.donch_pos_thr"))
+
+            entry_logic = _simple_filter_to_entry_logic(
+                buy_filter,
+                ema_len=ema_len,
+                rsi_thr=rsi_thr,
+                macd_hist_thr=macd_hist_thr,
+                bb_z_thr=bb_z_thr,
+                adx_thr=adx_thr,
+                donch_pos_thr=donch_pos_thr,
+            )
+
+            # Tiny “reality check” in simple mode
+            if df_feat is not None and not df_feat.empty:
+                try:
+                    pct = _filter_true_pct(
+                        df_feat,
+                        buy_filter,
+                        ema_len=ema_len,
+                        rsi_thr=rsi_thr,
+                        macd_hist_thr=macd_hist_thr,
+                        bb_z_thr=bb_z_thr,
+                        adx_thr=adx_thr,
+                        donch_pos_thr=donch_pos_thr,
+                    )
+                    atr_med = None
+                    if "atr_pct" in df_feat.columns:
+                        atr_med = float(np.nanmedian(pd.to_numeric(df_feat["atr_pct"], errors="coerce")))
+                    build_atr_med = atr_med
+                    msg = None
+                    if pct is not None:
+                        msg = f"On this dataset: filter true ~{pct:.0f}% of days"
+                    if atr_med is not None and math.isfinite(atr_med):
+                        msg = (msg + f" · median daily ATR ≈ {atr_med:.1f}%") if msg else f"Median daily ATR ≈ {atr_med:.1f}%"
+                    if msg:
+                        st.caption(msg + ".")
+                    if pct is not None and pct < 5:
+                        st.info("FYI: this filter triggers on <5% of days here. That typically reduces trade count and increases outcome variability.")
+                except Exception:
+                    pass
+
+        else:
+            st.caption("Builder: define a small set of gates (regime) and a few entry trigger clauses (any-of). Caps keep this auditable.")
+            st.markdown("**Regime (0–2 gates, AND):** entries are allowed only when all regime gates are true.")
+            reg_conds: List[Dict[str, Any]] = []
+            with st.expander("Regime gates", expanded=True):
+                c1 = _cond_ui("new.regime1")
+                if c1:
+                    reg_conds.append(c1)
+                c2 = _cond_ui("new.regime2")
+                if c2:
+                    reg_conds.append(c2)
+
+            st.markdown("**Entry triggers (1–3 clauses, OR-of-AND):** if *any* clause is true, an entry is allowed (subject to regime + allocation).")
+            clauses: List[List[Dict[str, Any]]] = []
+            with st.expander("Trigger clauses", expanded=True):
+                for i in range(1, 4):
+                    with st.container():
+                        st.markdown(f"**Clause {i}** (1–3 conditions, AND)")
+                        cl: List[Dict[str, Any]] = []
+                        c1 = _cond_ui(f"new.cl{i}.c1")
+                        if c1:
+                            cl.append(c1)
+                        c2 = _cond_ui(f"new.cl{i}.c2")
+                        if c2:
+                            cl.append(c2)
+                        c3 = _cond_ui(f"new.cl{i}.c3")
+                        if c3:
+                            cl.append(c3)
+                        if cl:
+                            clauses.append(cl)
+                        st.divider()
+
+            if not clauses:
+                st.warning("No trigger clause is enabled yet. Add at least one condition to at least one clause.")
+            entry_logic = {"regime": reg_conds, "clauses": clauses}
+
+            # Reality-check: how often does this fire?
+            if df_feat is not None and not df_feat.empty and clauses:
+                try:
+                    pcts = _entry_logic_true_pcts(df_feat, entry_logic)
+                    atr_med = None
+                    if "atr_pct" in df_feat.columns:
+                        atr_med = float(np.nanmedian(pd.to_numeric(df_feat["atr_pct"], errors="coerce")))
+                    build_atr_med = atr_med
+                    if pcts is not None:
+                        r, e, c = pcts
+                        msg = f"On this dataset: regime true ~{r:.0f}% · triggers true ~{e:.0f}% · combined ~{c:.0f}%"
+                        if atr_med is not None and math.isfinite(atr_med):
+                            msg += f" · median daily ATR ≈ {atr_med:.1f}%"
+                        st.caption(msg + ".")
+                        if c < 2:
+                            st.info("FYI: combined entry gating triggers on <2% of days here. That often leads to very low trade counts and high variability.")
+                except Exception:
+                    pass
 
         max_alloc_pct = float(
-            st.slider("Max allocation (fraction of equity)", min_value=0.05, max_value=1.00, value=1.00, step=0.05, key="new.max_alloc_pct")
+            st.slider(
+                "Max allocation (fraction of equity)",
+                min_value=0.05,
+                max_value=1.00,
+                value=1.00,
+                step=0.05,
+                key="new.max_alloc_pct",
+            )
         )
 
-        with st.expander("Advanced risk controls", expanded=False):
-            st.caption("Risk controls are expressed as % moves from your average entry price. (10 = 10%).")
-            sl_ui = float(st.slider("Stop loss (%) (0 disables)", 0.0, 50.0, 0.0, 0.25, key="new.sl_pct_ui"))
-            tp_ui = float(st.slider("Take profit (%) (0 disables)", 0.0, 200.0, 0.0, 0.5, key="new.tp_pct_ui"))
+        # Defaults (controls disabled by default)
+        sl_pct = 0.0
+        tp_pct = 0.0
+        tp_sell_fraction = 1.0
+        reserve_frac = 0.0
+
+        # New exits
+        max_hold_bars = 0
+        trail_pct = 0.0
+
+        with st.expander("Risk controls (optional)", expanded=False):
+            st.caption("Values are % moves from your average entry (10 = 10%). These are experiment knobs, not recommendations.")
+            if build_atr_med is not None and math.isfinite(build_atr_med):
+                st.caption(f"For scale only: median daily ATR ≈ {build_atr_med:.1f}% on this dataset.")
+
+            sl_ui = float(st.slider("Stop loss (%) (0 disables)", 0.0, 95.0, 0.0, 0.25, key="new.sl_pct_ui"))
+            tp_ui = float(st.slider("Take profit (%) (0 disables)", 0.0, 500.0, 0.0, 0.5, key="new.tp_pct_ui"))
+
+            # New: time stop + trailing stop
+            max_hold_bars = int(st.number_input("Time stop: max holding period (bars) (0 disables)", min_value=0, value=0, step=5, key="new.max_hold_bars"))
+            trail_ui = float(st.slider("Trailing stop (%) from peak (0 disables)", 0.0, 95.0, 0.0, 0.25, key="new.trail_pct_ui"))
+
+            if build_atr_med is not None and math.isfinite(build_atr_med) and build_atr_med > 0:
+                if sl_ui > 0:
+                    st.caption(f"Stop loss scale: {sl_ui:.2f}% ≈ {sl_ui / build_atr_med:.1f}× median ATR.")
+                if tp_ui > 0:
+                    st.caption(f"Take profit scale: {tp_ui:.2f}% ≈ {tp_ui / build_atr_med:.1f}× median ATR.")
+                if trail_ui > 0:
+                    st.caption(f"Trailing scale: {trail_ui:.2f}% ≈ {trail_ui / build_atr_med:.1f}× median ATR.")
+
             # Store as fractions in params (0.10 == 10%)
             sl_pct = sl_ui / 100.0
             tp_pct = tp_ui / 100.0
-            tp_sell_fraction = float(st.slider("TP sell fraction", 0.0, 1.0, 1.0, 0.05, key="new.tp_sell_frac"))
-            reserve_frac = float(st.slider("Reserve fraction of TP proceeds", 0.0, 1.0, 0.0, 0.05, key="new.reserve_frac"))
+            trail_pct = trail_ui / 100.0
+
+            if tp_ui > 0:
+                tp_sell_fraction = float(st.slider("On take profit: sell fraction of position", 0.0, 1.0, 1.0, 0.05, key="new.tp_sell_frac"))
+                reserve_frac = float(st.slider("Reserve fraction of TP proceeds (keep as cash)", 0.0, 1.0, 0.0, 0.05, key="new.reserve_frac"))
+            else:
+                tp_sell_fraction = 1.0
+                reserve_frac = 0.0
 
     params = {
         "deposit_freq": deposit_freq,
         "deposit_amount_usd": float(deposit_amount),
         "buy_freq": buy_freq,
         "buy_amount_usd": float(buy_amount),
-        "buy_filter": buy_filter,
+        "buy_filter": buy_filter,  # legacy (still used by grid/back-compat)
         "ema_len": int(ema_len),
         "rsi_thr": float(rsi_thr),
+        "macd_hist_thr": float(macd_hist_thr),
+        "bb_z_thr": float(bb_z_thr),
+        "adx_thr": float(adx_thr),
+        "donch_pos_thr": float(donch_pos_thr),
+        "entry_logic": entry_logic,  # new
         "max_alloc_pct": float(max_alloc_pct),
         "sl_pct": float(sl_pct),
         "tp_pct": float(tp_pct),
         "tp_sell_fraction": float(tp_sell_fraction),
-        "reserve_frac_of_proceeds": float(reserve_frac),
+        "reserve_frac": float(reserve_frac),
+        "max_hold_bars": int(max_hold_bars),
+        "trail_pct": float(trail_pct),
     }
 
-    # Plan summary (plain English)
-    parts = []
-    if params["deposit_freq"] != "none" and params["deposit_amount_usd"] > 0:
-        parts.append(f"Deposit ${_fmt_money(params['deposit_amount_usd'])} {params['deposit_freq']}.")
-    parts.append(f"Buy ${_fmt_money(params['buy_amount_usd'])} {params['buy_freq']}.")
-    if buy_filter == "below_ema":
-        parts.append(f"Only buy if price < EMA({params['ema_len']}).")
-    elif buy_filter == "rsi_below":
-        parts.append(f"Only buy if RSI < {params['rsi_thr']:.0f}.")
+    # Human-readable strategy card (dopamine-friendly)
+    parts: List[str] = []
+    parts.append(f"Deposit {deposit_freq} ${int(round(params['deposit_amount_usd']))} and buy {params['buy_freq']} ${int(round(params['buy_amount_usd']))}.")
+    if entry_mode.startswith("Simple"):
+        if buy_filter == "below_ema":
+            parts.append(f"Only buy if close ≤ EMA({params['ema_len']}).")
+        elif buy_filter == "rsi_below":
+            parts.append(f"Only buy if RSI(14) ≤ {params['rsi_thr']:.0f}.")
+        elif buy_filter == "bb_z_below":
+            parts.append(f"Only buy if BB z-score(20) ≤ {params['bb_z_thr']:.1f}.")
+        elif buy_filter == "macd_bull":
+            parts.append(f"Only buy if MACD histogram ≥ {params['macd_hist_thr']:.2f}.")
+        elif buy_filter == "adx_above":
+            parts.append(f"Only buy if ADX(14) ≥ {params['adx_thr']:.0f}.")
+        elif buy_filter == "donch_pos_below":
+            parts.append(f"Only buy near range bottom (Donchian pos ≤ {params['donch_pos_thr']:.2f}).")
+        else:
+            parts.append("Entry gate: (none).")
+    else:
+        parts.append(_human_entry_logic(entry_logic) or "Entry logic: (none).")
+
     parts.append(f"Never allocate more than {_fmt_pct(params['max_alloc_pct'], digits=0)} of equity.")
+
     # Risk controls
     if params.get("sl_pct", 0.0) > 0:
         parts.append("Stop loss: {:.2f}%.".format(params["sl_pct"] * 100))
     if params.get("tp_pct", 0.0) > 0:
         parts.append("Take profit: {:.2f}% (sell {}% per hit).".format(params["tp_pct"] * 100, int(round(params["tp_sell_fraction"] * 100))))
-    st.info(" ".join(parts))
+    if params.get("max_hold_bars", 0) > 0:
+        parts.append(f"Time stop: exit after {params['max_hold_bars']} bars in-position.")
+    if params.get("trail_pct", 0.0) > 0:
+        parts.append("Trailing stop: {:.2f}% from peak (ratchets up).".format(params["trail_pct"] * 100))
+
+    st.info(" ".join([p for p in parts if p.strip()]))
 
     return params
-
 
 def _write_baseline_json(tmp_dir: Path, *, strategy_name: str, side: str, params: Dict[str, Any]) -> Path:
     tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -2472,20 +3187,39 @@ if open_existing == "(new run)":
         n = int(st.number_input("Number of variants", min_value=50, max_value=10000, value=int(n_default), step=50, key="new.n"))
         seed = int(st.number_input("Random seed", min_value=1, max_value=10_000_000, value=1, step=1, key="new.seed"))
 
-        vary_groups = ["deposits", "buys", "filter", "alloc", "risk"]
-        vary = vary_groups
+                # Decide which vary-groups to expose based on the baseline entry mode.
+        entry_mode_ui = str(st.session_state.get("new.entry_mode", ""))
+        entry_group = "logic" if entry_mode_ui.startswith("Logic builder") else "filter"
+
+        vary_groups = ["deposits", "buys", entry_group, "alloc", "risk"]
+        vary = list(vary_groups)
+
+        LABELS = {
+            "deposits": "Deposits",
+            "buys": "Buys",
+            "filter": "Entry filter (simple)",
+            "logic": "Entry logic (builder)",
+            "alloc": "Allocation cap",
+            "risk": "Risk & exits (SL/TP + time/trail)",
+        }
+
+        logic_frac = float(st.session_state.get("new.logic_frac", 0.35))
+
         if mode.startswith("Stress test"):
-            st.write("What should be allowed to vary?")
+            st.write("What should be allowed to vary around the baseline?")
             cols = st.columns(len(vary_groups))
             picks: List[str] = []
             for i, g in enumerate(vary_groups):
                 with cols[i]:
-                    if st.checkbox(g, value=True, key=f"new.vary.{g}"):
+                    if st.checkbox(LABELS.get(g, g), value=True, key=f"new.vary.{g}"):
                         picks.append(g)
             vary = picks or ["deposits", "buys"]  # never allow empty
+
         else:
-            # random mode ignores vary/width/base
-            vary = vary_groups
+            # Random mode ignores vary/width/base; we do allow controlling the mix of logic-builder vs simple entry configs.
+            st.caption("Random mode explores a broader space. This slider controls how often the generator uses the logic-builder entry mode.")
+            logic_frac = float(st.slider("Logic-builder share", 0.0, 1.0, float(logic_frac), 0.05, key="new.logic_frac"))
+            vary = list(vary_groups)
 
         # Preview
         st.divider()
@@ -2509,6 +3243,8 @@ if open_existing == "(new run)":
                     "--seed",
                     str(seed),
                 ]
+                if not mode.startswith("Stress test"):
+                    grid_cmd += ["--logic-frac", str(float(st.session_state.get("new.logic_frac", 0.35)))]
                 if mode.startswith("Stress test"):
                     grid_cmd += [
                         "--mode",
@@ -2537,6 +3273,7 @@ if open_existing == "(new run)":
         st.session_state["new.grid_seed"] = seed
         st.session_state["new.grid_vary"] = vary
         st.session_state["new.grid_mode2"] = mode
+        st.session_state["new.logic_frac"] = float(st.session_state.get("new.logic_frac", 0.35))
 
         colL, colR = st.columns(2)
         with colL:
@@ -2674,6 +3411,7 @@ if open_existing == "(new run)":
 
                 # UI: unified run monitor (Sprint 3)
                 st.subheader("Run monitor")
+                grid_comp_ph = st.empty()
                 stages: List[_PipelineStage] = [
                     _PipelineStage("grid", "Variants"),
                     _PipelineStage("batch", "Batch"),
@@ -2705,6 +3443,8 @@ if open_existing == "(new run)":
                     "--seed",
                     str(int(st.session_state["new.grid_seed"])),
                 ]
+                if not str(st.session_state.get("new.grid_mode2", "")).startswith("Stress test"):
+                    grid_cmd += ["--logic-frac", str(float(st.session_state.get("new.logic_frac", 0.35)))]
                 if str(st.session_state.get("new.grid_mode2", "")).startswith("Stress test"):
                     grid_cmd += [
                         "--mode",
@@ -2721,6 +3461,18 @@ if open_existing == "(new run)":
 
                 pipe.run("grid", grid_cmd, cwd=REPO_ROOT)
                 _ensure_grid_has_baseline(grid_path, base_path, total_n=int(st.session_state["new.grid_n"]))
+
+                # Grid composition (dopamine loop): show + save
+                try:
+                    run_dir = RUNS_DIR / str(run_name)
+                    comp = _summarize_grid_composition(Path(str(grid_path)))
+                    _write_json(run_dir / "grid_meta.json", comp)
+                    with grid_comp_ph.container():
+                        _render_grid_composition(comp)
+                except Exception as _e:
+                    # Never fail the run on a summary widget
+                    with grid_comp_ph.container():
+                        st.caption(f"Grid composition unavailable: {_e}")
 
                 # 3) Batch
                 template_path = str(st.session_state.get("new.template_path", "strategies.dca_swing:Strategy"))
@@ -5838,6 +6590,145 @@ if stage_pick == "grand":
                 st.info("No equity_curve.csv found in artifacts for this config.")
 
 
+            
+            # Price + event timeline (receipts on the tape)
+            ev_path = art_dir / "events.csv"
+            if ev_path.exists():
+                st.markdown("##### Price + event timeline (entries/exits/TPs on the tape)")
+                ev = _load_csv(ev_path)
+                if ev is None or ev.empty:
+                    st.info("events.csv exists, but it has 0 rows (likely generated before event logging was added, or the replay generator hit an error).")
+                    # Allow regeneration even if cached artifacts exist (needed when new artifact types are added).
+                    replay_script = REPO_ROOT / "tools" / "generate_replay_artifacts.py"
+                    can_replay = (run_dir / "configs_resolved.jsonl").exists() and replay_script.exists()
+                    if st.button("Regenerate replay artifacts (refresh cache)", key=f"replay.regen.empty.{pick}", disabled=(not can_replay)):
+                        try:
+                            if replay_dir.exists():
+                                shutil.rmtree(replay_dir)
+                        except Exception:
+                            pass
+                        cmd = [PY, str(replay_script), "--from-run", str(run_dir), "--config-id", str(pick)]
+                        _run_cmd(cmd, cwd=REPO_ROOT, label="Replay: regenerate artifacts")
+                        st.rerun()
+                else:
+                    if "dt" in ev.columns:
+                        ev["dt"] = pd.to_datetime(ev["dt"], errors="coerce", utc=True)
+                    ev = ev.dropna(subset=["dt"]).sort_values("dt")
+
+                    # Load price series from df_feat (preferred) for the exact run's training tape
+                    price = None
+                    feat_path = run_dir / "df_feat.parquet"
+                    if feat_path.exists():
+                        try:
+                            # Try fast column-select read first
+                            price = pd.read_parquet(feat_path, columns=["dt", "close"])
+                        except Exception:
+                            try:
+                                df_tmp = pd.read_parquet(feat_path)
+                                if "dt" in df_tmp.columns and "close" in df_tmp.columns:
+                                    price = df_tmp[["dt", "close"]].copy()
+                            except Exception:
+                                price = None
+
+                    if price is not None and not price.empty and "dt" in price.columns:
+                        price["dt"] = pd.to_datetime(price["dt"], errors="coerce", utc=True)
+                        price = price.dropna(subset=["dt"]).sort_values("dt")
+
+                        # Focus the view around event range (with buffer)
+                        if not ev.empty:
+                            lo = ev["dt"].min() - pd.Timedelta(days=7)
+                            hi = ev["dt"].max() + pd.Timedelta(days=7)
+                            price = price[(price["dt"] >= lo) & (price["dt"] <= hi)]
+
+                        # Downsample for speed (plotly gets sluggish with huge lines)
+                        max_points = 3500
+                        if len(price) > max_points:
+                            idxs = np.linspace(0, len(price) - 1, max_points).astype(int)
+                            price = price.iloc[idxs]
+
+                        show_events = st.multiselect(
+                            "Show events",
+                            ["ENTRY", "ADD", "TP", "EXIT"],
+                            default=["ENTRY", "TP", "EXIT"],
+                            key=f"ev_show_{pick}",
+                        )
+
+                        if go is not None:
+                            fig_ev = go.Figure()
+                            fig_ev.add_trace(
+                                go.Scatter(
+                                    x=price["dt"],
+                                    y=price["close"],
+                                    mode="lines",
+                                    name="Close",
+                                )
+                            )
+
+                            def _add_ev(etype: str, symbol: str, name: str):
+                                if etype not in show_events:
+                                    return
+                                sub = ev[ev.get("event") == etype] if "event" in ev.columns else pd.DataFrame()
+                                if sub is None or sub.empty:
+                                    return
+                                y = pd.to_numeric(sub.get("price"), errors="coerce")
+                                text = None
+                                if "reason" in sub.columns or "detail" in sub.columns:
+                                    if "reason" in sub.columns:
+                                        r = sub["reason"].fillna("").astype(str)
+                                    else:
+                                        r = pd.Series([""] * len(sub), index=sub.index)
+                                    if "detail" in sub.columns:
+                                        d = sub["detail"].fillna("").astype(str)
+                                    else:
+                                        d = pd.Series([""] * len(sub), index=sub.index)
+                                    text = (r + "\n" + d).str.strip()
+                                fig_ev.add_trace(
+                                    go.Scatter(
+                                        x=sub["dt"],
+                                        y=y,
+                                        mode="markers",
+                                        name=name,
+                                        marker=dict(symbol=symbol, size=10),
+                                        text=text,
+                                        hovertemplate="%{x}<br>%{y}<br>%{text}<extra></extra>" if text is not None else "%{x}<br>%{y}<extra></extra>",
+                                    )
+                                )
+
+                            _add_ev("ENTRY", "triangle-up", "Entry")
+                            _add_ev("ADD", "circle", "Add (DCA)")
+                            _add_ev("TP", "diamond", "TP / Partial sell")
+                            _add_ev("EXIT", "triangle-down", "Exit")
+
+                            fig_ev.update_layout(
+                                height=430,
+                                margin=dict(l=10, r=10, t=10, b=10),
+                                xaxis_title="Date",
+                                yaxis_title="Price",
+                                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+                            )
+                            st.plotly_chart(fig_ev, use_container_width=True)
+                        else:
+                            st.info("Plotly is not available; cannot render event timeline chart.")
+                    else:
+                        st.info("events.csv exists, but df_feat.parquet (dt/close) isn't available for price overlay.")
+                st.download_button("Download events.csv", data=ev_path.read_bytes(), file_name=f"{pick}_events.csv")
+            else:
+                st.caption("No events.csv found for this config yet (replay artifacts need regeneration).")
+
+                # Allow regeneration even if cached artifacts exist (needed when new artifact types are added).
+                replay_script = REPO_ROOT / "tools" / "generate_replay_artifacts.py"
+                can_replay = (run_dir / "configs_resolved.jsonl").exists() and replay_script.exists()
+                if st.button("Regenerate replay artifacts (refresh cache)", key=f"replay.regen.{pick}", disabled=(not can_replay)):
+                    try:
+                        if replay_dir.exists():
+                            shutil.rmtree(replay_dir)
+                    except Exception:
+                        pass
+                    cmd = [PY, str(replay_script), "--from-run", str(run_dir), "--config-id", str(pick)]
+                    _run_cmd(cmd, cwd=REPO_ROOT, label="Replay: regenerate artifacts")
+                    st.rerun()
+
+
             # Trade outcomes (easy read)
             if tr_path.exists():
                 tr = _load_csv(tr_path)
@@ -5864,44 +6755,7 @@ if stage_pick == "grand":
                             figp.update_yaxes(title="Count")
                             st.plotly_chart(figp, use_container_width=True)
 
-                    if "exit_reason" in tr.columns and go is not None:
-                        # Only show SL/TP exits (user-legible). Many internal reasons (plan_flat, eod, etc.)
-                        # are useful for debugging but confusing for humans.
-                        def _bucket_exit(r: Any) -> Optional[str]:
-                            s = str(r).strip().lower()
-                            if not s or s == "nan":
-                                return None
-                            if "stop" in s or s in {"sl", "stop_loss", "stoploss"}:
-                                return "Stop loss"
-                            if "tp" in s or "take" in s or "profit" in s:
-                                return "Take profit"
-                            return None
-
-                        buckets = tr["exit_reason"].map(_bucket_exit)
-                        total_exits = int(len(tr))
-                        stp = buckets.dropna()
-                        if not stp.empty:
-                            vc = stp.value_counts()
-                            # enforce stable ordering
-                            vc = vc.reindex(["Stop loss", "Take profit"]).dropna()
-                            pct = (vc / max(1, int(vc.sum())) * 100.0).round(1)
-
-                            figx = go.Figure(
-                                go.Bar(
-                                    x=vc.index.tolist(),
-                                    y=pct.values.tolist(),
-                                    text=[f"{p:.1f}%" for p in pct.values.tolist()],
-                                    textposition="inside",
-                                    marker=dict(color=PASS_COLOR),
-                                )
-                            )
-                            _style_fig(figx, title="Exit reasons (SL vs TP)")
-                            figx.update_xaxes(title=None)
-                            figx.update_yaxes(title="% of SL/TP exits")
-                            st.caption(f"Showing only exits triggered by Stop loss / Take profit: **{int(vc.sum()):,}** of **{total_exits:,}** total exits.")
-                            st.plotly_chart(figx, use_container_width=True)
-                        else:
-                            st.info("No Stop loss / Take profit exits found for this replay (exits were EOD/flatten/other).")
+                    st.caption("Exit reasons are shown above on the price + event timeline (entries/exits/TPs).")
 
             cdl1, cdl2, cdl3 = st.columns(3)
             with cdl1:
