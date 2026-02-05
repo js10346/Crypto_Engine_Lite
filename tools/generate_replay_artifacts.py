@@ -25,6 +25,43 @@ import pandas as pd
 import numpy as np
 
 
+
+def _add_contrib_profit_columns(eq_df: pd.DataFrame, *, starting_equity: float) -> pd.DataFrame:
+    """Add contribution/profit clarity columns to an equity curve.
+
+    Columns added:
+      - contrib_total: cumulative cash-in (starting_equity + cumulative positive cashflow)
+      - profit: equity - contrib_total
+
+    Notes:
+    - We intentionally derive this from the *recorded* per-bar cashflow rather than
+      re-deriving deposit schedules from config params. That keeps results deterministic
+      and auditable: equity_curve.csv is the source of truth for what happened.
+    - If cashflow includes withdrawals (negative), contrib_total only counts cash-in.
+    """
+    if eq_df is None or eq_df.empty:
+        return eq_df
+
+    df = eq_df.copy()
+
+    # cashflow is recorded per bar by the backtester (0 if none).
+    if "cashflow" in df.columns:
+        cf = pd.to_numeric(df["cashflow"], errors="coerce").fillna(0.0)
+    else:
+        cf = pd.Series([0.0] * len(df), index=df.index)
+
+    deposits = cf.clip(lower=0.0)
+    contrib_total = float(starting_equity) + deposits.cumsum()
+
+    df["contrib_total"] = contrib_total
+
+    if "equity" in df.columns:
+        eq = pd.to_numeric(df["equity"], errors="coerce")
+        df["profit"] = eq - df["contrib_total"]
+
+    return df
+
+
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
@@ -117,6 +154,43 @@ def _ensure_vol_bps_like_batch(df: pd.DataFrame, window: int) -> pd.DataFrame:
         return df
 
     import numpy as np
+
+
+
+def _add_contrib_profit_columns(eq_df: pd.DataFrame, *, starting_equity: float) -> pd.DataFrame:
+    """Add contribution/profit clarity columns to an equity curve.
+
+    Columns added:
+      - contrib_total: cumulative cash-in (starting_equity + cumulative positive cashflow)
+      - profit: equity - contrib_total
+
+    Notes:
+    - We intentionally derive this from the *recorded* per-bar cashflow rather than
+      re-deriving deposit schedules from config params. That keeps results deterministic
+      and auditable: equity_curve.csv is the source of truth for what happened.
+    - If cashflow includes withdrawals (negative), contrib_total only counts cash-in.
+    """
+    if eq_df is None or eq_df.empty:
+        return eq_df
+
+    df = eq_df.copy()
+
+    # cashflow is recorded per bar by the backtester (0 if none).
+    if "cashflow" in df.columns:
+        cf = pd.to_numeric(df["cashflow"], errors="coerce").fillna(0.0)
+    else:
+        cf = pd.Series([0.0] * len(df), index=df.index)
+
+    deposits = cf.clip(lower=0.0)
+    contrib_total = float(starting_equity) + deposits.cumsum()
+
+    df["contrib_total"] = contrib_total
+
+    if "equity" in df.columns:
+        eq = pd.to_numeric(df["equity"], errors="coerce")
+        df["profit"] = eq - df["contrib_total"]
+
+    return df
 
     w = int(max(2, window))
     c = df["close"].astype(float)
@@ -537,6 +611,7 @@ def main() -> int:
     if trades_df is not None and not trades_df.empty:
         trades_df.to_csv(out_dir / "trades.csv", index=False)
     if eq_df is not None and not eq_df.empty:
+        eq_df = _add_contrib_profit_columns(eq_df, starting_equity=float(starting_equity))
         eq_df.to_csv(out_dir / "equity_curve.csv", index=False)
 
     (out_dir / "metrics.json").write_text(json.dumps(_to_jsonable(metrics), indent=2), encoding="utf-8")
