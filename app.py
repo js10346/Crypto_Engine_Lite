@@ -60,7 +60,44 @@ except Exception:  # pragma: no cover
 _PLOTLY_HAS_WIDTH = bool(_PLOTLY_CHART_SIG and ("width" in _PLOTLY_CHART_SIG.parameters))
 _PLOTLY_HAS_UCW = bool(_PLOTLY_CHART_SIG and ("use_container_width" in _PLOTLY_CHART_SIG.parameters))
 
+def _sanitize_plotly_figure(fig):
+    """Remove Plotly/JS 'undefined' legend/title artifacts by deleting problematic keys.
+    Runs right before rendering, so it's resilient to earlier layout merges.
+    """
+    if fig is None or go is None:
+        return fig
+    try:
+        d = fig.to_dict()
+
+        layout = d.get("layout", {})
+        legend = layout.get("legend", None)
+        showlegend = layout.get("showlegend", None)
+
+        if isinstance(legend, dict):
+            # Remove legend title entirely; Plotly.js sometimes prints missing text as "undefined"
+            legend.pop("title", None)
+
+        # If showlegend explicitly false, drop legend object altogether
+        if showlegend is False and isinstance(layout, dict):
+            layout.pop("legend", None)
+
+        # Remove trace group titles / unnamed traces that can trigger legend header glitches
+        data = d.get("data", [])
+        for tr in data:
+            if isinstance(tr, dict):
+                tr.pop("legendgrouptitle", None)
+                tr.pop("legendgroup", None)
+                if tr.get("name", "__sentinel__") is None:
+                    tr["name"] = ""
+
+        fig = go.Figure(d)
+    except Exception:
+        return fig
+    return fig
+
+
 def _plotly(fig, *, key: Optional[str] = None) -> None:
+    fig = _sanitize_plotly_figure(fig)
     kwargs: Dict[str, Any] = {"config": PLOTLY_CONFIG}
     if key is not None:
         kwargs["key"] = key
@@ -1444,7 +1481,7 @@ def walkforward_questions() -> List[QuestionSpec]:
         QuestionSpec(
             id="wf_worst_typical",
             title="How negative can the 'worst typical' window be?",
-            explanation="10th percentile (p10) return across windows. This is a good 'robustness' anchor.",
+            explanation="10th percentile (p10) return across windows. This is a good 'stability' anchor.",
             choices=[
                 ChoiceSpec("p10 ≥ -5%", [ConstraintSpec("return_p10", ">=", -0.05, "warn")]),
                 ChoiceSpec("p10 ≥ -10%", [ConstraintSpec("return_p10", ">=", -0.10, "info")]),
@@ -3361,7 +3398,7 @@ if open_existing == "(new run)":
         max_dd_filter = st.slider("Optional filter: max drawdown (0 disables)", 0.0, 0.99, 0.0, 0.01, key="new.max_dd_filter")
 
 
-        st.subheader("Optional: run robustness tests after Batch")
+        st.subheader("Optional: run stability checks after Batch")
         st.caption("These run *after* Batch completes, using the survivors from this run.")
         colT1, colT2 = st.columns(2)
         with colT1:
@@ -3606,7 +3643,7 @@ if open_existing == "(new run)":
                     do_rs = bool(st.session_state.get("new.do_rs", False))
                     do_wf = bool(st.session_state.get("new.do_wf", False))
                     if do_rs or do_wf:
-                        st.info("Running selected robustness tests…")
+                        st.info("Running selected stability checks…")
 
                         frames2 = load_batch_frames(run_dir)
                         survivors2, _src2 = pick_survivors(frames2)
@@ -3725,7 +3762,7 @@ if open_existing == "(new run)":
                     st.session_state.setdefault("ui.stage", "batch")
                     st.rerun()
                 else:
-                    st.info("Some selected robustness tests failed. Review the logs above, then open the run in Results when ready.")
+                    st.info("Some selected stability checks failed. Review the logs above, then open the run in Results when ready.")
                     if st.button("Open Results & Autopsy", key="run.goto_results_after_fail"):
                         st.session_state["ui.section_next"] = "2) Results & Autopsy"
                         st.session_state.setdefault("ui.stage", "batch")
@@ -5168,7 +5205,7 @@ if stage_pick == "rs":
     if "rs.measured" in df_show.columns:
         cols.insert(2, "rs.measured")
 
-    # Quick visual scan: robustness map (return vs drawdown)
+    # Quick visual scan: stability map (return vs drawdown)
     st.subheader("Quick visual scan")
     df_plot = df_show.copy()
     for c in ["twr_p10", "twr_p50", "twr_p90", "dd_p50", "dd_p90", "robustness_score", "windows"]:
@@ -5251,7 +5288,7 @@ if stage_pick == "rs":
                 "dd_p90": "Drawdown p90 (lower is better)",
                 "twr_p50": "Return p50 (higher is better)",
             },
-            title="Rolling Starts: return vs drawdown (robustness map)",
+            title="Rolling Starts: return vs drawdown (stability map)",
         )
         _plotly(fig)
 
@@ -5299,9 +5336,9 @@ if stage_pick == "rs":
             c3.metric("Return p50", _fmt_pct(r0.get("twr_p50")))
             c4.metric("DD p90", _fmt_pct(r0.get("dd_p90")))
             if "robustness_score" in row.columns:
-                c5.metric("Robustness score", _fmt_num(r0.get("robustness_score")))
+                c5.metric("Stability score", _fmt_num(r0.get("robustness_score")))
             else:
-                c5.metric("Robustness score", "—")
+                c5.metric("Stability score", "—")
 
             # Fragility: a fast, plain-English read (start-date sensitivity)
             frag = None
@@ -6414,7 +6451,7 @@ if stage_pick == "grand":
                 else:
                     hi = pd.DataFrame()
 
-                # Robustness percentile within the currently-visible shortlist (if score exists)
+                # Stability percentile within the currently-visible shortlist (if score exists)
                 score_col = None
                 for c in ["score.grand_robust", "robustness_score"]:
                     if c in hi.columns:
@@ -6549,7 +6586,7 @@ if stage_pick == "grand":
                                     "config=%{customdata[0]}<br>"
                                     "label=%{customdata[1]}<br>"
                                     "grand verdict=%{customdata[2]}<br>"
-                                    "robustness=%{customdata[3]}<br>"
+                                    "stability=%{customdata[3]}<br>"
                                     "max DD=%{x:.2%}<br>"
                                     f"return={hover_ret}<br>"
                                     "reason=%{customdata[4]}<extra></extra>"
@@ -6610,16 +6647,96 @@ if stage_pick == "grand":
             else:
                 st.caption("Risk/return map unavailable (missing drawdown/return columns).")
 
-            # Robustness distribution (grand robust score)
+            # Robustness distribution: rarity & separation
             score_col = "score.grand_robust" if "score.grand_robust" in df_req.columns else None
             if score_col:
                 s = pd.to_numeric(df_req[score_col], errors="coerce").dropna()
                 if len(s) > 0:
-                    fig_hist = go.Figure(go.Histogram(x=s, nbinsx=35, marker=dict(color=ACCENT_BLUE)))
-                    _style_fig(fig_hist, title="Robustness score distribution (after requirements)")
-                    fig_hist.update_xaxes(title="Robustness score (higher is better)")
+                    _arr = s.to_numpy(dtype=float)
+                    n = int(len(_arr))
+                    med = float(np.nanmedian(_arr))
+                    p80 = float(np.nanpercentile(_arr, 80))
+                    p90 = float(np.nanpercentile(_arr, 90)) if n >= 10 else None
+
+                    # "Shortlist cutoff" = the lowest robustness score among the currently visible shortlist (if any)
+                    cutoff = None
+                    try:
+                        if "score.grand_robust" in df_show.columns and len(df_show) > 0:
+                            _cut = pd.to_numeric(df_show["score.grand_robust"], errors="coerce").dropna()
+                            if len(_cut) > 0:
+                                cutoff = float(_cut.min())
+                    except Exception:
+                        cutoff = None
+
+                    st.markdown("#### Stability score: rarity & separation")
+
+                    note_parts = [f"N={n:,} survivors after requirements."]
+                    if n < 50:
+                        note_parts.append("Small N → percentiles can be chunky.")
+                    if cutoff is not None and math.isfinite(float(cutoff)):
+                        note_parts.append(f"Shortlist cutoff: {_fmt_num(cutoff, digits=3)} (lowest visible).")
+                    st.caption(" ".join(note_parts))
+
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("Median", _fmt_num(med, digits=3))
+                    c2.metric("80th pct (strong zone)", _fmt_num(p80, digits=3))
+                    c3.metric("90th pct", _fmt_num(p90, digits=3) if (p90 is not None and math.isfinite(float(p90))) else "—")
+                    if cutoff is not None and math.isfinite(float(cutoff)):
+                        c4.metric("Cutoff vs median", f"{(cutoff - med):+.3f}")
+                    else:
+                        c4.metric("Shortlist cutoff", "—")
+
+                    nbins = int(max(20, min(50, math.sqrt(n) * 3)))
+                    fig_hist = go.Figure(
+                        go.Histogram(
+                            x=_arr,
+                            nbinsx=nbins,
+                            marker=dict(color=ACCENT_BLUE),
+                            opacity=0.85,
+                            showlegend=False,
+                        )
+                    )
+                    _style_fig(fig_hist, title=None)
+                    # Extra top room because multiple reference labels can stack near the right tail
+                    fig_hist.update_layout(margin=dict(l=20, r=20, t=130, b=20))
+                    fig_hist.update_xaxes(title="Stability score (higher is better)")
                     fig_hist.update_yaxes(title="Count")
+
+                    def _vline(
+                        x: float,
+                        label: str,
+                        dash: str,
+                        color: str,
+                        *,
+                        y: float = 1.06,
+                    ) -> None:
+                        """Add a vertical reference line + a label snapped to the line's x (paper y lanes)."""
+                        try:
+                            fig_hist.add_vline(x=x, line_width=2, line_dash=dash, line_color=color)
+                            fig_hist.add_annotation(
+                                x=x,
+                                xref="x",
+                                y=y,
+                                yref="paper",
+                                text=label,
+                                showarrow=False,
+                                xanchor="center",
+                                yanchor="bottom",
+                                font=dict(size=12, color=color),
+                            )
+                        except Exception:
+                            pass
+
+                    # Stagger labels vertically (x always snapped to its own line).
+                    _vline(med, "Median", "solid", "#111827", y=1.06)
+                    _vline(p80, "P80", "dash", ACCENT_BLUE, y=1.12)
+                    if p90 is not None and math.isfinite(float(p90)):
+                        _vline(float(p90), "P90", "dot", ACCENT_BLUE, y=1.18)
+                    if cutoff is not None and math.isfinite(float(cutoff)):
+                        _vline(float(cutoff), "Cutoff", "dashdot", WARN_COLOR, y=1.06)
+
                     _plotly(fig_hist)
+
     st.markdown("#### Unified candidates table")
     st.caption(f"Candidates shown: **{len(df_show):,}** / Survivors evaluated: **{len(df):,}**")
     if df_show.empty:
@@ -6862,7 +6979,7 @@ if stage_pick == "grand":
 
                 m1, m2, m3 = st.columns(3)
                 with m1:
-                    st.metric("Robustness", score_line)
+                    st.metric("Stability score", score_line)
                 with m2:
                     st.metric("Batch return", _fmt_pct(batch_ret))
                 with m3:
@@ -7059,7 +7176,7 @@ if stage_pick == "grand":
             wf_p50 = rr_sel.get("return_p50", np.nan)
             wf_neg = rr_sel.get("pct_windows_negative", np.nan)
 
-            # Robustness percentile is computed over visible population earlier (same as the cards)
+            # Stability percentile is computed over visible population earlier (same as the cards)
             score_pct = _score_pct.get(cid_sel) if isinstance(_score_pct, dict) else None
 
             def _clamp01(x: Any) -> float:
@@ -7252,7 +7369,7 @@ if stage_pick == "grand":
                     st.markdown("**Diagnostics**")
                     d1, d2 = st.columns(2)
                     with d1:
-                        st.metric("Robustness", f"{int(round(score_pct * 100))}th pct" if (score_pct is not None and math.isfinite(float(score_pct))) else "—")
+                        st.metric("Stability score", f"{int(round(score_pct * 100))}th pct" if (score_pct is not None and math.isfinite(float(score_pct))) else "—")
                         st.metric("Batch return", _fmt_pct(batch_ret))
                     with d2:
                         st.metric("Max DD", _fmt_pct(batch_dd))
@@ -7719,41 +7836,172 @@ if stage_pick == "grand":
                 if d.empty:
                     st.info("No Rolling Starts detail rows for this config.")
                 else:
+                    _rs_stats = {}
+                    # ---- Summary strip (worst / p10 / median / negative / disappoint) ----
+                    try:
+                        _vals = pd.to_numeric(d.get("performance.twr_total_return"), errors="coerce").dropna()
+                    except Exception:
+                        _vals = pd.Series(dtype=float)
+                    if len(_vals) > 0:
+                        _worst = float(_vals.min())
+                        _p10 = float(_vals.quantile(0.10))
+                        _med = float(_vals.quantile(0.50))
+                        _neg = float((_vals < 0.0).mean())
+                        try:
+                            _thr = float(_rs_fail_thr)
+                        except Exception:
+                            _thr = 0.0
+                        _disappoint = float((_vals < _thr).mean())
+
+                        _rs_stats = dict(worst=_worst, p10=_p10, med=_med, thr=_thr, neg=_neg, disappoint=_disappoint, n=int(len(_vals)))
+
+                        st.markdown("##### Start-date sensitivity summary")
+                        s1, s2, s3, s4, s5 = st.columns(5)
+                        s1.metric("Worst case", f"{_worst*100:.1f}%")
+                        s2.metric("10th percentile", f"{_p10*100:.1f}%")
+                        s3.metric("Median", f"{_med*100:.1f}%")
+                        s4.metric("% negative", f"{_neg*100:.0f}%")
+                        s5.metric(f"Disappoint rate (<{_thr*100:.0f}%)", f"{_disappoint*100:.0f}%")
+
+                        st.caption(f"N={len(_vals)} start dates. “Disappoint” means total return below {_thr*100:.0f}% under your current Rolling Starts tolerance.")
+                        if len(_vals) < 30:
+                            st.caption("Note: small N makes percentiles chunky.")
+                        st.divider()
+
                     if "start_dt" in d.columns:
                         d["start_dt"] = pd.to_datetime(d.get("start_dt"), errors="coerce", utc=True)
-                    if px is not None and "performance.twr_total_return" in d.columns:
-                        fig = px.histogram(
-                            d,
-                            x="performance.twr_total_return",
-                            nbins=40,
-                            title="Rolling-start TWR distribution (detail)",
-                        )
-                        _style_fig(fig, title="Rolling-start TWR distribution (detail)")
-                        _plotly(fig)
+                    # Distribution view (clean default): violin + box + reference lines
+                    if go is not None and "performance.twr_total_return" in d.columns:
+                        try:
+                            _dist_vals = pd.to_numeric(d["performance.twr_total_return"], errors="coerce").dropna()
+                        except Exception:
+                            _dist_vals = pd.Series(dtype=float)
+                        if len(_dist_vals) > 0:
+                            st.markdown("##### Rolling-start return distribution")
+                            figd = go.Figure()
+                            figd.add_trace(
+                                go.Violin(
+                                    x=_dist_vals,
+                                    orientation="h",
+                                    name="",
+                                    box_visible=True,
+                                    meanline_visible=False,
+                                    points=False,
+                                    line_color=ACCENT_BLUE,
+                                    fillcolor="rgba(41,121,255,0.22)",
+                                )
+                            )
+
+                            # Reference lines (from summary if available)
+                            _thr_line = None
+                            _p10_line = None
+                            _med_line = None
+                            try:
+                                _thr_line = float((_rs_stats or {}).get("thr", _rs_fail_thr))
+                            except Exception:
+                                _thr_line = None
+                            try:
+                                _p10_line = float((_rs_stats or {}).get("p10"))
+                            except Exception:
+                                _p10_line = None
+                            try:
+                                _med_line = float((_rs_stats or {}).get("med"))
+                            except Exception:
+                                _med_line = None
+
+                            if _med_line is not None:
+                                figd.add_vline(x=_med_line, line_width=1, line_dash="solid", line_color="rgba(17,24,39,0.45)", annotation_text="Median", annotation_position="top")
+                            if _p10_line is not None:
+                                figd.add_vline(x=_p10_line, line_width=1, line_dash="dot", line_color="rgba(17,24,39,0.45)", annotation_text="10th pct", annotation_position="top")
+                            if _thr_line is not None:
+                                figd.add_vline(x=_thr_line, line_width=1, line_dash="dash", line_color="rgba(255,23,68,0.55)", annotation_text="Tolerance", annotation_position="top")
+
+                            _style_fig(figd, title=None)
+                            figd.update_layout(showlegend=False)
+                            figd.update_xaxes(tickformat=".0%", title="Total return")
+                            figd.update_yaxes(showticklabels=False, title="")
+                            _plotly(figd)
+
+                            with st.expander("Show histogram (bins)", expanded=False):
+                                if px is not None:
+                                    figh = px.histogram(d, x="performance.twr_total_return", nbins=40)
+                                    _style_fig(figh, title=None)
+                                    figh.update_xaxes(tickformat=".0%", title="Total return")
+                                    figh.update_yaxes(title="Count")
+                                    _plotly(figh)
+
 
 
                     # Timeline view: start date → outcome (helps spot "bad eras")
                     if go is not None and "start_dt" in d.columns and "performance.twr_total_return" in d.columns:
                         try:
                             dd = d.copy()
-                            dd["performance.twr_total_return"] = pd.to_numeric(dd["performance.twr_total_return"], errors="coerce")
-                            dd = dd.dropna(subset=["performance.twr_total_return", "start_dt"])
+                            dd["start_dt"] = pd.to_datetime(dd.get("start_dt"), errors="coerce", utc=True)
+                            dd["ret"] = pd.to_numeric(dd["performance.twr_total_return"], errors="coerce")
+                            dd = dd.dropna(subset=["ret", "start_dt"]).sort_values("start_dt")
                             if not dd.empty:
+                                try:
+                                    _thr = float((_rs_stats or {}).get("thr", _rs_fail_thr))
+                                except Exception:
+                                    _thr = 0.0
+
                                 figt = go.Figure()
-                                figt.add_trace(
-                                    go.Scatter(
-                                        x=dd["start_dt"],
-                                        y=dd["performance.twr_total_return"],
-                                        mode="markers",
-                                        marker=dict(size=7, color=ACCENT_BLUE, opacity=0.8),
-                                        name="Rolling starts",
-                                        hovertemplate="%{x|%Y-%m-%d}<br>return=%{y:.2%}<extra></extra>",
-                                    )
-                                )
-                                _style_fig(figt, title="Rolling Starts timeline (each dot = a different start date)")
+
+                                # Shading + reference lines
+                                figt.add_hrect(y0=-1.0, y1=_thr, fillcolor="rgba(255,23,68,0.06)", line_width=0, layer="below")
+                                figt.add_hline(y=_thr, line_dash="dash", line_color="rgba(255,23,68,0.55)")
+                                figt.add_hline(y=0.0, line_dash="dot", line_color="rgba(17,24,39,0.25)")
+
+                                m_bad = dd["ret"] < _thr
+                                m_neg = (dd["ret"] >= _thr) & (dd["ret"] < 0.0)
+                                m_pos = dd["ret"] >= 0.0
+
+                                def _add_points(mask, name, color):
+                                    if mask.any():
+                                        figt.add_trace(
+                                            go.Scatter(
+                                                x=dd.loc[mask, "start_dt"],
+                                                y=dd.loc[mask, "ret"],
+                                                mode="markers",
+                                                marker=dict(size=7, color=color, opacity=0.85),
+                                                name=name,
+                                                hovertemplate="%{x|%Y-%m-%d}<br>return=%{y:.2%}<extra></extra>",
+                                            )
+                                        )
+
+                                _add_points(m_pos, "Above 0", PASS_COLOR)
+                                _add_points(m_neg, "Below 0", WARN_COLOR)
+                                _add_points(m_bad, "Below tolerance", FAIL_COLOR)
+
+                                # Optional rolling median line (helps spot regime sensitivity)
+                                try:
+                                    w = int(min(21, max(5, len(dd) // 10)))
+                                    if w % 2 == 0:
+                                        w += 1
+                                    dd["roll_med"] = dd["ret"].rolling(w, center=True, min_periods=max(3, w // 2)).median()
+                                    if dd["roll_med"].notna().sum() >= 3:
+                                        figt.add_trace(
+                                            go.Scatter(
+                                                x=dd["start_dt"],
+                                                y=dd["roll_med"],
+                                                mode="lines",
+                                                line=dict(width=2, color="rgba(17,24,39,0.35)"),
+                                                name="Rolling median",
+                                                hovertemplate="%{x|%Y-%m-%d}<br>median=%{y:.2%}<extra></extra>",
+                                            )
+                                        )
+                                except Exception:
+                                    pass
+
+                                st.markdown("##### Start-date outcomes over time")
+                                _style_fig(figt, title=None)
+                                figt.update_layout(margin=dict(l=20, r=20, t=55, b=20), legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, font=dict(size=12)))
                                 figt.update_yaxes(tickformat=".0%", title="Total return")
                                 figt.update_xaxes(title="Start date")
                                 _plotly(figt)
+                        except Exception:
+                            pass
+
                         except Exception:
                             pass
                     st.download_button(
@@ -7797,36 +8045,215 @@ if stage_pick == "grand":
                 if d.empty:
                     st.info("No Walkforward detail rows for this config.")
                 else:
+                    # -----------------------------
+                    # Step 6: window ranges + missing windows made explicit
+                    # -----------------------------
+                    meta = _read_json(Path(wf_dir_effective) / "wf_meta.json") if wf_dir_effective else {}
+                    expected_total = None
+                    try:
+                        expected_total = int(meta.get("windows")) if meta.get("windows") is not None else None
+                    except Exception:
+                        expected_total = None
 
-
-                    if go is not None and "window_return" in d.columns:
+                    # Build a global window -> date range mapping from all configs (cheap, artifact-derived)
+                    window_map = None
+                    if ("window_idx" in wf_rows.columns) and ("window_start_dt" in wf_rows.columns) and ("window_end_dt" in wf_rows.columns):
                         try:
-                            dd = d.copy()
-                            dd["window_return"] = pd.to_numeric(dd["window_return"], errors="coerce")
-                            dd = dd.dropna(subset=["window_return"])
-                            if not dd.empty:
-                                x = dd["window_idx"] if "window_idx" in dd.columns else list(range(len(dd)))
-                                cols = [PASS_COLOR if float(v) >= 0.0 else FAIL_COLOR for v in dd["window_return"].tolist()]
-                                fig = go.Figure(go.Bar(x=x, y=dd["window_return"], marker_color=cols))
-                                _style_fig(fig, title="Walkforward window returns (detail)")
-                                fig.update_yaxes(tickformat=".0%", title="Window return")
-                                fig.update_xaxes(title="Window")
-                                _plotly(fig)
+                            wm = wf_rows[["window_idx", "window_start_dt", "window_end_dt"]].copy()
+                            wm["window_idx"] = pd.to_numeric(wm["window_idx"], errors="coerce")
+                            wm = wm.dropna(subset=["window_idx"])
+                            wm["window_idx"] = wm["window_idx"].astype(int)
+                            window_map = (
+                                wm.sort_values("window_idx")
+                                .groupby("window_idx", as_index=False)[["window_start_dt", "window_end_dt"]]
+                                .first()
+                            )
                         except Exception:
-                            pass
-                    elif px is not None and "window_return" in d.columns:
-                        fig = px.line(d, x="window_idx", y="window_return", title="Walkforward window returns (detail)")
-                        _style_fig(fig, title="Walkforward window returns (detail)")
-                        _plotly(fig)
+                            window_map = None
+
+                    if expected_total is None:
+                        try:
+                            if window_map is not None and not window_map.empty:
+                                expected_total = int(window_map["window_idx"].max()) + 1
+                            elif "window_idx" in d.columns and not d["window_idx"].isna().all():
+                                expected_total = int(pd.to_numeric(d["window_idx"], errors="coerce").dropna().max()) + 1
+                            else:
+                                expected_total = int(len(d))
+                        except Exception:
+                            expected_total = int(len(d))
+
+                    expected_total = int(max(0, expected_total or 0))
+                    exp = pd.DataFrame({"window_idx": list(range(expected_total))})
+                    if window_map is not None and not window_map.empty:
+                        exp = exp.merge(window_map, how="left", on="window_idx")
+
+                    # Attach this-config returns
+                    dd = d.copy()
+                    if "window_idx" not in dd.columns:
+                        dd["window_idx"] = list(range(len(dd)))
+                    dd["window_idx"] = pd.to_numeric(dd["window_idx"], errors="coerce")
+                    dd["window_return"] = pd.to_numeric(dd.get("window_return"), errors="coerce") if "window_return" in dd.columns else np.nan
+                    dd = dd.dropna(subset=["window_idx"])
+                    dd["window_idx"] = dd["window_idx"].astype(int)
+                    dd_ret = dd.groupby("window_idx", as_index=False)[["window_return"]].first()
+                    exp = exp.merge(dd_ret, how="left", on="window_idx")
+
+                    def _short_dt(x: Any) -> str:
+                        try:
+                            if x is None:
+                                return ""
+                            s = str(x).strip()
+                            if not s:
+                                return ""
+                            return pd.to_datetime(s, errors="coerce").strftime("%Y-%m-%d")
+                        except Exception:
+                            return str(x)[:10] if x is not None else ""
+
+                    exp["start_s"] = exp.get("window_start_dt", "").apply(_short_dt) if "window_start_dt" in exp.columns else ""
+                    exp["end_s"] = exp.get("window_end_dt", "").apply(_short_dt) if "window_end_dt" in exp.columns else ""
+                    exp["range_label"] = exp.apply(
+                        lambda r: (f"{r['start_s']} → {r['end_s']}".strip() if (str(r.get("start_s") or "").strip() and str(r.get("end_s") or "").strip()) else f"Window {int(r['window_idx'])}"),
+                        axis=1,
+                    )
+
+                    present_mask = exp["window_return"].notna()
+                    present_n = int(present_mask.sum())
+                    expected_n = int(len(exp))
+                    missing_n = int(expected_n - present_n)
+
+                    # Summary metrics (from present windows only)
+                    rvals = exp.loc[present_mask, "window_return"].astype(float)
+                    if len(rvals) == 0:
+                        st.info("No Walkforward window returns available for this config.")
+                    else:
+                        p10 = float(np.nanpercentile(rvals, 10))
+                        p50 = float(np.nanpercentile(rvals, 50))
+                        pct_neg = float((rvals < 0.0).mean() * 100.0)
+
+                        st.markdown("##### Walkforward window summary")
+                        c1, c2, c3, c4 = st.columns(4)
+                        with c1:
+                            st.metric("10th percentile", _fmt_pct(p10))
+                        with c2:
+                            st.metric("Median", _fmt_pct(p50))
+                        with c3:
+                            st.metric("% negative", f"{pct_neg:.0f}%")
+                        with c4:
+                            st.metric("Windows present", f"{present_n}/{expected_n}")
+
+                        if expected_n and expected_n < 20:
+                            st.caption("Small N: window percentiles can be chunky.")
+                        if missing_n > 0:
+                            st.caption(f"Missing windows are shown as faint placeholders at 0 with hover label “no data” ({missing_n} missing).")
+
+                        # Chart: explicit “no data” windows + compact x labels (full ranges in hover)
+                        if go is not None:
+                            try:
+                                exp_plot = exp.copy()
+                                exp_plot["x_i"] = exp_plot["window_idx"].astype(int)
+
+                                # Full date-range label for hover (most informative)
+                                exp_plot["label_full"] = exp_plot["range_label"].astype(str)
+
+                                # Compact tick label: start date (YY-MM-DD) if available; else Window #
+                                def _tick_lbl(r):
+                                    s = str(r.get("start_s") or "").strip()
+                                    if s:
+                                        try:
+                                            return pd.to_datetime(s, errors="coerce").strftime("%y-%m-%d")
+                                        except Exception:
+                                            return s[:8]
+                                    return f"W{int(r['window_idx'])}"
+
+                                exp_plot["label_tick"] = exp_plot.apply(_tick_lbl, axis=1)
+
+                                # Choose tick density (~12 labels max) to prevent overlap
+                                max_ticks = 12
+                                step = max(1, int(math.ceil(len(exp_plot) / max_ticks)))
+                                tickvals = exp_plot["x_i"].iloc[::step].tolist()
+                                ticktext = exp_plot["label_tick"].iloc[::step].tolist()
+
+                                # Bar colors: green >= 0, amber < 0, grey for missing
+                                raw_vals = exp_plot["window_return"].tolist()
+                                base_colors = [
+                                    (PASS_COLOR if (v is not None and not pd.isna(v) and float(v) >= 0.0) else WARN_COLOR)
+                                    for v in raw_vals
+                                ]
+                                colors = [
+                                    (base_colors[i] if bool(present_mask.iloc[i]) else "rgba(17,24,39,0.10)")
+                                    for i in range(len(base_colors))
+                                ]
+
+                                fig_wf = go.Figure()
+
+                                # Main bars (use 0 for missing so axis stays honest)
+                                y_main = exp_plot["window_return"].fillna(0.0).astype(float).tolist()
+                                hover = []
+                                for i, row in exp_plot.iterrows():
+                                    v = row.get("window_return")
+                                    if pd.isna(v):
+                                        hover.append(f"<b>{row['label_full']}</b><br>Return: <b>no data</b>")
+                                    else:
+                                        hover.append(f"<b>{row['label_full']}</b><br>Window return: <b>{_fmt_pct(float(v))}</b>")
+
+                                fig_wf.add_trace(
+                                    go.Bar(
+                                        x=exp_plot["x_i"],
+                                        y=y_main,
+                                        marker_color=colors,
+                                        hovertext=hover,
+                                        hoverinfo="text",
+                                        showlegend=False,
+                                    )
+                                )
+
+                                # Missing placeholders: tiny eps bar + “no data” label (so it’s visible but not misleading)
+                                miss = exp_plot.loc[~present_mask].copy()
+                                if not miss.empty:
+                                    eps = 1e-6
+                                    fig_wf.add_trace(
+                                        go.Bar(
+                                            x=miss["x_i"],
+                                            y=[eps] * len(miss),
+                                            marker_color="rgba(17,24,39,0.06)",
+                                            marker_line_color="rgba(17,24,39,0.15)",
+                                            marker_line_width=1,
+                                            text=["no data"] * len(miss) if len(miss) <= 30 else None,
+                                            textposition="outside",
+                                            textfont=dict(size=10, color="rgba(17,24,39,0.55)"),
+                                            hovertext=[f"<b>{lbl}</b><br>Return: <b>no data</b>" for lbl in miss["label_full"].tolist()],
+                                            hoverinfo="text",
+                                            showlegend=False,
+                                        )
+                                    )
+
+                                # Styling + axis labels
+                                fig_wf.update_layout(barmode="overlay")
+                                _style_fig(fig_wf, title=None)
+                                fig_wf.update_yaxes(tickformat=".0%", title="Window return")
+                                fig_wf.update_xaxes(
+                                    title="Test window (start date)",
+                                    tickmode="array",
+                                    tickvals=tickvals,
+                                    ticktext=ticktext,
+                                    tickangle=0,
+                                )
+                                fig_wf.update_xaxes(range=[-0.5, float(len(exp_plot) - 0.5)])
+
+                                _plotly(fig_wf)
+                            except Exception:
+                                pass
+
                     st.download_button(
                         "Download wf_results.csv (full)",
                         data=(wf_dir_effective / "wf_results.csv").read_bytes(),
                         file_name=f"{selected_run_name}_wf_results.csv",
                     )
+            else:
+                st.info("Walkforward results file exists but appears empty.")
         else:
             st.info("Walkforward evidence not available for this run (run it from Build & Run).")
-
-    with _tab.get("Exports", _tab_containers[-1]):
+with _tab.get("Exports", _tab_containers[-1]):
         st.markdown("#### Exports")
 
         st.download_button(
