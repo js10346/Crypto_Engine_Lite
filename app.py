@@ -166,6 +166,15 @@ DATA_DIR = REPO_ROOT / "data"
 PY = sys.executable
 
 st.set_page_config(page_title="Spot Strategy Stress Lab", layout="wide")
+
+st.markdown(
+    """
+<style>
+.sticky-preview { position: sticky; top: 1rem; }
+</style>
+""",
+    unsafe_allow_html=True,
+)
 st.title("Spot Strategy Stress Lab")
 st.caption("Spot-only. Batch → Rolling Starts → Walkforward → Grand verdict.")
 
@@ -1951,6 +1960,9 @@ def _human_entry_logic(entry_logic: Dict[str, Any]) -> str:
 def build_dca_baseline_params() -> Dict[str, Any]:
     st.subheader("Baseline plan (DCA/Swing)")
 
+    # Render a "build card" header placeholder (filled after controls are read).
+    header_slot = st.empty()
+
     # Build-step context (optional): compute indicator columns to show “how often will this trigger?”
     df_feat = None
     data_path_str = st.session_state.get("new.data_path")
@@ -1964,183 +1976,265 @@ def build_dca_baseline_params() -> Dict[str, Any]:
 
     build_atr_med = None
 
-    colA, colB = st.columns(2)
-    with colA:
-        deposit_freq = st.selectbox(
-            "Deposit frequency",
-            options=["none", "daily", "weekly", "monthly"],
-            index=2,
-            key="new.deposit_freq",
-        )
-        deposit_amount = st.number_input(
-            "Deposit amount (USD)",
-            min_value=0.0,
-            value=50.0,
-            step=10.0,
-            key="new.deposit_amount",
-        )
-        if str(deposit_freq).lower() == "none":
-            deposit_amount = 0.0
-
-        buy_freq = st.selectbox(
-            "Buy frequency",
-            options=["daily", "weekly", "monthly"],
-            index=1,
-            key="new.buy_freq",
-        )
-        buy_amount = st.number_input(
-            "Buy amount (USD)",
-            min_value=0.0,
-            value=50.0,
-            step=10.0,
-            key="new.buy_amount",
-        )
-
     # -------------------------
-    # Entry logic (simple vs builder)
+    # Loadout (left) + preview (right)
     # -------------------------
-    with colB:
-        st.caption("Entry gating controls whether scheduled buys are allowed to fire. This is about mechanics, not recommendations.")
+    colL, colR = st.columns([0.62, 0.38], gap="large")
 
-        entry_mode = st.radio(
-            "Entry logic mode",
-            options=["Simple (one filter)", "Logic builder (regime + triggers)"],
-            index=0,
-            horizontal=True,
-            key="new.entry_mode",
-        )
+    # Defaults for legacy knobs (used in simple mode and as defaults in the builder)
+    buy_filter = "none"
+    ema_len = 200
+    rsi_thr = 40.0
+    macd_hist_thr = 0.0
+    bb_z_thr = -1.0
+    adx_thr = 20.0
+    donch_pos_thr = 0.20
 
-        # Defaults for legacy knobs (used in simple mode and as defaults in the builder)
-        buy_filter = "none"
-        ema_len = 200
-        rsi_thr = 40.0
-        macd_hist_thr = 0.0
-        bb_z_thr = -1.0
-        adx_thr = 20.0
-        donch_pos_thr = 0.20
+    entry_logic: Dict[str, Any] = {"regime": [], "clauses": []}
 
-        entry_logic: Dict[str, Any] = {"regime": [], "clauses": []}
+    # Defaults (controls disabled by default)
+    sl_pct = 0.0
+    tp_pct = 0.0
+    tp_sell_fraction = 1.0
+    reserve_frac = 0.0
+    max_hold_bars = 0
+    trail_pct = 0.0
 
-        def _cond_ui(prefix: str) -> Optional[Dict[str, Any]]:
-            """
-            Builder UI for one condition. Returns condition dict or None if disabled.
-            We keep condition types tight so we only reference known feature columns.
-            """
-            cond_type = st.selectbox(
-                "Condition",
-                options=[
-                    "— (disabled)",
-                    "Price vs EMA",
-                    "RSI(14)",
-                    "Bollinger z-score(20)",
-                    "MACD histogram(12,26,9)",
-                    "ADX(14)",
-                    "Donchian position(20)",
-                ],
-                index=0,
-                key=f"{prefix}.type",
-            )
-            if cond_type.startswith("—"):
-                return None
+    with colL:
+        # ------------------------------------------------------------------
+        # Skill strip navigation (Phase 3)
+        # ------------------------------------------------------------------
+        if "build.active_module" not in st.session_state:
+            st.session_state["build.active_module"] = "funding"
+        if "build.active_modifier" not in st.session_state:
+            st.session_state["build.active_modifier"] = ""
 
-            # Operators (restricted per type to reduce foot-guns)
-            if cond_type == "Price vs EMA":
-                op = st.selectbox("Operator", options=["<=", ">="], index=0, key=f"{prefix}.op")
-                ln = int(st.selectbox("EMA length", options=[10, 20, 50, 100, 200], index=4, key=f"{prefix}.ema_len"))
-                return {"indicator": "close", "operator": op, "ref_indicator": f"ema_{ln}", "threshold": 0.0}
+        active_module = str(st.session_state.get("build.active_module") or "funding")
+        active_mod = str(st.session_state.get("build.active_modifier") or "")
 
-            if cond_type == "RSI(14)":
-                op = st.selectbox("Operator", options=["<=", ">="], index=0, key=f"{prefix}.op")
-                thr = float(st.slider("Threshold", 5.0, 95.0, 40.0, 1.0, key=f"{prefix}.thr"))
-                return {"indicator": "rsi_14", "operator": op, "threshold": thr}
+        def _builder_has_any_clause() -> bool:
+            for i in range(1, 4):
+                for j in range(1, 4):
+                    v = st.session_state.get(f"new.cl{i}.c{j}.type")
+                    if v and (not str(v).startswith("—")):
+                        return True
+            return False
 
-            if cond_type == "Bollinger z-score(20)":
-                op = st.selectbox("Operator", options=["<=", ">="], index=0, key=f"{prefix}.op")
-                thr = float(st.slider("Threshold", -3.0, 3.0, -1.0, 0.1, key=f"{prefix}.thr"))
-                return {"indicator": "bb_z_20", "operator": op, "threshold": thr}
+        # Determine "configured" states from session_state (best-effort, purely UI)
+        dep_freq_ss = str(st.session_state.get("new.deposit_freq", "none")).lower()
+        dep_amt_ss = float(st.session_state.get("new.deposit_amount", 0.0) or 0.0)
+        buy_amt_ss = float(st.session_state.get("new.buy_amount", 0.0) or 0.0)
+        entry_mode_ss = str(st.session_state.get("new.entry_mode", "Simple (one filter)"))
+        buy_filter_ss = str(st.session_state.get("new.buy_filter", "none"))
+        max_alloc_ss = float(st.session_state.get("new.max_alloc_pct", 1.0) or 1.0)
 
-            if cond_type == "MACD histogram(12,26,9)":
-                op = st.selectbox("Operator", options=[">=", "<="], index=0, key=f"{prefix}.op")
-                thr = float(st.number_input("Threshold", value=0.0, step=0.1, key=f"{prefix}.thr"))
-                return {"indicator": "macd_hist_12_26_9", "operator": op, "threshold": thr}
+        sl_ui_ss = float(st.session_state.get("new.sl_pct_ui", 0.0) or 0.0)
+        tp_ui_ss = float(st.session_state.get("new.tp_pct_ui", 0.0) or 0.0)
+        max_hold_ss = int(st.session_state.get("new.max_hold_bars", 0) or 0)
+        trail_ui_ss = float(st.session_state.get("new.trail_pct_ui", 0.0) or 0.0)
 
-            if cond_type == "ADX(14)":
-                op = st.selectbox("Operator", options=[">=", "<="], index=0, key=f"{prefix}.op")
-                thr = float(st.slider("Threshold", 1.0, 80.0, 20.0, 1.0, key=f"{prefix}.thr"))
-                return {"indicator": "adx_14", "operator": op, "threshold": thr}
+        funding_on = (dep_freq_ss != "none") and (dep_amt_ss > 0)
+        buys_on = buy_amt_ss > 0
+        entry_on = (entry_mode_ss.startswith("Simple") and buy_filter_ss != "none") or ((not entry_mode_ss.startswith("Simple")) and _builder_has_any_clause())
+        alloc_on = max_alloc_ss < 1.0
+        exits_on = (sl_ui_ss > 0) or (tp_ui_ss > 0) or (max_hold_ss > 0) or (trail_ui_ss > 0)
 
-            if cond_type == "Donchian position(20)":
-                op = st.selectbox("Operator", options=["<=", ">="], index=0, key=f"{prefix}.op")
-                thr = float(st.slider("Threshold", 0.0, 1.0, 0.20, 0.05, key=f"{prefix}.thr"))
-                return {"indicator": "donch_pos_20", "operator": op, "threshold": thr}
+        def _node_icon(target: str, *, sub: str = "", configured: bool = False) -> str:
+            if active_module == target and (not sub or active_mod == sub):
+                return "🔷"
+            return "🟩" if configured else "⬜"
 
-            return None
+        def _skill_btn(col, label: str, target: str, *, sub: str = "", configured: bool = False):
+            icon = _node_icon(target, sub=sub, configured=configured)
+            key = f"build.skill.{target}.{sub or 'main'}"
+            if col.button(f"{icon} {label}", key=key):
+                st.session_state["build.active_module"] = target
+                st.session_state["build.active_modifier"] = sub
+                st.rerun()
 
-        if entry_mode.startswith("Simple"):
-            FILTER_LABELS = {
-                "none": "🟦 Always buy (no filter)",
-                "below_ema": "📉 Buy dips below EMA",
-                "rsi_below": "😮‍💨 Oversold (RSI low)",
-                "bb_z_below": "🎯 Oversold (Bollinger stretch)",
-                "macd_bull": "🚀 Momentum (MACD bullish)",
-                "adx_above": "🧭 Trend strength (ADX)",
-                "donch_pos_below": "🏷️ Range bottom (Donchian)",
-            }
-            FILTER_DESC = {
-                "none": "Buys fire on schedule (subject to max allocation).",
-                "below_ema": "Only buy when price is below a moving average (dip gate).",
-                "rsi_below": "Only buy when RSI is below a threshold (oversold gate).",
-                "bb_z_below": "Only buy when price is stretched below its Bollinger midline (z‑score).",
-                "macd_bull": "Only buy when momentum is bullish (MACD histogram ≥ threshold).",
-                "adx_above": "Only buy when trend strength is above a threshold (ADX).",
-                "donch_pos_below": "Only buy near the bottom of the recent Donchian range.",
-            }
 
-            buy_filter = st.selectbox(
-                "Entry filter (TradingView‑style)",
-                options=[
-                    "none",
-                    "below_ema",
-                    "rsi_below",
-                    "bb_z_below",
-                    "macd_bull",
-                    "adx_above",
-                    "donch_pos_below",
-                ],
-                index=0,
-                key="new.buy_filter",
-                format_func=lambda v: FILTER_LABELS.get(v, v),
-            )
-            st.caption(FILTER_DESC.get(buy_filter, ""))
+        # -------------------------
+        # Funding module
+        # -------------------------
+        with st.container(border=True):
+            top_a, top_b = st.columns([0.62, 0.38])
+            with top_a:
+                st.markdown("**Funding**")
+                st.caption("Cash in schedule (optional).")
+            with top_b:
+                fund_sum = st.empty()
 
-            if buy_filter == "below_ema":
-                ema_len = int(st.selectbox("EMA length", options=[10, 20, 50, 100, 200], index=4, key="new.ema_len"))
-            elif buy_filter == "rsi_below":
-                rsi_thr = float(st.slider("RSI threshold (buy when RSI ≤ threshold)", 5.0, 80.0, 40.0, 1.0, key="new.rsi_thr"))
-            elif buy_filter == "bb_z_below":
-                bb_z_thr = float(st.slider("Bollinger z-score threshold (buy when z ≤ threshold)", -3.0, 0.0, -1.0, 0.1, key="new.bb_z_thr"))
-            elif buy_filter == "macd_bull":
-                macd_hist_thr = float(st.number_input("MACD histogram threshold (hist ≥ threshold)", value=0.0, step=0.1, key="new.macd_hist_thr"))
-            elif buy_filter == "adx_above":
-                adx_thr = float(st.slider("ADX threshold (buy when ADX ≥ threshold)", 5.0, 60.0, 20.0, 1.0, key="new.adx_thr"))
-            elif buy_filter == "donch_pos_below":
-                donch_pos_thr = float(st.slider("Donchian position threshold (pos ≤ threshold)", 0.0, 1.0, 0.20, 0.05, key="new.donch_pos_thr"))
+            with st.expander("Configure", expanded=(active_module == "funding")):
+                deposit_freq = st.selectbox(
+                    "Deposit frequency",
+                    options=["none", "daily", "weekly", "monthly"],
+                    index=2,
+                    key="new.deposit_freq",
+                )
+                deposit_amount = st.number_input(
+                    "Deposit amount (USD)",
+                    min_value=0.0,
+                    value=50.0,
+                    step=10.0,
+                    key="new.deposit_amount",
+                )
+                if str(deposit_freq).lower() == "none":
+                    deposit_amount = 0.0
 
-            entry_logic = _simple_filter_to_entry_logic(
-                buy_filter,
-                ema_len=ema_len,
-                rsi_thr=rsi_thr,
-                macd_hist_thr=macd_hist_thr,
-                bb_z_thr=bb_z_thr,
-                adx_thr=adx_thr,
-                donch_pos_thr=donch_pos_thr,
-            )
+            fund_label = "Off" if (str(deposit_freq).lower() == "none" or float(deposit_amount) <= 0) else f"{deposit_freq} · ${int(round(float(deposit_amount)))}"
+            fund_sum.markdown(f"<div style='text-align:right; font-weight:700'>{fund_label}</div>", unsafe_allow_html=True)
 
-            # Tiny “reality check” in simple mode
-            if df_feat is not None and not df_feat.empty:
-                try:
-                    pct = _filter_true_pct(
-                        df_feat,
+        # -------------------------
+        # Buy cadence module
+        # -------------------------
+        with st.container(border=True):
+            top_a, top_b = st.columns([0.62, 0.38])
+            with top_a:
+                st.markdown("**Buy cadence**")
+                st.caption("Scheduled buys (subject to allocation + entry gate).")
+            with top_b:
+                buy_sum = st.empty()
+
+            with st.expander("Configure", expanded=(active_module == "buys")):
+                buy_freq = st.selectbox(
+                    "Buy frequency",
+                    options=["daily", "weekly", "monthly"],
+                    index=1,
+                    key="new.buy_freq",
+                )
+                buy_amount = st.number_input(
+                    "Buy amount (USD)",
+                    min_value=0.0,
+                    value=50.0,
+                    step=10.0,
+                    key="new.buy_amount",
+                )
+
+            buy_label = f"{buy_freq} · ${int(round(float(buy_amount)))}" if float(buy_amount) > 0 else "Off"
+            buy_sum.markdown(f"<div style='text-align:right; font-weight:700'>{buy_label}</div>", unsafe_allow_html=True)
+
+        # -------------------------
+        # Entry gate module
+        # -------------------------
+        with st.container(border=True):
+            top_a, top_b = st.columns([0.62, 0.38])
+            with top_a:
+                st.markdown("**Entry gate**")
+                st.caption("Controls whether scheduled buys are allowed to fire. Mechanics only (not recommendations).")
+            with top_b:
+                gate_sum = st.empty()
+
+            with st.expander("Configure", expanded=(active_module == "entry")):
+                entry_mode = st.radio(
+                    "Entry logic mode",
+                    options=["Simple (one filter)", "Logic builder (regime + triggers)"],
+                    index=0,
+                    horizontal=True,
+                    key="new.entry_mode",
+                )
+
+                def _cond_ui(prefix: str) -> Optional[Dict[str, Any]]:
+                    """Builder UI for one condition. Returns condition dict or None if disabled."""
+                    cond_type = st.selectbox(
+                        "Condition",
+                        options=[
+                            "— (disabled)",
+                            "Price vs EMA",
+                            "RSI(14)",
+                            "Bollinger z-score(20)",
+                            "MACD histogram(12,26,9)",
+                            "ADX(14)",
+                            "Donchian position(20)",
+                        ],
+                        index=0,
+                        key=f"{prefix}.type",
+                    )
+                    if cond_type.startswith("—"):
+                        return None
+
+                    if cond_type == "Price vs EMA":
+                        op = st.selectbox("Operator", options=["<=", ">="], index=0, key=f"{prefix}.op")
+                        ln = int(st.selectbox("EMA length", options=[10, 20, 50, 100, 200], index=4, key=f"{prefix}.ema_len"))
+                        return {"indicator": "close", "operator": op, "ref_indicator": f"ema_{ln}", "threshold": 0.0}
+
+                    if cond_type == "RSI(14)":
+                        op = st.selectbox("Operator", options=["<=", ">="], index=0, key=f"{prefix}.op")
+                        thr = float(st.slider("Threshold", 5.0, 95.0, 40.0, 1.0, key=f"{prefix}.thr"))
+                        return {"indicator": "rsi_14", "operator": op, "threshold": thr}
+
+                    if cond_type == "Bollinger z-score(20)":
+                        op = st.selectbox("Operator", options=["<=", ">="], index=0, key=f"{prefix}.op")
+                        thr = float(st.slider("Threshold", -3.0, 3.0, -1.0, 0.1, key=f"{prefix}.thr"))
+                        return {"indicator": "bb_z_20", "operator": op, "threshold": thr}
+
+                    if cond_type == "MACD histogram(12,26,9)":
+                        op = st.selectbox("Operator", options=[">=", "<="], index=0, key=f"{prefix}.op")
+                        thr = float(st.number_input("Threshold", value=0.0, step=0.1, key=f"{prefix}.thr"))
+                        return {"indicator": "macd_hist_12_26_9", "operator": op, "threshold": thr}
+
+                    if cond_type == "ADX(14)":
+                        op = st.selectbox("Operator", options=[">=", "<="], index=0, key=f"{prefix}.op")
+                        thr = float(st.slider("Threshold", 1.0, 80.0, 20.0, 1.0, key=f"{prefix}.thr"))
+                        return {"indicator": "adx_14", "operator": op, "threshold": thr}
+
+                    if cond_type == "Donchian position(20)":
+                        op = st.selectbox("Operator", options=["<=", ">="], index=0, key=f"{prefix}.op")
+                        thr = float(st.slider("Threshold", 0.0, 1.0, 0.20, 0.05, key=f"{prefix}.thr"))
+                        return {"indicator": "donch_pos_20", "operator": op, "threshold": thr}
+
+                    return None
+
+                if entry_mode.startswith("Simple"):
+                    FILTER_LABELS = {
+                        "none": "Always buy (no filter)",
+                        "below_ema": "Buy dips below EMA",
+                        "rsi_below": "Oversold (RSI low)",
+                        "bb_z_below": "Oversold (Bollinger stretch)",
+                        "macd_bull": "Momentum (MACD bullish)",
+                        "adx_above": "Trend strength (ADX)",
+                        "donch_pos_below": "Range bottom (Donchian)",
+                    }
+                    FILTER_DESC = {
+                        "none": "Buys fire on schedule (subject to max allocation).",
+                        "below_ema": "Only buy when price is below a moving average (dip gate).",
+                        "rsi_below": "Only buy when RSI is below a threshold (oversold gate).",
+                        "bb_z_below": "Only buy when price is stretched below its Bollinger midline (z‑score).",
+                        "macd_bull": "Only buy when momentum is bullish (MACD histogram ≥ threshold).",
+                        "adx_above": "Only buy when trend strength is above a threshold (ADX).",
+                        "donch_pos_below": "Only buy near the bottom of the recent Donchian range.",
+                    }
+
+                    buy_filter = st.selectbox(
+                        "Entry filter (TradingView‑style)",
+                        options=[
+                            "none",
+                            "below_ema",
+                            "rsi_below",
+                            "bb_z_below",
+                            "macd_bull",
+                            "adx_above",
+                            "donch_pos_below",
+                        ],
+                        index=0,
+                        key="new.buy_filter",
+                        format_func=lambda v: FILTER_LABELS.get(v, v),
+                    )
+                    st.caption(FILTER_DESC.get(buy_filter, ""))
+
+                    if buy_filter == "below_ema":
+                        ema_len = int(st.selectbox("EMA length", options=[10, 20, 50, 100, 200], index=4, key="new.ema_len"))
+                    elif buy_filter == "rsi_below":
+                        rsi_thr = float(st.slider("RSI threshold (buy when RSI ≤ threshold)", 5.0, 80.0, 40.0, 1.0, key="new.rsi_thr"))
+                    elif buy_filter == "bb_z_below":
+                        bb_z_thr = float(st.slider("Bollinger z-score threshold (buy when z ≤ threshold)", -3.0, 0.0, -1.0, 0.1, key="new.bb_z_thr"))
+                    elif buy_filter == "macd_bull":
+                        macd_hist_thr = float(st.number_input("MACD histogram threshold (hist ≥ threshold)", value=0.0, step=0.1, key="new.macd_hist_thr"))
+                    elif buy_filter == "adx_above":
+                        adx_thr = float(st.slider("ADX threshold (buy when ADX ≥ threshold)", 5.0, 60.0, 20.0, 1.0, key="new.adx_thr"))
+                    elif buy_filter == "donch_pos_below":
+                        donch_pos_thr = float(st.slider("Donchian position threshold (pos ≤ threshold)", 0.0, 1.0, 0.20, 0.05, key="new.donch_pos_thr"))
+
+                    entry_logic = _simple_filter_to_entry_logic(
                         buy_filter,
                         ema_len=ema_len,
                         rsi_thr=rsi_thr,
@@ -2149,130 +2243,201 @@ def build_dca_baseline_params() -> Dict[str, Any]:
                         adx_thr=adx_thr,
                         donch_pos_thr=donch_pos_thr,
                     )
-                    atr_med = None
-                    if "atr_pct" in df_feat.columns:
-                        atr_med = float(np.nanmedian(pd.to_numeric(df_feat["atr_pct"], errors="coerce")))
-                    build_atr_med = atr_med
-                    msg = None
-                    if pct is not None:
-                        msg = f"On this dataset: filter true ~{pct:.0f}% of days"
-                    if atr_med is not None and math.isfinite(atr_med):
-                        msg = (msg + f" · median daily ATR ≈ {atr_med:.1f}%") if msg else f"Median daily ATR ≈ {atr_med:.1f}%"
-                    if msg:
-                        st.caption(msg + ".")
-                    if pct is not None and pct < 5:
-                        st.info("FYI: this filter triggers on <5% of days here. That typically reduces trade count and increases outcome variability.")
-                except Exception:
-                    pass
 
-        else:
-            st.caption("Builder: define a small set of gates (regime) and a few entry trigger clauses (any-of). Caps keep this auditable.")
-            st.markdown("**Regime (0–2 gates, AND):** entries are allowed only when all regime gates are true.")
-            reg_conds: List[Dict[str, Any]] = []
-            with st.expander("Regime gates", expanded=True):
-                c1 = _cond_ui("new.regime1")
-                if c1:
-                    reg_conds.append(c1)
-                c2 = _cond_ui("new.regime2")
-                if c2:
-                    reg_conds.append(c2)
+                    # Tiny “reality check” in simple mode
+                    if df_feat is not None and not df_feat.empty:
+                        try:
+                            pct = _filter_true_pct(
+                                df_feat,
+                                buy_filter,
+                                ema_len=ema_len,
+                                rsi_thr=rsi_thr,
+                                macd_hist_thr=macd_hist_thr,
+                                bb_z_thr=bb_z_thr,
+                                adx_thr=adx_thr,
+                                donch_pos_thr=donch_pos_thr,
+                            )
+                            atr_med = None
+                            if "atr_pct" in df_feat.columns:
+                                atr_med = float(np.nanmedian(pd.to_numeric(df_feat["atr_pct"], errors="coerce")))
+                            build_atr_med = atr_med
+                            msg = None
+                            if pct is not None:
+                                msg = f"On this dataset: filter true ~{pct:.0f}% of days"
+                            if atr_med is not None and math.isfinite(atr_med):
+                                msg = (msg + f" · median daily ATR ≈ {atr_med:.1f}%") if msg else f"Median daily ATR ≈ {atr_med:.1f}%"
+                            if msg:
+                                st.caption(msg + ".")
+                            if pct is not None and pct < 5:
+                                st.info("FYI: this filter triggers on <5% of days here. That typically reduces trade count and increases outcome variability.")
+                        except Exception:
+                            pass
+                else:
+                    st.caption("Builder: define a small set of gates (regime) and a few entry trigger clauses (any-of). Caps keep this auditable.")
 
-            st.markdown("**Entry triggers (1–3 clauses, OR-of-AND):** if *any* clause is true, an entry is allowed (subject to regime + allocation).")
-            clauses: List[List[Dict[str, Any]]] = []
-            with st.expander("Trigger clauses", expanded=True):
-                for i in range(1, 4):
-                    with st.container():
-                        st.markdown(f"**Clause {i}** (1–3 conditions, AND)")
-                        cl: List[Dict[str, Any]] = []
-                        c1 = _cond_ui(f"new.cl{i}.c1")
+                    reg_conds: List[Dict[str, Any]] = []
+                    with st.expander("Regime gates (0–2, AND)", expanded=True):
+                        c1 = _cond_ui("new.regime1")
                         if c1:
-                            cl.append(c1)
-                        c2 = _cond_ui(f"new.cl{i}.c2")
+                            reg_conds.append(c1)
+                        c2 = _cond_ui("new.regime2")
                         if c2:
-                            cl.append(c2)
-                        c3 = _cond_ui(f"new.cl{i}.c3")
-                        if c3:
-                            cl.append(c3)
-                        if cl:
-                            clauses.append(cl)
-                        st.divider()
+                            reg_conds.append(c2)
 
-            if not clauses:
-                st.warning("No trigger clause is enabled yet. Add at least one condition to at least one clause.")
-            entry_logic = {"regime": reg_conds, "clauses": clauses}
+                    clauses: List[List[Dict[str, Any]]] = []
+                    with st.expander("Trigger clauses (1–3 clauses, OR-of-AND)", expanded=True):
+                        for i in range(1, 4):
+                            with st.container():
+                                st.markdown(f"**Clause {i}** (1–3 conditions, AND)")
+                                cl: List[Dict[str, Any]] = []
+                                c1 = _cond_ui(f"new.cl{i}.c1")
+                                if c1:
+                                    cl.append(c1)
+                                c2 = _cond_ui(f"new.cl{i}.c2")
+                                if c2:
+                                    cl.append(c2)
+                                c3 = _cond_ui(f"new.cl{i}.c3")
+                                if c3:
+                                    cl.append(c3)
+                                if cl:
+                                    clauses.append(cl)
+                                st.divider()
 
-            # Reality-check: how often does this fire?
-            if df_feat is not None and not df_feat.empty and clauses:
+                    if not clauses:
+                        st.warning("No trigger clause is enabled yet. Add at least one condition to at least one clause.")
+                    entry_logic = {"regime": reg_conds, "clauses": clauses}
+
+                    if df_feat is not None and not df_feat.empty and clauses:
+                        try:
+                            pcts = _entry_logic_true_pcts(df_feat, entry_logic)
+                            atr_med = None
+                            if "atr_pct" in df_feat.columns:
+                                atr_med = float(np.nanmedian(pd.to_numeric(df_feat["atr_pct"], errors="coerce")))
+                            build_atr_med = atr_med
+                            if pcts is not None:
+                                r, e, c = pcts
+                                msg = f"On this dataset: regime true ~{r:.0f}% · triggers true ~{e:.0f}% · combined ~{c:.0f}%"
+                                if atr_med is not None and math.isfinite(atr_med):
+                                    msg += f" · median daily ATR ≈ {atr_med:.1f}%"
+                                st.caption(msg + ".")
+                                if c < 2:
+                                    st.info("FYI: combined entry gating triggers on <2% of days here. That often leads to very low trade counts and high variability.")
+                        except Exception:
+                            pass
+
+            # Entry gate summary (right-aligned)
+            if str(entry_mode).startswith("Simple"):
+                gate_lbl = {
+                    "none": "No gate",
+                    "below_ema": f"EMA{ema_len}",
+                    "rsi_below": f"RSI≤{rsi_thr:.0f}",
+                    "bb_z_below": f"BB z≤{bb_z_thr:.1f}",
+                    "macd_bull": "MACD hist",
+                    "adx_above": f"ADX≥{adx_thr:.0f}",
+                    "donch_pos_below": "Donchian low",
+                }.get(str(buy_filter), "Custom")
+            else:
                 try:
-                    pcts = _entry_logic_true_pcts(df_feat, entry_logic)
-                    atr_med = None
-                    if "atr_pct" in df_feat.columns:
-                        atr_med = float(np.nanmedian(pd.to_numeric(df_feat["atr_pct"], errors="coerce")))
-                    build_atr_med = atr_med
-                    if pcts is not None:
-                        r, e, c = pcts
-                        msg = f"On this dataset: regime true ~{r:.0f}% · triggers true ~{e:.0f}% · combined ~{c:.0f}%"
-                        if atr_med is not None and math.isfinite(atr_med):
-                            msg += f" · median daily ATR ≈ {atr_med:.1f}%"
-                        st.caption(msg + ".")
-                        if c < 2:
-                            st.info("FYI: combined entry gating triggers on <2% of days here. That often leads to very low trade counts and high variability.")
+                    r_n = len(entry_logic.get("regime") or [])
+                    c_n = len(entry_logic.get("clauses") or [])
+                except Exception:
+                    r_n, c_n = 0, 0
+                gate_lbl = f"Builder ({r_n}R/{c_n}C)"
+            gate_sum.markdown(f"<div style='text-align:right; font-weight:700'>{gate_lbl}</div>", unsafe_allow_html=True)
+
+        # -------------------------
+        # Allocation module
+        # -------------------------
+        with st.container(border=True):
+            top_a, top_b = st.columns([0.62, 0.38])
+            with top_a:
+                st.markdown("**Allocation**")
+                st.caption("Caps how much equity can be allocated at once.")
+            with top_b:
+                alloc_sum = st.empty()
+
+            with st.expander("Configure", expanded=(active_module == "allocation")):
+                max_alloc_pct = float(
+                    st.slider(
+                        "Max allocation (fraction of equity)",
+                        min_value=0.05,
+                        max_value=1.00,
+                        value=1.00,
+                        step=0.05,
+                        key="new.max_alloc_pct",
+                    )
+                )
+
+            alloc_sum.markdown(f"<div style='text-align:right; font-weight:700'>{_fmt_pct(float(max_alloc_pct), digits=0)}</div>", unsafe_allow_html=True)
+
+        # -------------------------
+        # Risk controls module
+        # -------------------------
+        with st.container(border=True):
+            top_a, top_b = st.columns([0.62, 0.38])
+            with top_a:
+                st.markdown("**Risk controls**")
+                st.caption("Optional exits. Values are experiment knobs (not recommendations).")
+            with top_b:
+                risk_sum = st.empty()
+
+            with st.expander("Configure", expanded=(active_module == "risk")):
+                if build_atr_med is not None and math.isfinite(build_atr_med):
+                    st.caption(f"For scale only: median daily ATR ≈ {build_atr_med:.1f}% on this dataset.")
+
+                # Sub-skill expanders: open the focused one if a modifier node was clicked.
+                focus = active_mod if (active_module == "risk") else ""
+                exp_sl = (focus == "stop_loss")
+                exp_tp = (focus == "take_profit")
+                exp_time = (focus == "time_stop")
+                exp_trail = (focus == "trailing")
+
+                with st.expander("Stop loss", expanded=exp_sl):
+                    sl_ui = float(st.slider("Stop loss (%) (0 disables)", 0.0, 95.0, 0.0, 0.25, key="new.sl_pct_ui"))
+
+                with st.expander("Take profit", expanded=exp_tp):
+                    tp_ui = float(st.slider("Take profit (%) (0 disables)", 0.0, 500.0, 0.0, 0.5, key="new.tp_pct_ui"))
+                    if tp_ui > 0:
+                        tp_sell_fraction = float(st.slider("On take profit: sell fraction of position", 0.0, 1.0, 1.0, 0.05, key="new.tp_sell_frac"))
+                        reserve_frac = float(st.slider("Reserve fraction of TP proceeds (keep as cash)", 0.0, 1.0, 0.0, 0.05, key="new.reserve_frac"))
+                    else:
+                        tp_sell_fraction = 1.0
+                        reserve_frac = 0.0
+
+                with st.expander("Time stop", expanded=exp_time):
+                    max_hold_bars = int(st.number_input("Max holding period (bars) (0 disables)", min_value=0, value=0, step=5, key="new.max_hold_bars"))
+
+                with st.expander("Trailing stop", expanded=exp_trail):
+                    trail_ui = float(st.slider("Trailing stop (%) from peak (0 disables)", 0.0, 95.0, 0.0, 0.25, key="new.trail_pct_ui"))
+
+                # Scale captions (if ATR exists)
+                try:
+                    if build_atr_med is not None and math.isfinite(build_atr_med) and build_atr_med > 0:
+                        if sl_ui > 0:
+                            st.caption(f"Stop loss scale: {sl_ui:.2f}% ≈ {sl_ui / build_atr_med:.1f}× median ATR.")
+                        if tp_ui > 0:
+                            st.caption(f"Take profit scale: {tp_ui:.2f}% ≈ {tp_ui / build_atr_med:.1f}× median ATR.")
+                        if trail_ui > 0:
+                            st.caption(f"Trailing scale: {trail_ui:.2f}% ≈ {trail_ui / build_atr_med:.1f}× median ATR.")
                 except Exception:
                     pass
 
-        max_alloc_pct = float(
-            st.slider(
-                "Max allocation (fraction of equity)",
-                min_value=0.05,
-                max_value=1.00,
-                value=1.00,
-                step=0.05,
-                key="new.max_alloc_pct",
-            )
-        )
+                sl_pct = float(sl_ui) / 100.0
+                tp_pct = float(tp_ui) / 100.0
+                trail_pct = float(trail_ui) / 100.0
 
-        # Defaults (controls disabled by default)
-        sl_pct = 0.0
-        tp_pct = 0.0
-        tp_sell_fraction = 1.0
-        reserve_frac = 0.0
-
-        # New exits
-        max_hold_bars = 0
-        trail_pct = 0.0
-
-        with st.expander("Risk controls (optional)", expanded=False):
-            st.caption("Values are % moves from your average entry (10 = 10%). These are experiment knobs, not recommendations.")
-            if build_atr_med is not None and math.isfinite(build_atr_med):
-                st.caption(f"For scale only: median daily ATR ≈ {build_atr_med:.1f}% on this dataset.")
-
-            sl_ui = float(st.slider("Stop loss (%) (0 disables)", 0.0, 95.0, 0.0, 0.25, key="new.sl_pct_ui"))
-            tp_ui = float(st.slider("Take profit (%) (0 disables)", 0.0, 500.0, 0.0, 0.5, key="new.tp_pct_ui"))
-
-            # New: time stop + trailing stop
-            max_hold_bars = int(st.number_input("Time stop: max holding period (bars) (0 disables)", min_value=0, value=0, step=5, key="new.max_hold_bars"))
-            trail_ui = float(st.slider("Trailing stop (%) from peak (0 disables)", 0.0, 95.0, 0.0, 0.25, key="new.trail_pct_ui"))
-
-            if build_atr_med is not None and math.isfinite(build_atr_med) and build_atr_med > 0:
-                if sl_ui > 0:
-                    st.caption(f"Stop loss scale: {sl_ui:.2f}% ≈ {sl_ui / build_atr_med:.1f}× median ATR.")
-                if tp_ui > 0:
-                    st.caption(f"Take profit scale: {tp_ui:.2f}% ≈ {tp_ui / build_atr_med:.1f}× median ATR.")
-                if trail_ui > 0:
-                    st.caption(f"Trailing scale: {trail_ui:.2f}% ≈ {trail_ui / build_atr_med:.1f}× median ATR.")
-
-            # Store as fractions in params (0.10 == 10%)
-            sl_pct = sl_ui / 100.0
-            tp_pct = tp_ui / 100.0
-            trail_pct = trail_ui / 100.0
-
-            if tp_ui > 0:
-                tp_sell_fraction = float(st.slider("On take profit: sell fraction of position", 0.0, 1.0, 1.0, 0.05, key="new.tp_sell_frac"))
-                reserve_frac = float(st.slider("Reserve fraction of TP proceeds (keep as cash)", 0.0, 1.0, 0.0, 0.05, key="new.reserve_frac"))
-            else:
-                tp_sell_fraction = 1.0
-                reserve_frac = 0.0
-
+            exits = []
+            if float(sl_pct) > 0:
+                exits.append(f"SL {sl_pct*100:.1f}%")
+            if float(tp_pct) > 0:
+                exits.append(f"TP {tp_pct*100:.1f}%")
+            if int(max_hold_bars) > 0:
+                exits.append(f"Time {int(max_hold_bars)}")
+            if float(trail_pct) > 0:
+                exits.append(f"Trail {trail_pct*100:.1f}%")
+            risk_label = ", ".join(exits) if exits else "None"
+            risk_sum.markdown(f"<div style='text-align:right; font-weight:700'>{risk_label}</div>", unsafe_allow_html=True)
+    # Params (schema unchanged)
     params = {
         "deposit_freq": deposit_freq,
         "deposit_amount_usd": float(deposit_amount),
@@ -2295,7 +2460,7 @@ def build_dca_baseline_params() -> Dict[str, Any]:
         "trail_pct": float(trail_pct),
     }
 
-    # Human-readable strategy card (dopamine-friendly)
+    # Human-readable build summary
     parts: List[str] = []
     parts.append(f"Deposit {deposit_freq} ${int(round(params['deposit_amount_usd']))} and buy {params['buy_freq']} ${int(round(params['buy_amount_usd']))}.")
     if entry_mode.startswith("Simple"):
@@ -2318,7 +2483,6 @@ def build_dca_baseline_params() -> Dict[str, Any]:
 
     parts.append(f"Never allocate more than {_fmt_pct(params['max_alloc_pct'], digits=0)} of equity.")
 
-    # Risk controls
     if params.get("sl_pct", 0.0) > 0:
         parts.append("Stop loss: {:.2f}%.".format(params["sl_pct"] * 100))
     if params.get("tp_pct", 0.0) > 0:
@@ -2328,9 +2492,345 @@ def build_dca_baseline_params() -> Dict[str, Any]:
     if params.get("trail_pct", 0.0) > 0:
         parts.append("Trailing stop: {:.2f}% from peak (ratchets up).".format(params["trail_pct"] * 100))
 
-    st.info(" ".join([p for p in parts if p.strip()]))
+    summary_text = " ".join([p for p in parts if p.strip()])
 
+    # Build label + completeness (neutral, non-advice)
+    gate_label = "No gate"
+    if entry_mode.startswith("Simple"):
+        gate_label = {
+            "none": "No gate",
+            "below_ema": f"Gate: EMA{ema_len}",
+            "rsi_below": f"Gate: RSI≤{rsi_thr:.0f}",
+            "bb_z_below": f"Gate: BB z≤{bb_z_thr:.1f}",
+            "macd_bull": "Gate: MACD hist",
+            "adx_above": f"Gate: ADX≥{adx_thr:.0f}",
+            "donch_pos_below": "Gate: Donchian low",
+        }.get(buy_filter, "Gate: custom")
+    else:
+        # Builder mode: show counts only
+        try:
+            r_n = len(entry_logic.get("regime") or [])
+            c_n = len(entry_logic.get("clauses") or [])
+        except Exception:
+            r_n, c_n = 0, 0
+        gate_label = f"Gate: builder ({r_n} regime, {c_n} clause)"
+
+    build_label = f"{buy_freq.capitalize()} DCA · {gate_label}"
+
+    total_slots = 5
+    slots = 0
+    if deposit_freq != "none" and float(deposit_amount) > 0:
+        slots += 1
+    if float(buy_amount) > 0:
+        slots += 1
+    if (entry_mode.startswith("Simple") and buy_filter != "none") or (not entry_mode.startswith("Simple") and (entry_logic.get("clauses") or [])):
+        slots += 1
+    if float(max_alloc_pct) < 1.0:
+        slots += 1
+    if (sl_pct > 0) or (tp_pct > 0) or (max_hold_bars > 0) or (trail_pct > 0):
+        slots += 1
+
+    completeness = slots / float(total_slots) if total_slots else 0.0
+
+    # Fill header + right preview
+    with header_slot.container():
+        with st.container(border=True):
+            h1, h2 = st.columns([0.72, 0.28])
+            with h1:
+                st.markdown(f"### {build_label}")
+                st.caption("Spot only · Mechanics preview · No compute runs on this page.")
+            with h2:
+                st.caption("Build completeness")
+                st.progress(completeness)
+                st.caption(f"{slots}/{total_slots} modules configured")
+
+            st.markdown("**Build summary**")
+            st.info(summary_text)
+
+            # --- Phase 4: Build manifest + exports (read-only) ---
+            with st.expander("Build manifest (read-only)", expanded=False):
+                # Baseline config that can be fed into the engine (spot, long-only).
+                cfg_out = {
+                    "strategy_name": str(st.session_state.get("new.strategy_name") or "dca_swing"),
+                    "side": "long",
+                    "market_mode": "spot",
+                    "params": params,
+                }
+
+                # Extra metadata for auditability (no performance claims).
+                manifest = {
+                    "build_label": build_label,
+                    "generated_at": datetime.now().isoformat(timespec="seconds"),
+                    "notes": "Mechanics-only configuration. Spot only. Read-only build page.",
+                    "cfg": cfg_out,
+                    "ui_context": {
+                        "template": str(st.session_state.get("new.template") or "DCA/Swing"),
+                        "data_path": st.session_state.get("new.data_path"),
+                    },
+                }
+
+                st.caption("These exports describe mechanics only. They do not predict performance and are not trading advice.")
+
+                st.markdown("**Summary text**")
+                st.code(summary_text)
+
+                st.markdown("**Baseline config (JSON)**")
+                st.code(json.dumps(cfg_out, indent=2), language="json")
+
+                st.markdown("**Build manifest (JSON)**")
+                st.code(json.dumps(manifest, indent=2), language="json")
+
+                dl1, dl2, dl3 = st.columns(3, gap="small")
+                with dl1:
+                    st.download_button(
+                        "Download baseline config",
+                        data=json.dumps(cfg_out, indent=2),
+                        file_name="baseline_config.json",
+                        mime="application/json",
+                    )
+                with dl2:
+                    st.download_button(
+                        "Download manifest",
+                        data=json.dumps(manifest, indent=2),
+                        file_name="build_manifest.json",
+                        mime="application/json",
+                    )
+                with dl3:
+                    st.download_button(
+                        "Download summary",
+                        data=summary_text,
+                        file_name="build_summary.txt",
+                        mime="text/plain",
+                    )
+
+    with colR:
+        st.markdown('<div class="sticky-preview">', unsafe_allow_html=True)
+        with st.container(border=True):
+            st.markdown("**Preview**")
+            st.caption("Live mechanics summary (no performance claims).")
+            st.markdown("**Build checklist**")
+
+            def _chk(ok: bool, label: str) -> str:
+                return f"- {'✅' if ok else '⬜'} {label}"
+
+            funding_ok = (deposit_freq != "none") and (float(deposit_amount or 0.0) > 0)
+            buys_ok = (buy_freq != "none") and (float(buy_amount or 0.0) > 0)
+
+            entry_ok = False
+            try:
+                if buy_filter != "none":
+                    entry_ok = True
+                elif entry_mode.startswith("Logic builder"):
+                    # Built logic dict contains enabled conditions/clauses
+                    entry_ok = bool(entry_logic.get("regime")) or bool(entry_logic.get("clauses"))
+            except Exception:
+                pass
+
+            alloc_ok = True  # always present (cap is a core mechanic)
+            sl_ok = float(sl_pct or 0.0) > 0.0
+            tp_ok = float(tp_pct or 0.0) > 0.0
+            time_ok = int(max_hold_bars or 0) > 0
+            trail_ok = float(trail_pct or 0.0) > 0.0
+
+            checklist_lines = [
+                _chk(funding_ok, f"Funding schedule ({deposit_freq} · ${deposit_amount:.0f})" if funding_ok else "Funding schedule"),
+                _chk(buys_ok, f"Buy schedule ({buy_freq} · ${buy_amount:.0f})" if buys_ok else "Buy schedule"),
+                _chk(entry_ok, "Entry gate"),
+                _chk(alloc_ok, f"Allocation cap ({max_alloc_pct*100:.0f}%)"),
+                _chk(sl_ok, f"Stop loss ({sl_pct:.2f}%)" if sl_ok else "Stop loss"),
+                _chk(tp_ok, f"Take profit ({tp_pct:.2f}%)" if tp_ok else "Take profit"),
+                _chk(time_ok, f"Time stop ({max_hold_bars} bars)" if time_ok else "Time stop"),
+                _chk(trail_ok, f"Trailing stop ({trail_pct:.2f}%)" if trail_ok else "Trailing stop"),
+            ]
+            st.markdown("\n".join(checklist_lines))
+            st.markdown("---")
+
+            # --- Text summary (fast scan) ---
+            st.markdown(f"**Funding:** {deposit_freq} · ${int(round(float(deposit_amount)))}")
+            st.markdown(f"**Buys:** {buy_freq} · ${int(round(float(buy_amount)))}")
+            st.markdown(f"**Entry gate:** {gate_label.replace('Gate: ', '') if isinstance(gate_label, str) else gate_label}")
+            st.markdown(f"**Allocation cap:** {_fmt_pct(float(max_alloc_pct), digits=0)}")
+
+            exits = []
+            if sl_pct > 0:
+                exits.append(f"SL {sl_pct*100:.1f}%")
+            if tp_pct > 0:
+                exits.append(f"TP {tp_pct*100:.1f}%")
+            if max_hold_bars > 0:
+                exits.append(f"Time {max_hold_bars} bars")
+            if trail_pct > 0:
+                exits.append(f"Trail {trail_pct*100:.1f}%")
+            st.markdown("**Exits:** " + (", ".join(exits) if exits else "None"))
+
+            # --- Helpers for preview visuals ---
+            def _extract_dt_series(_df: Optional[pd.DataFrame]) -> Optional[pd.Series]:
+                if _df is None or getattr(_df, "empty", True):
+                    return None
+                try:
+                    cols = [str(c).strip().lower() for c in list(_df.columns)]
+                except Exception:
+                    cols = []
+                try:
+                    if "dt" in cols:
+                        s = pd.to_datetime(_df.iloc[:200_000, cols.index("dt")], errors="coerce")
+                    elif "date" in cols:
+                        s = pd.to_datetime(_df.iloc[:200_000, cols.index("date")], errors="coerce")
+                    elif "datetime" in cols:
+                        s = pd.to_datetime(_df.iloc[:200_000, cols.index("datetime")], errors="coerce")
+                    elif "ts" in cols:
+                        raw = pd.to_numeric(_df.iloc[:200_000, cols.index("ts")], errors="coerce")
+                        # Heuristic: ms epoch if values are large
+                        s = pd.to_datetime(raw, unit="ms", errors="coerce")
+                        if s.isna().all():
+                            s = pd.to_datetime(raw, unit="s", errors="coerce")
+                    else:
+                        # If index is datetime-like
+                        if isinstance(getattr(_df, "index", None), pd.DatetimeIndex):
+                            s = pd.Series(_df.index[:200_000])
+                        else:
+                            return None
+                    s = s.dropna()
+                    return s if len(s) else None
+                except Exception:
+                    return None
+
+            def _daily_anchor_points(dt_s: pd.Series) -> pd.Series:
+                # First bar timestamp per day (anchors schedules to dataset dates deterministically).
+                dt_s = pd.to_datetime(dt_s, errors="coerce").dropna()
+                if dt_s.empty:
+                    return dt_s
+                dt_s = dt_s.sort_values()
+                d = dt_s.dt.floor("D")
+                try:
+                    first = dt_s.groupby(d).min()
+                    out = pd.Series(first.values)
+                    out = pd.to_datetime(out, errors="coerce").dropna()
+                    return out.sort_values()
+                except Exception:
+                    # Fallback: drop duplicates by day
+                    tmp = pd.DataFrame({"dt": dt_s.values})
+                    tmp["day"] = pd.to_datetime(tmp["dt"]).dt.floor("D")
+                    tmp = tmp.drop_duplicates("day", keep="first")
+                    return pd.to_datetime(tmp["dt"]).sort_values()
+
+            def _schedule_points(freq: str, daily_pts: pd.Series) -> pd.Series:
+                freq = str(freq or "").lower().strip()
+                if daily_pts is None or daily_pts.empty:
+                    return pd.Series(dtype="datetime64[ns]")
+                if freq == "none":
+                    return pd.Series(dtype="datetime64[ns]")
+                if freq == "daily":
+                    return daily_pts
+                if freq == "weekly":
+                    return daily_pts.iloc[::7]
+                if freq == "monthly":
+                    try:
+                        return daily_pts.groupby(daily_pts.dt.to_period("M")).min().sort_values()
+                    except Exception:
+                        return daily_pts
+                return daily_pts
+
+            # --- Visuals: allocation + complexity ---
+            cA, cB = st.columns(2, gap="small")
+
+            with cA:
+                st.markdown("**Allocation**")
+                if go is not None:
+                    inv = float(max_alloc_pct) / 100.0 if float(max_alloc_pct) > 1.0 else float(max_alloc_pct)
+                    inv = max(0.0, min(1.0, inv))
+                    cash = max(0.0, 1.0 - inv)
+                    fig_alloc = go.Figure(
+                        data=[
+                            go.Pie(
+                                labels=["Max invested", "Cash buffer"],
+                                values=[inv, cash],
+                                hole=0.68,
+                                sort=False,
+                                direction="clockwise",
+                                textinfo="none",
+                                hovertemplate="%{label}: %{percent:.0%}<extra></extra>",
+                                showlegend=False,
+                            )
+                        ]
+                    )
+                    _style_fig(fig_alloc, title=None)
+                    fig_alloc.update_layout(height=170, margin=dict(l=10, r=10, t=10, b=10), showlegend=False)
+                    fig_alloc.add_annotation(text=f"{inv*100:.0f}% cap", x=0.5, y=0.5, showarrow=False, font=dict(size=16))
+                    _plotly(fig_alloc, key="build.preview.alloc")
+                else:
+                    st.caption(f"Cap: {_fmt_pct(float(max_alloc_pct), digits=0)}")
+
+            with cB:
+                st.markdown("**Complexity**")
+                # Deterministic “workflow complexity” meter (not quality/performance).
+                score = 1.0
+                if str(deposit_freq).lower() != "none" and float(deposit_amount) > 0:
+                    score += 0.5
+                if entry_mode.startswith("Simple"):
+                    if str(buy_filter).lower() != "none":
+                        score += 1.0
+                else:
+                    score += 1.5
+                    try:
+                        score += 0.5 * len(entry_logic.get("regime", []) or [])
+                        score += 0.3 * len(entry_logic.get("clauses", []) or [])
+                    except Exception:
+                        pass
+                if float(max_alloc_pct) < 0.999:
+                    score += 0.25
+                rc = int(bool(sl_pct > 0)) + int(bool(tp_pct > 0)) + int(bool(max_hold_bars > 0)) + int(bool(trail_pct > 0))
+                score += 0.75 * rc
+                score = max(0.0, min(5.0, float(score)))
+
+                if go is not None:
+                    fig_cx = go.Figure(
+                        go.Indicator(
+                            mode="gauge+number",
+                            value=score,
+                            number={"suffix": "/5"},
+                            gauge={"axis": {"range": [0, 5]}},
+                        )
+                    )
+                    _style_fig(fig_cx, title=None)
+                    fig_cx.update_layout(height=170, margin=dict(l=10, r=10, t=10, b=10))
+                    _plotly(fig_cx, key="build.preview.complexity")
+                else:
+                    st.progress(score / 5.0)
+                    st.caption(f"{score:.1f}/5")
+
+            # --- Traits (descriptive chips) ---
+            st.markdown("**Derived characteristics**")
+            traits: List[Tuple[str, str]] = []
+            if str(deposit_freq).lower() != "none" and float(deposit_amount) > 0:
+                traits.append(("💰", "Auto funding"))
+            else:
+                traits.append(("💼", "No deposits"))
+            traits.append(("🗓️", f"{buy_freq.capitalize()} schedule"))
+            if entry_mode.startswith("Simple") and str(buy_filter).lower() == "none":
+                traits.append(("🚪", "Ungated buys"))
+            else:
+                traits.append(("🚪", "Gated buys"))
+            if float(max_alloc_pct) < 0.999:
+                traits.append(("🧱", f"Invest cap {_fmt_pct(float(max_alloc_pct), digits=0)}"))
+            if exits:
+                traits.append(("🛡️", "Exit rules enabled"))
+            else:
+                traits.append(("🧘", "No exits"))
+            if build_atr_med is not None and math.isfinite(float(build_atr_med)):
+                traits.append(("📈", f"Median ATR ~{float(build_atr_med):.1f}% (dataset)"))
+
+            # Render in a clean grid (no HTML/CSS).
+            rows = [traits[i : i + 2] for i in range(0, len(traits), 2)]
+            for r in rows:
+                cc = st.columns(2, gap="small")
+                for j, item in enumerate(r):
+                    ico, label = item
+                    with cc[j]:
+                        st.caption(f"{ico} {label}")
+
+        st.markdown("</div>", unsafe_allow_html=True)
     return params
+
 
 def _write_baseline_json(tmp_dir: Path, *, strategy_name: str, side: str, params: Dict[str, Any]) -> Path:
     tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -3225,123 +3725,198 @@ if open_existing == "(new run)":
     # -------------------------------------------------------------------------
     # Step 2: Variations (grid)
     # -------------------------------------------------------------------------
+    
+    # -------------------------------------------------------------------------
+    # Step 2: Variations (grid)
+    # -------------------------------------------------------------------------
     elif step == 2:
-        st.write("Decide how you want to stress test the baseline plan.")
+        st.write("Create a variation grid around your baseline build. This controls **breadth vs cost** (not performance).")
 
-        mode = st.selectbox(
-            "How to generate variants",
-            options=[
-                "Stress test my plan (recommended)",
-                "Explore random variations (advanced)",
-            ],
-            index=0,
-            key="new.grid_mode",
-        )
+        # Decide which vary-groups to expose based on the baseline entry mode.
+        entry_mode_ui = str(st.session_state.get("new.entry_mode", ""))
+        entry_group = "logic" if entry_mode_ui.startswith("Logic builder") else "filter"
 
-        # Friendly presets → translates to make_dca_grid width + N
-        preset = st.selectbox(
-            "Stress level",
-            options=["Low", "Medium", "High"],
-            index=1,
-            key="new.stress_level",
-        )
+        LABELS = {
+            "deposits": "Funding (deposits)",
+            "buys": "Buy cadence",
+            "filter": "Entry gate (simple filter)",
+            "logic": "Entry gate (logic builder)",
+            "alloc": "Allocation cap",
+            "risk": "Risk & exits (SL/TP + time/trail)",
+        }
+
         preset_map = {
             "Low": ("narrow", 300),
             "Medium": ("medium", 1000),
             "High": ("wide", 2000),
         }
-        width, n_default = preset_map[preset]
 
-        n = int(st.number_input("Number of variants", min_value=50, max_value=10000, value=int(n_default), step=50, key="new.n"))
-        seed = int(st.number_input("Random seed", min_value=1, max_value=10_000_000, value=1, step=1, key="new.seed"))
+        left, right = st.columns([0.62, 0.38], gap="large")
 
-                # Decide which vary-groups to expose based on the baseline entry mode.
-        entry_mode_ui = str(st.session_state.get("new.entry_mode", ""))
-        entry_group = "logic" if entry_mode_ui.startswith("Logic builder") else "filter"
+        with left:
+            st.markdown("##### Variation slots")
 
-        vary_groups = ["deposits", "buys", entry_group, "alloc", "risk"]
-        vary = list(vary_groups)
+            mode = st.radio(
+                "Generator",
+                options=[
+                    "Neighborhood stress test (around baseline)",
+                    "Random exploration (advanced)",
+                ],
+                index=0,
+                horizontal=True,
+                key="new.grid_mode",
+            )
 
-        LABELS = {
-            "deposits": "Deposits",
-            "buys": "Buys",
-            "filter": "Entry filter (simple)",
-            "logic": "Entry logic (builder)",
-            "alloc": "Allocation cap",
-            "risk": "Risk & exits (SL/TP + time/trail)",
-        }
+            preset = st.select_slider(
+                "Stress-test breadth",
+                options=["Low", "Medium", "High"],
+                value=str(st.session_state.get("new.stress_level", "Medium")),
+                key="new.stress_level",
+            )
+            width, n_default = preset_map[str(st.session_state.get("new.stress_level", "Medium"))]
 
-        logic_frac = float(st.session_state.get("new.logic_frac", 0.35))
-
-        if mode.startswith("Stress test"):
-            st.write("What should be allowed to vary around the baseline?")
-            cols = st.columns(len(vary_groups))
-            picks: List[str] = []
-            for i, g in enumerate(vary_groups):
-                with cols[i]:
-                    if st.checkbox(LABELS.get(g, g), value=True, key=f"new.vary.{g}"):
-                        picks.append(g)
-            vary = picks or ["deposits", "buys"]  # never allow empty
-
-        else:
-            # Random mode ignores vary/width/base; we do allow controlling the mix of logic-builder vs simple entry configs.
-            st.caption("Random mode explores a broader space. This slider controls how often the generator uses the logic-builder entry mode.")
-            logic_frac = float(st.slider("Logic-builder share", 0.0, 1.0, float(logic_frac), 0.05, key="new.logic_frac"))
-            vary = list(vary_groups)
-
-        # Preview
-        st.divider()
-        st.write("Preview (optional)")
-        if st.button("Generate a preview grid (first 25 configs)"):
-            try:
-                tmp_grid = tmp_dir / f"grid_preview_{_now_slug()}.jsonl"
-                base_path = _write_baseline_json(
-                    tmp_dir,
-                    strategy_name=st.session_state.get("new.strategy_name", "dca_swing"),
-                    side="long",
-                    params=st.session_state.get("new.baseline_params", {}),
+            # Core knob: how many variants total
+            n = int(
+                st.number_input(
+                    "Total variants",
+                    min_value=50,
+                    max_value=10000,
+                    value=int(st.session_state.get("new.n", n_default)),
+                    step=50,
+                    key="new.n",
                 )
-                grid_cmd: List[str] = [
-                    PY,
-                    st.session_state["new.grid_script"],
-                    "--out",
-                    str(tmp_grid),
-                    "--n",
-                    str(max(0, max(25, min(200, n)) - 1)),
-                    "--seed",
-                    str(seed),
-                ]
-                if not mode.startswith("Stress test"):
-                    grid_cmd += ["--logic-frac", str(float(st.session_state.get("new.logic_frac", 0.35)))]
-                if mode.startswith("Stress test"):
-                    grid_cmd += [
-                        "--mode",
-                        "neighborhood",
-                        "--base",
-                        str(base_path),
-                        "--width",
-                        str(width),
-                        "--vary",
-                        ",".join(vary),
-                    ]
+            )
+
+            # Slot: cadence
+            with st.container(border=True):
+                st.markdown("**Cadence**")
+                st.caption("Vary funding and/or buy schedule around the baseline.")
+                c1, c2 = st.columns(2)
+                with c1:
+                    vary_deposits = bool(st.checkbox(LABELS["deposits"], value=bool(st.session_state.get("new.vary.deposits", True)), key="new.vary.deposits"))
+                with c2:
+                    vary_buys = bool(st.checkbox(LABELS["buys"], value=bool(st.session_state.get("new.vary.buys", True)), key="new.vary.buys"))
+
+            # Slot: entry gate
+            with st.container(border=True):
+                st.markdown("**Entry gate**")
+                if str(mode).startswith("Random"):
+                    st.caption("Random mode explores a broader space. This controls how often the generator uses the logic-builder entry mode.")
+                    logic_frac = float(st.slider("Logic-builder share", 0.0, 1.0, float(st.session_state.get("new.logic_frac", 0.35)), 0.05, key="new.logic_frac"))
+                    vary_entry = True  # always varied in random mode
                 else:
-                    grid_cmd += ["--mode", "random"]
+                    st.caption("Vary the entry gate around the baseline (if enabled).")
+                    vary_entry = bool(st.checkbox(LABELS.get(entry_group, entry_group), value=bool(st.session_state.get(f"new.vary.{entry_group}", True)), key=f"new.vary.{entry_group}"))
+                    logic_frac = float(st.session_state.get("new.logic_frac", 0.35))
 
-                _run_cmd(grid_cmd, cwd=REPO_ROOT, label="Generate preview grid")
-                _ensure_grid_has_baseline(tmp_grid, base_path, total_n=max(25, min(200, n)))
-                rows = _load_jsonl(tmp_grid)[:25]
-                st.json(rows[:5])
-                st.caption(f"Preview grid rows: {len(rows)} (showing first 5)")
-            except Exception as e:
-                st.error(str(e))
+            # Slot: allocation
+            with st.container(border=True):
+                st.markdown("**Allocation**")
+                st.caption("Vary the max allocation cap (risk posture).")
+                vary_alloc = bool(st.checkbox(LABELS["alloc"], value=bool(st.session_state.get("new.vary.alloc", True)), key="new.vary.alloc"))
 
-        # Persist grid settings
-        st.session_state["new.grid_width"] = width
-        st.session_state["new.grid_n"] = n
-        st.session_state["new.grid_seed"] = seed
-        st.session_state["new.grid_vary"] = vary
-        st.session_state["new.grid_mode2"] = mode
-        st.session_state["new.logic_frac"] = float(st.session_state.get("new.logic_frac", 0.35))
+            # Slot: risk controls
+            with st.container(border=True):
+                st.markdown("**Risk & exits**")
+                st.caption("Vary stop/take-profit and optional time/trailing exits.")
+                vary_risk = bool(st.checkbox(LABELS["risk"], value=bool(st.session_state.get("new.vary.risk", True)), key="new.vary.risk"))
+
+            # Build vary list deterministically
+            vary_groups: List[str] = []
+            if vary_deposits:
+                vary_groups.append("deposits")
+            if vary_buys:
+                vary_groups.append("buys")
+            if vary_entry:
+                vary_groups.append(entry_group)
+            if vary_alloc:
+                vary_groups.append("alloc")
+            if vary_risk:
+                vary_groups.append("risk")
+
+            if not vary_groups:
+                vary_groups = ["deposits", "buys"]  # never allow empty
+
+            # Persist grid settings
+            st.session_state["new.grid_width"] = width
+            st.session_state["new.grid_n"] = n
+            st.session_state["new.grid_vary"] = list(vary_groups)
+            st.session_state["new.grid_mode2"] = str(mode)
+            st.session_state["new.logic_frac"] = float(logic_frac)
+
+            # Preview + advanced
+            # Ensure a seed exists even if the advanced panel is never opened.
+            st.session_state["new.grid_seed"] = int(st.session_state.get("new.seed", 1))
+            with st.expander("Advanced (seed, preview grid)", expanded=False):
+                seed = int(st.number_input("Random seed", min_value=1, max_value=10_000_000, value=int(st.session_state.get("new.seed", 1)), step=1, key="new.seed"))
+                st.session_state["new.grid_seed"] = seed
+
+                st.divider()
+                st.write("Preview (optional)")
+                if st.button("Generate a preview grid (first 25 configs)"):
+                    try:
+                        tmp_grid = tmp_dir / f"grid_preview_{_now_slug()}.jsonl"
+                        base_path = _write_baseline_json(
+                            tmp_dir,
+                            strategy_name=st.session_state.get("new.strategy_name", "dca_swing"),
+                            side="long",
+                            params=st.session_state.get("new.baseline_params", {}),
+                        )
+                        grid_cmd: List[str] = [
+                            PY,
+                            st.session_state["new.grid_script"],
+                            "--out",
+                            str(tmp_grid),
+                            "--n",
+                            str(max(0, max(25, min(200, n)) - 1)),
+                            "--seed",
+                            str(seed),
+                        ]
+                        if str(mode).startswith("Random"):
+                            grid_cmd += ["--mode", "random", "--logic-frac", str(float(st.session_state.get("new.logic_frac", 0.35)))]
+                        else:
+                            grid_cmd += [
+                                "--mode",
+                                "neighborhood",
+                                "--base",
+                                str(base_path),
+                                "--width",
+                                str(width),
+                                "--vary",
+                                ",".join(vary_groups),
+                            ]
+
+                        _run_cmd(grid_cmd, cwd=REPO_ROOT, label="Generate preview grid")
+                        _ensure_grid_has_baseline(tmp_grid, base_path, total_n=max(25, min(200, n)))
+                        rows = _load_jsonl(tmp_grid)[:25]
+                        st.json(rows[:5])
+                        st.caption(f"Preview grid rows: {len(rows)} (showing first 5)")
+                    except Exception as e:
+                        st.error(str(e))
+
+        with right:
+            st.markdown("##### Grid size & cost")
+            mode_short = "Neighborhood" if not str(mode).startswith("Random") else "Random"
+            st.caption(f"Generator: **{mode_short}** · Width: **{width}**")
+
+            # Simple compute-load meter (cost framing only)
+            if n <= 400:
+                load = "Low"
+                score = n / 400
+            elif n <= 1500:
+                load = "Medium"
+                score = (n - 400) / (1500 - 400)
+            else:
+                load = "High"
+                score = min(1.0, (n - 1500) / (3500 - 1500))
+            st.metric("Estimated variants", f"{n:,}")
+            st.metric("Compute load", load)
+            st.progress(min(1.0, max(0.05, float(score))))
+
+            st.divider()
+            st.markdown("##### Varying")
+            pretty = [LABELS.get(g, g) for g in vary_groups]
+            st.write("• " + "\n• ".join(pretty))
 
         colL, colR = st.columns(2)
         with colL:
@@ -3353,7 +3928,8 @@ if open_existing == "(new run)":
                 st.session_state["new.step"] = 3
                 st.rerun()
 
-    # -------------------------------------------------------------------------
+
+# -------------------------------------------------------------------------
     # Step 3: Run batch
     # -------------------------------------------------------------------------
     elif step == 3:
