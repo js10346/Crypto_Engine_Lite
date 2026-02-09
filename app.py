@@ -170,7 +170,7 @@ st.set_page_config(page_title="Spot Strategy Stress Lab", layout="wide")
 st.markdown(
     """
 <style>
-.sticky-preview { position: sticky; top: 1rem; }
+.sticky-preview { position: sticky; top: 5.25rem; max-height: calc(100vh - 6.5rem); overflow: auto; padding-bottom: 12px; }
 </style>
 """,
     unsafe_allow_html=True,
@@ -205,6 +205,548 @@ def _fmt_pct(x: Any, *, digits: int = 2) -> str:
     except Exception:
         return "n/a"
 
+
+# =============================================================================
+# Plan blueprint helpers (copy/paste)
+# =============================================================================
+
+def _blank_dca_plan_blueprint() -> Dict[str, Any]:
+    """Portable, mechanics-only JSON skeleton for the baseline plan.
+
+    Notes
+    - This is a *mechanics* blueprint (cadence, gating, sizing, exits). It is not a performance claim.
+    - Unknown keys are ignored on import (forward compatible).
+    - `buy_filter` expects the *internal key* (e.g. "none"), not the human label.
+    - For `entry_mode="builder"`, populate `entry_logic` as:
+        {
+          "regime": [ {"indicator": "close", "operator": "<=", "threshold": "ema_200"}, ... ],
+          "clauses": [
+             [ {"indicator": "rsi_14", "operator": "<=", "threshold": 30}, ... ],
+             ...
+          ]
+        }
+      (Each clause is AND; the clause list is OR-of-AND.)
+    """
+    return {
+        "version": 1,
+        "strategy": "dca_swing",
+        "market": "spot",
+        "side": "long",  # spot only (no leverage)
+
+        # Funding / buy cadence (one of: none, daily, weekly, monthly)
+        "deposit_freq": "weekly",
+        "deposit_amount_usd": 50.0,
+        "buy_freq": "weekly",
+        "buy_amount_usd": 50.0,
+
+        # Entry gating
+        "entry_mode": "simple",          # simple | builder
+        "buy_filter": "none",            # none | below_ema | rsi_oversold | macd_bullish | bb_z_low | adx_trend | donch_pullback
+
+        # Simple filter knobs (used by some filters)
+        "ema_len": 200,
+        "rsi_thr": 30,
+        "macd_hist_thr": 0.0,
+        "bb_z_thr": -1.0,
+        "adx_thr": 20.0,
+        "donch_pos_thr": 0.2,
+
+        # Builder logic (optional). Used when entry_mode=builder.
+        "entry_logic": {"regime": [], "clauses": []},
+
+        # Allocation + exits
+        "max_alloc_pct": 1.0,
+        "stop_loss_pct": 0.0,
+        "take_profit_pct": 0.0,
+        "time_stop_bars": 0,
+        "trailing_stop_pct": 0.0,
+
+        # Optional advanced exit / cash behavior
+        "tp_sell_fraction": 1.0,  # fraction of position to sell on TP (1.0 = full)
+        "reserve_frac": 0.0,      # fraction of equity to keep uninvested (0.0 = none)
+    }
+
+
+
+def _apply_dca_plan_blueprint(bp: Dict[str, Any]) -> Tuple[bool, str]:
+    """Best-effort: apply a pasted plan blueprint into Streamlit session state.
+
+    This intentionally prioritizes *mechanics* fields and ignores unknown keys.
+    """
+    if not isinstance(bp, dict):
+        return False, "Blueprint must be a JSON object (top-level dictionary)."
+
+    def _pick(*keys, default=None):
+        for k in keys:
+            if k in bp:
+                return bp[k]
+        return default
+
+    # Cadence / cash-in
+    dep_freq = str(_pick("deposit_freq", "deposit_frequency", default="weekly") or "weekly").lower()
+    buy_freq = str(_pick("buy_freq", "buy_frequency", default="weekly") or "weekly").lower()
+    dep_freq = dep_freq if dep_freq in {"none", "daily", "weekly", "monthly"} else "weekly"
+    buy_freq = buy_freq if buy_freq in {"none", "daily", "weekly", "monthly"} else "weekly"
+
+    st.session_state["new.deposit_freq"] = dep_freq
+    st.session_state["new.buy_freq"] = buy_freq
+
+    try:
+        # Normalize legacy / friendly inputs (keep imports resilient).
+        if isinstance(bp, dict):
+            bf = bp.get("buy_filter")
+            if isinstance(bf, str):
+                _bf_label_to_key = {
+                    "Always buy (no filter)": "none",
+                    "Buy dips below EMA": "below_ema",
+                    "RSI oversold": "rsi_oversold",
+                    "Momentum (MACD bullish)": "macd_bullish",
+                    "Bollinger z low": "bb_z_low",
+                    "Trend strength (ADX)": "adx_trend",
+                    "Donchian pullback": "donch_pullback",
+                }
+                if bf in _bf_label_to_key:
+                    bp = dict(bp)
+                    bp["buy_filter"] = _bf_label_to_key[bf]
+
+            em = bp.get("entry_mode")
+            if isinstance(em, str):
+                _em_norm = {
+                    "logic_builder": "builder",
+                    "logic": "builder",
+                    "builder": "builder",
+                    "simple": "simple",
+                }.get(em.strip().lower(), em)
+                if _em_norm != em:
+                    bp = dict(bp)
+                    bp["entry_mode"] = _em_norm
+
+        st.session_state["new.deposit_amount"] = float(_pick("deposit_amount_usd", "deposit_amount", default=50.0) or 0.0)
+    except Exception:
+        pass
+    try:
+        st.session_state["new.buy_amount"] = float(_pick("buy_amount_usd", "buy_amount", default=50.0) or 0.0)
+    except Exception:
+        pass
+
+    # Entry mode
+    em = str(_pick("entry_mode", default="simple") or "simple").lower()
+    wants_builder = em.startswith("b") or ("builder" in em) or ("logic" in em)
+
+    entry_logic = _pick("entry_logic", default=None)
+    if wants_builder and isinstance(entry_logic, dict) and (entry_logic.get("regime") or entry_logic.get("clauses")):
+        st.session_state["new.entry_mode"] = "Logic builder (regime + triggers)"
+        st.session_state["new.blueprint_entry_logic"] = entry_logic
+    else:
+        st.session_state["new.entry_mode"] = "Simple (one filter)"
+        st.session_state["new.blueprint_entry_logic"] = None
+
+    # Simple filter (TradingView-style)
+    bf = _pick("buy_filter", default=None)
+    if isinstance(bf, str) and bf.strip():
+        st.session_state["new.buy_filter"] = bf.strip()
+
+    # Filter knobs
+    for k_src, k_state in [
+        ("ema_len", "new.ema_len"),
+        ("rsi_thr", "new.rsi_thr"),
+        ("macd_hist_thr", "new.macd_hist_thr"),
+        ("bb_z_thr", "new.bb_z_thr"),
+        ("adx_thr", "new.adx_thr"),
+        ("donch_pos_thr", "new.donch_pos_thr"),
+    ]:
+        if k_src in bp:
+            try:
+                st.session_state[k_state] = float(bp[k_src]) if k_src != "ema_len" else int(bp[k_src])
+            except Exception:
+                pass
+
+    # Allocation + exits
+    try:
+        st.session_state["new.max_alloc_pct"] = float(_pick("max_alloc_pct", default=1.0) or 1.0)
+    except Exception:
+        pass
+
+    # Optional cash reserve + partial TP selling (if exposed/used)
+    try:
+        _rf = _pick("reserve_frac", default=None)
+        if _rf is not None:
+            st.session_state["new.reserve_frac"] = max(0.0, min(1.0, float(_rf)))
+    except Exception:
+        pass
+    try:
+        _tsf = _pick("tp_sell_fraction", "take_profit_sell_fraction", default=None)
+        if _tsf is not None:
+            st.session_state["new.tp_sell_frac"] = max(0.0, min(1.0, float(_tsf)))
+    except Exception:
+        pass
+
+
+    try:
+        st.session_state["new.sl_pct_ui"] = float(_pick("stop_loss_pct", "sl_pct", default=0.0) or 0.0)
+    except Exception:
+        pass
+    try:
+        st.session_state["new.tp_pct_ui"] = float(_pick("take_profit_pct", "tp_pct", default=0.0) or 0.0)
+    except Exception:
+        pass
+    try:
+        st.session_state["new.max_hold_bars"] = int(_pick("time_stop_bars", "max_hold_bars", default=0) or 0)
+    except Exception:
+        pass
+    try:
+        st.session_state["new.trail_pct_ui"] = float(_pick("trailing_stop_pct", "trail_pct", default=0.0) or 0.0)
+    except Exception:
+        pass
+
+    return True, "Blueprint applied."
+
+def _blueprint_spec_text() -> str:
+    """Human-readable spec for the portable plan blueprint (v1).
+
+    This is intentionally written for copy/paste into other tools.
+    Keep it aligned with _apply_dca_plan_blueprint() + the builder UI.
+    """
+    return """\
+PLAN BLUEPRINT SPEC (v1)
+
+Intent
+- Portable JSON describing *mechanics* for a spot-only, long-only DCA/Swing plan.
+- This is NOT a performance model and NOT a recommendation.
+
+Top-level (required on import; missing values are defaulted)
+- version: 1
+- strategy: "dca_swing"
+- market: "spot"
+- side: "long"
+
+Schedules
+- deposit_freq: "none" | "daily" | "weekly" | "monthly"
+- deposit_amount_usd: number (>= 0)
+- buy_freq: "none" | "daily" | "weekly" | "monthly"
+- buy_amount_usd: number (>= 0)
+
+Entry gate
+- entry_mode: "simple" | "builder"
+- buy_filter (used when entry_mode="simple"):
+    - "none"             : always allow scheduled buys
+    - "below_ema"        : allow only when close <= EMA(ema_len)
+    - "rsi_below"        : allow only when RSI(14) <= rsi_thr
+    - "bb_z_below"       : allow only when BB z-score(20) <= bb_z_thr
+    - "macd_bull"        : allow only when MACD histogram >= macd_hist_thr
+    - "adx_above"        : allow only when ADX(14) >= adx_thr
+    - "donch_pos_below"  : allow only when Donchian position(20) <= donch_pos_thr
+  Notes:
+  - Import also accepts older/human labels for buy_filter; they will be normalized.
+
+Simple-gate knobs (used depending on buy_filter)
+- ema_len: 10 | 20 | 50 | 100 | 200
+- rsi_thr: number (0..100)
+- macd_hist_thr: number
+- bb_z_thr: number
+- adx_thr: number
+- donch_pos_thr: number (0..1)
+
+Builder-gate grammar (used when entry_mode="builder")
+- entry_logic:
+    - regime: 0..2 Conditions (AND)
+    - clauses: 0..3 Clauses (OR-of-AND)
+        - each Clause is 1..3 Conditions (AND)
+- Condition object:
+    - indicator: string
+    - operator: "<=" | "<" | ">=" | ">"
+    - threshold: number OR string reference (see below)
+  Supported indicator vocabulary (current UI):
+    - "close"
+    - "rsi_14"
+    - "adx_14"
+    - "bb_z_20"
+    - "macd_hist"
+    - "donch_pos_20"
+  Supported reference thresholds:
+    - "ema_<LEN>" (string), where <LEN> matches ema_len (e.g., "ema_200")
+  Notes:
+    - The UI currently uses "close <= ema_<LEN>" for EMA regime gates.
+    - Unknown indicators may be rejected or treated as inactive depending on dataset availability.
+
+Allocation & reserves
+- max_alloc_pct: number (0..1)    # fraction of equity allowed to be invested
+- reserve_frac: number (0..1)     # fraction held in cash (reduces max investable)
+
+Exit controls (0 disables)
+- stop_loss_pct: number (>= 0)        # percent from entry
+- take_profit_pct: number (>= 0)      # percent from entry
+- tp_sell_fraction: number (0..1)     # fraction sold on take-profit
+- time_stop_bars: integer (>= 0)      # max holding period in bars
+- trailing_stop_pct: number (>= 0)    # percent from peak
+
+Import behavior
+- Missing keys: defaulted
+- Extra keys: ignored
+- Types: coerced where safe (e.g., strings to floats)
+"""
+
+
+
+def _collect_dca_plan_state():
+    """Return a portable snapshot of the current DCA/Swing plan knobs (mechanics-only)."""
+    ss = st.session_state
+
+    def g(key, default=None):
+        return ss.get(key, default)
+
+    def _to_float(x, default=0.0):
+        try:
+            if x is None:
+                return float(default)
+            return float(x)
+        except Exception:
+            return float(default)
+
+    def _to_int(x, default=0):
+        try:
+            if x is None:
+                return int(default)
+            return int(float(x))
+        except Exception:
+            return int(default)
+
+    # Start from the blank blueprint (ensures full coverage / stable keys)
+    bp = _blank_dca_plan_blueprint()
+
+    # Entry mode (UI stores a label)
+    em_ui = g("new.entry_mode", "Simple (one filter)")
+    em_ui_s = (str(em_ui) if em_ui is not None else "").lower()
+    entry_mode = "builder" if "builder" in em_ui_s else "simple"
+
+    bp.update(
+        {
+            "deposit_freq": g("new.deposit_freq", bp.get("deposit_freq", "weekly")),
+            "deposit_amount_usd": _to_float(g("new.deposit_amount", bp.get("deposit_amount_usd", 50.0)), bp.get("deposit_amount_usd", 50.0)),
+            "buy_freq": g("new.buy_freq", bp.get("buy_freq", "weekly")),
+            "buy_amount_usd": _to_float(g("new.buy_amount", bp.get("buy_amount_usd", 50.0)), bp.get("buy_amount_usd", 50.0)),
+            "entry_mode": entry_mode,
+            "buy_filter": g("new.buy_filter", bp.get("buy_filter", "none")),
+            "ema_len": _to_int(g("new.ema_len", bp.get("ema_len", 200)), bp.get("ema_len", 200)),
+            "rsi_thr": _to_float(g("new.rsi_thr", bp.get("rsi_thr", 30.0)), bp.get("rsi_thr", 30.0)),
+            "macd_hist_thr": _to_float(g("new.macd_hist_thr", bp.get("macd_hist_thr", 0.0)), bp.get("macd_hist_thr", 0.0)),
+            "bb_z_thr": _to_float(g("new.bb_z_thr", bp.get("bb_z_thr", -1.0)), bp.get("bb_z_thr", -1.0)),
+            "adx_thr": _to_float(g("new.adx_thr", bp.get("adx_thr", 20.0)), bp.get("adx_thr", 20.0)),
+            "donch_pos_thr": _to_float(g("new.donch_pos_thr", bp.get("donch_pos_thr", 0.2)), bp.get("donch_pos_thr", 0.2)),
+            "max_alloc_pct": _to_float(g("new.max_alloc_pct", bp.get("max_alloc_pct", 1.0)), bp.get("max_alloc_pct", 1.0)),
+            # exits / risk controls (UI keys store % in "ui" space)
+            "stop_loss_pct": _to_float(g("new.sl_pct_ui", bp.get("stop_loss_pct", 0.0)), bp.get("stop_loss_pct", 0.0)),
+            "take_profit_pct": _to_float(g("new.tp_pct_ui", bp.get("take_profit_pct", 0.0)), bp.get("take_profit_pct", 0.0)),
+            "time_stop_bars": _to_int(g("new.max_hold_bars", bp.get("time_stop_bars", 0)), bp.get("time_stop_bars", 0)),
+            "trailing_stop_pct": _to_float(g("new.trail_pct_ui", bp.get("trailing_stop_pct", 0.0)), bp.get("trailing_stop_pct", 0.0)),
+            # misc knobs
+            "tp_sell_fraction": _to_float(g("new.tp_sell_frac", bp.get("tp_sell_fraction", 1.0)), bp.get("tp_sell_fraction", 1.0)),
+            "reserve_frac": _to_float(g("new.reserve_frac", bp.get("reserve_frac", 0.0)), bp.get("reserve_frac", 0.0)),
+        }
+    )
+
+    def _read_cond(prefix: str):
+        t = g(f"{prefix}.type", "—")
+        if t in (None, "—", "(disabled)", "(none)", ""):
+            return None
+
+        op = g(f"{prefix}.op", "<=")
+
+        if t == "Price vs EMA":
+            ema_len = _to_int(g(f"{prefix}.ema_len", 200), 200)
+            return {"indicator": "close", "operator": op, "threshold": f"ema_{ema_len}"}
+
+        # indicator id is stored directly for non-EMA conditions (e.g. rsi_14, adx_14, bb_z_20, donch_pos_20)
+        thr = g(f"{prefix}.thr", None)
+        if thr is None:
+            thr = 0.0
+        # keep ints as ints if they were entered as ints
+        try:
+            thr_f = float(thr)
+            thr_out = int(thr_f) if abs(thr_f - int(thr_f)) < 1e-12 else thr_f
+        except Exception:
+            thr_out = thr
+
+        return {"indicator": t, "operator": op, "threshold": thr_out}
+
+    if entry_mode == "builder":
+        regime = []
+        for i in (1, 2):
+            c = _read_cond(f"new.regime{i}")
+            if c:
+                regime.append(c)
+
+        clauses = []
+        for ci in (1, 2, 3):
+            conds = []
+            for cj in (1, 2, 3):
+                c = _read_cond(f"new.clause{ci}.cond{cj}")
+                if c:
+                    conds.append(c)
+            if conds:
+                clauses.append(conds)
+
+        bp["entry_logic"] = {"regime": regime, "clauses": clauses}
+    else:
+        bp["entry_logic"] = {"regime": [], "clauses": []}
+
+    return bp
+
+
+def _apply_dca_plan_blueprint(bp: dict) -> None:
+    """Apply a plan blueprint into Streamlit session state (mechanics-only)."""
+    if not isinstance(bp, dict):
+        return
+
+    ss = st.session_state
+
+    def _to_float(x, default=0.0):
+        try:
+            if x is None:
+                return float(default)
+            return float(x)
+        except Exception:
+            return float(default)
+
+    def _to_int(x, default=0):
+        try:
+            if x is None:
+                return int(default)
+            return int(float(x))
+        except Exception:
+            return int(default)
+
+    # Core
+    ss["new.deposit_freq"] = bp.get("deposit_freq", ss.get("new.deposit_freq", "weekly"))
+    ss["new.deposit_amount"] = _to_float(bp.get("deposit_amount_usd", ss.get("new.deposit_amount", 50.0)), ss.get("new.deposit_amount", 50.0))
+    ss["new.buy_freq"] = bp.get("buy_freq", ss.get("new.buy_freq", "weekly"))
+    ss["new.buy_amount"] = _to_float(bp.get("buy_amount_usd", ss.get("new.buy_amount", 50.0)), ss.get("new.buy_amount", 50.0))
+
+    # Entry mode: store the UI label (the radio uses labels)
+    entry_mode = str(bp.get("entry_mode", "simple")).lower().strip()
+    ss["new.entry_mode"] = "Logic builder (regime + triggers)" if entry_mode == "builder" else "Simple (one filter)"
+
+    # Simple filter id (stored directly)
+    ss["new.buy_filter"] = bp.get("buy_filter", ss.get("new.buy_filter", "none"))
+
+    # Shared thresholds
+    ss["new.ema_len"] = _to_int(bp.get("ema_len", ss.get("new.ema_len", 200)), ss.get("new.ema_len", 200))
+    ss["new.rsi_thr"] = _to_float(bp.get("rsi_thr", ss.get("new.rsi_thr", 30.0)), ss.get("new.rsi_thr", 30.0))
+    ss["new.macd_hist_thr"] = _to_float(bp.get("macd_hist_thr", ss.get("new.macd_hist_thr", 0.0)), ss.get("new.macd_hist_thr", 0.0))
+    ss["new.bb_z_thr"] = _to_float(bp.get("bb_z_thr", ss.get("new.bb_z_thr", -1.0)), ss.get("new.bb_z_thr", -1.0))
+    ss["new.adx_thr"] = _to_float(bp.get("adx_thr", ss.get("new.adx_thr", 20.0)), ss.get("new.adx_thr", 20.0))
+    ss["new.donch_pos_thr"] = _to_float(bp.get("donch_pos_thr", ss.get("new.donch_pos_thr", 0.2)), ss.get("new.donch_pos_thr", 0.2))
+
+    # Allocation / misc
+    ss["new.max_alloc_pct"] = _to_float(bp.get("max_alloc_pct", ss.get("new.max_alloc_pct", 1.0)), ss.get("new.max_alloc_pct", 1.0))
+    ss["new.reserve_frac"] = _to_float(bp.get("reserve_frac", ss.get("new.reserve_frac", 0.0)), ss.get("new.reserve_frac", 0.0))
+    ss["new.tp_sell_frac"] = _to_float(bp.get("tp_sell_fraction", ss.get("new.tp_sell_frac", 1.0)), ss.get("new.tp_sell_frac", 1.0))
+
+    # Exits (UI space)
+    ss["new.sl_pct_ui"] = _to_float(bp.get("stop_loss_pct", ss.get("new.sl_pct_ui", 0.0)), ss.get("new.sl_pct_ui", 0.0))
+    ss["new.tp_pct_ui"] = _to_float(bp.get("take_profit_pct", ss.get("new.tp_pct_ui", 0.0)), ss.get("new.tp_pct_ui", 0.0))
+    ss["new.max_hold_bars"] = _to_int(bp.get("time_stop_bars", ss.get("new.max_hold_bars", 0)), ss.get("new.max_hold_bars", 0))
+    ss["new.trail_pct_ui"] = _to_float(bp.get("trailing_stop_pct", ss.get("new.trail_pct_ui", 0.0)), ss.get("new.trail_pct_ui", 0.0))
+
+    # Builder logic: hand off to the UI prefill mechanism (so the UI keys match _cond_ui)
+    entry_logic = bp.get("entry_logic") or {"regime": [], "clauses": []}
+    ss["new.blueprint_entry_logic"] = entry_logic
+
+
+
+def _render_plan_blueprint_import_ui() -> None:
+    with st.expander("Plan blueprint (copy/paste)", expanded=False):
+        st.caption("Portable JSON you can copy, edit, and paste back in. Mechanics-only (not recommendations).")
+
+        tab_bp, tab_spec = st.tabs(["Blueprint", "Blueprint spec"])
+
+        with tab_bp:
+            st.markdown("**Blank blueprint**")
+            st.code(json.dumps(_blank_dca_plan_blueprint(), indent=2), language="json")
+
+            with st.expander("Builder example (copy/paste)", expanded=False):
+                ex = _blank_dca_plan_blueprint()
+                ex["entry_mode"] = "builder"
+                ex["entry_logic"] = {
+                    "regime": [{"indicator": "close", "operator": "<=", "threshold": "ema_200"}],
+                    "clauses": [
+                        [
+                            {"indicator": "rsi_14", "operator": "<=", "threshold": 30},
+                            {"indicator": "bb_z_20", "operator": "<=", "threshold": -1.0},
+                        ],
+                        [
+                            {"indicator": "adx_14", "operator": ">=", "threshold": 20},
+                        ],
+                    ],
+                }
+                st.code(json.dumps(ex, indent=2), language="json")
+
+            st.markdown("**Paste blueprint JSON to load**")
+            # Text area state: initialize once, mutate via callbacks (Streamlit forbids post-widget mutation in the same run)
+            if "plan_blueprint_paste" not in st.session_state:
+                st.session_state["plan_blueprint_paste"] = ""
+
+            def _clear_plan_blueprint_paste():
+                st.session_state["plan_blueprint_paste"] = ""
+            bp_text = st.text_area(
+                "Blueprint JSON",
+                height=220,
+                placeholder='Paste JSON here (must be an object). Example: {"deposit_freq":"weekly", ... }',
+                key="plan_blueprint_paste",
+            )
+
+
+            cols = st.columns([1, 1, 2])
+            with cols[0]:
+                if st.button("Load blueprint", type="primary", use_container_width=True):
+                                        # Parse (lenient) and merge with defaults, then apply to widget state
+                    _s = (bp_text or "").strip()
+                    if _s.startswith("```"):
+                        _s = re.sub(r"^```[a-zA-Z]*\n|\n```$", "", _s.strip(), flags=re.S)
+                    # Allow pasting a JSON fragment without surrounding braces
+                    if _s and (not _s.startswith("{")) and (not _s.startswith("[")):
+                        _s = "{" + _s
+                    if _s and _s.startswith("{") and (not _s.endswith("}")):
+                        _s = _s + "}"
+                    try:
+                        _data = json.loads(_s) if _s else None
+                    except Exception as _e:
+                        _data = None
+                        st.error(f"Invalid blueprint JSON: {_e}")
+                    if isinstance(_data, dict):
+                        _bp = _blank_dca_plan_blueprint()
+                        _bp.update(_data)
+                        _apply_dca_plan_blueprint(_bp)
+                        st.success("Loaded blueprint into the build.")
+                        # No explicit rerun needed; the button click already triggers a rerun.
+                    else:
+                        st.error("Blueprint must be a JSON object (e.g., { ... }).")
+            with cols[1]:
+                st.button("Clear", use_container_width=True, on_click=_clear_plan_blueprint_paste)
+
+            st.divider()
+            st.markdown("**Export current page state as blueprint**")
+            cur = _collect_dca_plan_state()
+            st.code(json.dumps(cur, indent=2), language="json")
+
+        with tab_spec:
+            st.markdown("**Blueprint spec (v1)**")
+            st.caption("Field definitions + allowed values for power users and external tooling. Mechanics-only.")
+            spec = _blueprint_spec_text()
+            st.code(spec, language="text")
+            st.download_button(
+                "Download spec",
+                data=spec.encode("utf-8"),
+                file_name="plan_blueprint_spec_v1.txt",
+                mime="text/plain",
+                use_container_width=False,
+            )
+
+
+
+def _render_current_plan_blueprint(params: Dict[str, Any]) -> None:
+    with st.expander("Current plan blueprint (copy)", expanded=False):
+        st.code(json.dumps(params, indent=2), language="json")
 
 def _fmt_num(x: Any, *, digits: int = 4) -> str:
     try:
@@ -2645,188 +3187,140 @@ def build_dca_baseline_params() -> Dict[str, Any]:
             st.markdown("\n".join(checklist_lines))
             st.markdown("---")
 
-            # --- Text summary (fast scan) ---
-            st.markdown(f"**Funding:** {deposit_freq} · ${int(round(float(deposit_amount)))}")
-            st.markdown(f"**Buys:** {buy_freq} · ${int(round(float(buy_amount)))}")
-            st.markdown(f"**Entry gate:** {gate_label.replace('Gate: ', '') if isinstance(gate_label, str) else gate_label}")
-            st.markdown(f"**Allocation cap:** {_fmt_pct(float(max_alloc_pct), digits=0)}")
+                        # --- Event flow (mechanics only; no simulation) ---
+            st.markdown("**How this build executes (event flow)**")
+            st.caption(
+                "Mechanics-only flow derived from your current knobs (spot only, no leverage). "
+                "This is not a performance estimate."
+            )
 
-            exits = []
-            if sl_pct > 0:
-                exits.append(f"SL {sl_pct*100:.1f}%")
-            if tp_pct > 0:
-                exits.append(f"TP {tp_pct*100:.1f}%")
-            if max_hold_bars > 0:
-                exits.append(f"Time {max_hold_bars} bars")
-            if trail_pct > 0:
-                exits.append(f"Trail {trail_pct*100:.1f}%")
-            st.markdown("**Exits:** " + (", ".join(exits) if exits else "None"))
-
-            # --- Helpers for preview visuals ---
-            def _extract_dt_series(_df: Optional[pd.DataFrame]) -> Optional[pd.Series]:
-                if _df is None or getattr(_df, "empty", True):
-                    return None
-                try:
-                    cols = [str(c).strip().lower() for c in list(_df.columns)]
-                except Exception:
-                    cols = []
-                try:
-                    if "dt" in cols:
-                        s = pd.to_datetime(_df.iloc[:200_000, cols.index("dt")], errors="coerce")
-                    elif "date" in cols:
-                        s = pd.to_datetime(_df.iloc[:200_000, cols.index("date")], errors="coerce")
-                    elif "datetime" in cols:
-                        s = pd.to_datetime(_df.iloc[:200_000, cols.index("datetime")], errors="coerce")
-                    elif "ts" in cols:
-                        raw = pd.to_numeric(_df.iloc[:200_000, cols.index("ts")], errors="coerce")
-                        # Heuristic: ms epoch if values are large
-                        s = pd.to_datetime(raw, unit="ms", errors="coerce")
-                        if s.isna().all():
-                            s = pd.to_datetime(raw, unit="s", errors="coerce")
-                    else:
-                        # If index is datetime-like
-                        if isinstance(getattr(_df, "index", None), pd.DatetimeIndex):
-                            s = pd.Series(_df.index[:200_000])
+            def _cond_to_text(cond: Optional[Dict[str, Any]]) -> str:
+                if not isinstance(cond, dict):
+                    return ""
+                ind = str(cond.get("indicator", "")).strip()
+                op = str(cond.get("operator", "")).strip()
+                ref = str(cond.get("ref_indicator", "")).strip()
+                thr = cond.get("threshold", None)
+                if ref:
+                    # e.g. close <= ema_200
+                    return f"{ind} {op} {ref}".strip()
+                if thr is not None and ind and op:
+                    try:
+                        thr_f = float(thr)
+                        # tighter formatting for common indicators
+                        if abs(thr_f) >= 10:
+                            thr_s = f"{thr_f:.0f}"
+                        elif abs(thr_f) >= 1:
+                            thr_s = f"{thr_f:.2f}"
                         else:
-                            return None
-                    s = s.dropna()
-                    return s if len(s) else None
-                except Exception:
-                    return None
+                            thr_s = f"{thr_f:.3f}"
+                    except Exception:
+                        thr_s = str(thr)
+                    return f"{ind} {op} {thr_s}".strip()
+                return ind or "condition"
 
-            def _daily_anchor_points(dt_s: pd.Series) -> pd.Series:
-                # First bar timestamp per day (anchors schedules to dataset dates deterministically).
-                dt_s = pd.to_datetime(dt_s, errors="coerce").dropna()
-                if dt_s.empty:
-                    return dt_s
-                dt_s = dt_s.sort_values()
-                d = dt_s.dt.floor("D")
+            def _gate_detail_html() -> str:
+                # entry_mode / buy_filter / entry_logic are in-scope from the baseline builder
                 try:
-                    first = dt_s.groupby(d).min()
-                    out = pd.Series(first.values)
-                    out = pd.to_datetime(out, errors="coerce").dropna()
-                    return out.sort_values()
+                    if not entry_ok:
+                        return "no gate (always executes on schedule)"
+                    # Simple mode
+                    if str(entry_mode).startswith("Simple"):
+                        lbl = FILTER_LABELS.get(str(buy_filter), str(buy_filter))
+                        # Keep it neutral / mechanical
+                        if str(buy_filter) == "none":
+                            return "no gate (always executes on schedule)"
+                        return f"{lbl}"
+                    # Builder mode
+                    if isinstance(entry_logic, dict):
+                                                import html as _html
+                                                def _clean(_s: str) -> str:
+                                                    return " ".join(str(_s).split())
+                                                def _short(_s: str, n: int = 90) -> str:
+                                                    _s = _clean(_s)
+                                                    if len(_s) <= n:
+                                                        return _html.escape(_s)
+                                                    # Tooltip contains the full (escaped) expression
+                                                    return f"<span title='{_html.escape(_s, quote=True)}'>{_html.escape(_s[:max(0, n-1)])}…</span>"
+
+                                                reg = entry_logic.get("regime") or []
+                                                clauses = entry_logic.get("clauses") or []
+                                                reg_txt_full = " AND ".join([_cond_to_text(c) for c in reg if c]) or "none"
+
+                                                clause_txts = []
+                                                for cl in clauses:
+                                                    if not cl:
+                                                        continue
+                                                    clause_txts.append("(" + " AND ".join([_cond_to_text(c) for c in cl if c]) + ")")
+                                                trig_txt_full = " OR ".join(clause_txts) if clause_txts else "none"
+
+                                                # If user picked builder mode but hasn't set conditions, make that explicit.
+                                                if reg_txt_full == "none" and trig_txt_full == "none":
+                                                    return "gate enabled (no conditions set)"
+
+                                                reg_txt = _short(reg_txt_full, 85)
+                                                trig_txt = _short(trig_txt_full, 85)
+                                                return f"<b>Regime</b>: {reg_txt}<br/><b>Triggers</b>: {trig_txt}"
                 except Exception:
-                    # Fallback: drop duplicates by day
-                    tmp = pd.DataFrame({"dt": dt_s.values})
-                    tmp["day"] = pd.to_datetime(tmp["dt"]).dt.floor("D")
-                    tmp = tmp.drop_duplicates("day", keep="first")
-                    return pd.to_datetime(tmp["dt"]).sort_values()
+                    pass
+                return "enabled"
 
-            def _schedule_points(freq: str, daily_pts: pd.Series) -> pd.Series:
-                freq = str(freq or "").lower().strip()
-                if daily_pts is None or daily_pts.empty:
-                    return pd.Series(dtype="datetime64[ns]")
-                if freq == "none":
-                    return pd.Series(dtype="datetime64[ns]")
-                if freq == "daily":
-                    return daily_pts
-                if freq == "weekly":
-                    return daily_pts.iloc[::7]
-                if freq == "monthly":
-                    try:
-                        return daily_pts.groupby(daily_pts.dt.to_period("M")).min().sort_values()
-                    except Exception:
-                        return daily_pts
-                return daily_pts
+            def _flow_node(label: str, *, active: bool = True, detail_html: str = "", tone: str = "on") -> str:
+                cls = "node"
+                if not active:
+                    cls += " off"
+                elif tone == "warn":
+                    cls += " warn"
+                title = f"<div class='label'>{label}</div>"
+                detail = f"<div class='detail'>{detail_html}</div>" if detail_html else ""
+                return f"<div class='{cls}'>{title}{detail}</div>"
 
-            # --- Visuals: allocation + complexity ---
-            cA, cB = st.columns(2, gap="small")
+            # Compact, responsive vertical flow (clean + intuitive in the sticky panel)
+            css = """
+<style>
+.flow-vert {display:flex; flex-direction:column; gap:8px; margin-top:8px; padding-bottom:8px;}
+.node{border:1px solid rgba(17,24,39,0.15); border-radius:12px; padding:10px 12px; background:#f9fafb; margin-bottom:2px}
+.node .label{font-weight:700; font-size:13px; color:#111827}
+.node .detail{font-size:12px; color:#4b5563; margin-top:2px; line-height:1.25; white-space:normal; overflow-wrap:anywhere}
+.node.off{opacity:0.55}
+.node.warn{border-color: rgba(245,158,11,0.55); background: rgba(245,158,11,0.08)}
+.arrow-down{display:flex; justify-content:center; color:#9ca3af; font-size:16px; line-height:1}
+</style>
+"""
 
-            with cA:
-                st.markdown("**Allocation**")
-                if go is not None:
-                    inv = float(max_alloc_pct) / 100.0 if float(max_alloc_pct) > 1.0 else float(max_alloc_pct)
-                    inv = max(0.0, min(1.0, inv))
-                    cash = max(0.0, 1.0 - inv)
-                    fig_alloc = go.Figure(
-                        data=[
-                            go.Pie(
-                                labels=["Max invested", "Cash buffer"],
-                                values=[inv, cash],
-                                hole=0.68,
-                                sort=False,
-                                direction="clockwise",
-                                textinfo="none",
-                                hovertemplate="%{label}: %{percent:.0%}<extra></extra>",
-                                showlegend=False,
-                            )
-                        ]
-                    )
-                    _style_fig(fig_alloc, title=None)
-                    fig_alloc.update_layout(height=170, margin=dict(l=10, r=10, t=10, b=10), showlegend=False)
-                    fig_alloc.add_annotation(text=f"{inv*100:.0f}% cap", x=0.5, y=0.5, showarrow=False, font=dict(size=16))
-                    _plotly(fig_alloc, key="build.preview.alloc")
-                else:
-                    st.caption(f"Cap: {_fmt_pct(float(max_alloc_pct), digits=0)}")
+            # Details
+            cash_detail = f"{deposit_freq} · ${deposit_amount:.0f}" if funding_ok else "off"
+            buys_detail = f"{buy_freq} · ${buy_amount:.0f}" if buys_ok else "off"
+            gate_detail = _gate_detail_html()
+            alloc_detail = f"≤ {max_alloc_pct*100:.0f}% invested"
 
-            with cB:
-                st.markdown("**Complexity**")
-                # Deterministic “workflow complexity” meter (not quality/performance).
-                score = 1.0
-                if str(deposit_freq).lower() != "none" and float(deposit_amount) > 0:
-                    score += 0.5
-                if entry_mode.startswith("Simple"):
-                    if str(buy_filter).lower() != "none":
-                        score += 1.0
-                else:
-                    score += 1.5
-                    try:
-                        score += 0.5 * len(entry_logic.get("regime", []) or [])
-                        score += 0.3 * len(entry_logic.get("clauses", []) or [])
-                    except Exception:
-                        pass
-                if float(max_alloc_pct) < 0.999:
-                    score += 0.25
-                rc = int(bool(sl_pct > 0)) + int(bool(tp_pct > 0)) + int(bool(max_hold_bars > 0)) + int(bool(trail_pct > 0))
-                score += 0.75 * rc
-                score = max(0.0, min(5.0, float(score)))
+            exec_detail = "always (scheduled)" if (buys_ok and not entry_ok) else ("only if gate passes" if buys_ok else "no buys")
+            pos_detail = "holds between buys"
+            exit_parts = []
+            if sl_ok:
+                exit_parts.append(f"SL {_fmt_pct(sl_pct)}")
+            if tp_ok:
+                exit_parts.append(f"TP {_fmt_pct(tp_pct)}")
+            if time_ok:
+                exit_parts.append(f"Time {int(max_hold_bars)} bars")
+            if trail_ok:
+                exit_parts.append(f"Trail {_fmt_pct(trail_pct)}")
+            exits_detail = " · ".join(exit_parts) if exit_parts else "none"
+            sell_detail = "only via exits"
 
-                if go is not None:
-                    fig_cx = go.Figure(
-                        go.Indicator(
-                            mode="gauge+number",
-                            value=score,
-                            number={"suffix": "/5"},
-                            gauge={"axis": {"range": [0, 5]}},
-                        )
-                    )
-                    _style_fig(fig_cx, title=None)
-                    fig_cx.update_layout(height=170, margin=dict(l=10, r=10, t=10, b=10))
-                    _plotly(fig_cx, key="build.preview.complexity")
-                else:
-                    st.progress(score / 5.0)
-                    st.caption(f"{score:.1f}/5")
+            nodes = [
+                _flow_node("Cash-in schedule", active=funding_ok, detail_html=cash_detail, tone="on"),
+                _flow_node("Buy schedule", active=buys_ok, detail_html=buys_detail, tone="on"),
+                _flow_node("Signal gate", active=True, detail_html=gate_detail, tone=("warn" if entry_ok else "on")),
+                _flow_node("Allocation cap", active=True, detail_html=alloc_detail, tone="on"),
+                _flow_node("Buy executes", active=buys_ok, detail_html=exec_detail, tone=("warn" if entry_ok else "on")),
+                _flow_node("Position state", active=True, detail_html=pos_detail, tone="on"),
+                _flow_node("Exit rules", active=True, detail_html=exits_detail, tone=("warn" if exits_detail != "none" else "on")),
+                _flow_node("Sell / reduce", active=True, detail_html=sell_detail, tone="on"),
+            ]
 
-            # --- Traits (descriptive chips) ---
-            st.markdown("**Derived characteristics**")
-            traits: List[Tuple[str, str]] = []
-            if str(deposit_freq).lower() != "none" and float(deposit_amount) > 0:
-                traits.append(("💰", "Auto funding"))
-            else:
-                traits.append(("💼", "No deposits"))
-            traits.append(("🗓️", f"{buy_freq.capitalize()} schedule"))
-            if entry_mode.startswith("Simple") and str(buy_filter).lower() == "none":
-                traits.append(("🚪", "Ungated buys"))
-            else:
-                traits.append(("🚪", "Gated buys"))
-            if float(max_alloc_pct) < 0.999:
-                traits.append(("🧱", f"Invest cap {_fmt_pct(float(max_alloc_pct), digits=0)}"))
-            if exits:
-                traits.append(("🛡️", "Exit rules enabled"))
-            else:
-                traits.append(("🧘", "No exits"))
-            if build_atr_med is not None and math.isfinite(float(build_atr_med)):
-                traits.append(("📈", f"Median ATR ~{float(build_atr_med):.1f}% (dataset)"))
-
-            # Render in a clean grid (no HTML/CSS).
-            rows = [traits[i : i + 2] for i in range(0, len(traits), 2)]
-            for r in rows:
-                cc = st.columns(2, gap="small")
-                for j, item in enumerate(r):
-                    ico, label = item
-                    with cc[j]:
-                        st.caption(f"{ico} {label}")
+            html = css + "<div class='flow-vert'>" + "<div class='arrow-down'>↓</div>".join(nodes) + "</div>"
+            st.markdown(html, unsafe_allow_html=True)
 
         st.markdown("</div>", unsafe_allow_html=True)
     return params
@@ -3695,18 +4189,13 @@ if open_existing == "(new run)":
     elif step == 1:
         st.write("Define your plan. This becomes the baseline that variations are generated around.")
 
-        strategy_template = st.selectbox(
-            "Strategy template",
-            options=[
-                "DCA/Swing (beginner-friendly, long-only)",
-            ],
-            index=0,
-            key="new.template",
-        )
+        st.caption("Module: DCA/Swing (spot, long-only).")
+
+        _render_plan_blueprint_import_ui()
 
         baseline_params = build_dca_baseline_params()
-
         st.session_state["new.baseline_params"] = baseline_params
+        _render_current_plan_blueprint(baseline_params)
         st.session_state["new.template_path"] = "strategies.dca_swing:Strategy"
         st.session_state["new.grid_script"] = str(REPO_ROOT / "tools" / "make_dca_grid.py")
         st.session_state["new.market_mode"] = "spot"

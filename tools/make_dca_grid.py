@@ -582,7 +582,10 @@ def generate_grid_random(*, n: int, seed: int, logic_frac: float = 0.35) -> List
             bb_z_thr = float(_pick(rng, bb_z_thrs)) if buy_filter == "bb_z_below" else None
             adx_thr = float(_pick(rng, adx_thrs)) if buy_filter == "adx_above" else None
             donch_pos_thr = float(_pick(rng, donch_pos_thrs)) if buy_filter == "donch_pos_below" else None
-            if base_is_logic:
+            # In random grid generation, 'use_logic' controls whether we emit a builder-style gate.
+            # If logic is enabled, the simple buy_filter gate is forced off (buy_filter='none') and
+            # the entry_logic object drives the gate mechanics.
+            if use_logic:
                 buy_filter = "none"
                 ema_len = None
                 rsi_thr = None
@@ -590,19 +593,6 @@ def generate_grid_random(*, n: int, seed: int, logic_frac: float = 0.35) -> List
                 bb_z_thr = None
                 adx_thr = None
                 donch_pos_thr = None
-                if "logic" in vary_groups:
-                    entry_logic = _mutate_entry_logic(
-                        rng,
-                        base_entry_logic or {"regime": [], "clauses": []},
-                        width=w,
-                        ema_lens=ema_lens,
-                        rsi_thrs=rsi_thrs,
-                        bb_z_thrs=bb_z_thrs,
-                        adx_thrs=adx_thrs,
-                        donch_pos_thrs=donch_pos_thrs,
-                    )
-                else:
-                    entry_logic = base_entry_logic
             else:
                 entry_logic = None  # derived in build_dca_cfg
 
