@@ -219,6 +219,9 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
         df["macd_signal_12_26_9"] = macd_df["signal"]
         df["macd_hist_12_26_9"] = macd_df["hist"]
         feat_cols.extend(["macd_12_26", "macd_signal_12_26_9", "macd_hist_12_26_9"])
+        # Back-compat alias (used by older blueprints/spec)
+        df["macd_hist"] = df["macd_hist_12_26_9"]
+        feat_cols.append("macd_hist")
     except Exception:
         pass
 

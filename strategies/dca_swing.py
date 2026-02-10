@@ -78,8 +78,8 @@ DEFAULT_CONFIG = StrategyConfig(
 
         # Take profit (strategy-managed)
         "tp_pct": 0.0,  # avg_entry*(1+tp_pct); 0 disables
-        "tp_sell_fraction": 0.50,
-        "reserve_frac_of_proceeds": 0.50,
+        "tp_sell_fraction": 1.0,
+        "reserve_frac_of_proceeds": 0.0,
     },
 )
 
@@ -116,6 +116,8 @@ def _get_indicator(ctx: StrategyContext, name: str) -> float:
         return float(v) if v is not None else float("nan")
 
     v2 = ctx.features.get(k)
+    if v2 is None and k == "macd_hist":
+        v2 = ctx.features.get("macd_hist_12_26_9")
     return float(v2) if v2 is not None else float("nan")
 
 
@@ -252,7 +254,16 @@ class DCASwingStrategy:
 
     def _p(self, key: str, default):
         params = getattr(self.cfg, "params", {}) or {}
-        return params.get(key, default)
+        if key in params:
+            return params.get(key, default)
+        # Back-compat aliases (UI/spec older keys)
+        aliases = {
+            "reserve_frac_of_proceeds": ["reserve_frac"],
+        }
+        for alt in aliases.get(key, []):
+            if alt in params:
+                return params.get(alt, default)
+        return default
 
     # ----------------------
     # Legacy buy filters (kept)
