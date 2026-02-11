@@ -7768,34 +7768,8 @@ if stage_pick == "grand":
     # -------------------------------------------------------------------------
     # Cockpit view (MVP): preferences → shortlist → evidence
     # -------------------------------------------------------------------------
-    st.subheader("Shortlist → Evidence → Deep dives")
-    st.caption("Make a shortlist first, then inspect receipts. Deep dives (optional) explain the population and why things look the way they do.")
-
-    with st.container(border=True):
-        st.markdown("#### Run summary")
-        ds_path = None
-        try:
-            ds = (manifest.get("dataset") or {}) if isinstance(manifest, dict) else {}
-            ds_path = ds.get("path_abs") or ds.get("path")
-        except Exception:
-            ds_path = None
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            st.metric("Survivors", f"{len(survivors):,}" if survivors is not None else "—")
-        with c2:
-            st.metric("Rolling Starts", rs_label if "rs_label" in globals() else "—")
-        with c3:
-            st.metric("Walkforward", wf_label if "wf_label" in globals() else "—")
-        with c4:
-            st.metric("Run", str(getattr(run_dir, "name", "—")))
-        if ds_path:
-            try:
-                st.caption(f"Dataset: `{ds_path}`")
-            except Exception:
-                pass
-        st.caption("Next: tweak **Lens & filters** → review **Your shortlist** → pick one and open **Evidence**.")
-
-
+    st.subheader("Results & Autopsy")
+    st.caption("Set your lens → review the run overview → build a shortlist → open Evidence to inspect receipts.")
 
     # -------------------------------------------------------------------------
     # Run overview (preferences first, then population charts)
@@ -7803,6 +7777,24 @@ if stage_pick == "grand":
     overview_slot = st.container()
     with overview_slot:
         st.subheader("Run overview")
+        # Run / dataset context (kept here so we only have one summary area)
+        _run_name = str(getattr(run_dir, "name", "—"))
+        _ds_path = None
+        try:
+            _ds = (manifest.get('dataset') or {}) if isinstance(manifest, dict) else {}
+            _ds_path = _ds.get('path_abs') or _ds.get('path')
+        except Exception:
+            _ds_path = None
+        
+        _meta_bits = [f"Run: **{_run_name}**"]
+        if _ds_path:
+            _meta_bits.append(f"Dataset: `{_ds_path}`")
+        if 'rs_label' in globals():
+            _meta_bits.append(f"Rolling Starts: **{rs_label}**")
+        if 'wf_label' in globals():
+            _meta_bits.append(f"Walkforward: **{wf_label}**")
+        st.caption(" · ".join(_meta_bits))
+
         st.caption("Set your lens first. These preferences change how the overview charts filter, color, and explain the run.")
         prefs_slot = st.container()
         charts_slot = st.container()
@@ -8364,78 +8356,401 @@ if stage_pick == "grand":
                         except Exception:
                             cutoff = None
 
-                        st.markdown("#### Stability score: rarity & separation")
+                        st.markdown("#### Stability Score: how repeatable is this plan?")
+                        st.markdown("Stability Score = **how consistently a plan behaves** across different start dates and time windows (**less fragile = higher**).")
+                        st.caption("Rewards: steady behavior across time, fewer deep drawdowns, fewer ugly windows.  Penalizes: start-date luck, big drawdowns, long underwater stretches, unstable windows.")
+                        with st.expander("What is this score?", expanded=False):
+                            st.markdown(
+                                "- **Batch:** filters + shortlist\n" + "- **Rolling Starts:** start-date sensitivity\n" + "- **Walkforward:** time-window stability\n\n" + "Think of it like a **crash-test rating** for strategies — not horsepower."
+                            )
+                        # Focus the view on where the survivor population actually sits (avoid cutoff stretching the axis).
+                        try:
+                            x_p2 = float(np.nanpercentile(_arr, 5))
+                            x_p995 = float(np.nanpercentile(_arr, 99))
+                            if (not math.isfinite(x_p2)) or (not math.isfinite(x_p995)) or (x_p995 <= x_p2):
+                                raise ValueError('bad percentiles')
+                        except Exception:
+                            x_p2 = float(np.nanmin(_arr))
+                            x_p995 = float(np.nanmax(_arr))
+                        x_pad = (x_p995 - x_p2) * 0.06 if (x_p995 > x_p2) else 1.0
+                        x0 = x_p2 - x_pad
+                        x1 = x_p995 + x_pad
+                        cutoff_in_range = (cutoff is not None and math.isfinite(float(cutoff)) and (float(cutoff) >= x0) and (float(cutoff) <= x1))
+                        
                         note_parts = [f"N={n:,} survivors after requirements."]
+                        # Display zoom: keep the plot focused on where most survivors sit (percentile-based view)
+                        note_parts.append("View zoom: P5–P99.")
+                        try:
+                            _minv = float(np.nanmin(_arr))
+                            if math.isfinite(_minv) and (_minv < x0):
+                                note_parts.append(f"Rare low tail: min {_fmt_num(_minv, digits=3)} (off-scale).")
+                        except Exception:
+                            pass
                         if n < 50:
                             note_parts.append("Small N → percentiles can be chunky.")
                         if cutoff is not None and math.isfinite(float(cutoff)):
-                            note_parts.append(f"Shortlist cutoff: {_fmt_num(cutoff, digits=3)} (lowest visible).")
+                            if cutoff_in_range:
+                                note_parts.append(f"Shortlist cutoff: {_fmt_num(cutoff, digits=3)} (lowest visible).")
+                            else:
+                                note_parts.append(f"Shortlist cutoff: {_fmt_num(cutoff, digits=3)} (off-scale).")
                         st.caption(" ".join(note_parts))
-
+                        
                         sc1, sc2, sc3, sc4 = st.columns(4)
-                        sc1.metric("Median", _fmt_num(med, digits=3))
-                        sc2.metric("80th pct (strong zone)", _fmt_num(p80, digits=3))
-                        sc3.metric("90th pct", _fmt_num(p90, digits=3) if (p90 is not None and math.isfinite(float(p90))) else "—")
+                        sc1.metric("Typical survivor", _fmt_num(med, digits=3))
+                        sc1.caption("Median (P50)")
+                        sc2.metric("Strong threshold", _fmt_num(p80, digits=3))
+                        sc2.caption("P80 (top 20%)")
+                        sc3.metric("Elite threshold", _fmt_num(p90, digits=3) if (p90 is not None and math.isfinite(float(p90))) else "—")
+                        sc3.caption("P90 (top 10%)")
                         if cutoff is not None and math.isfinite(float(cutoff)):
-                            sc4.metric("Cutoff vs median", f"{(cutoff - med):+.3f}")
+                            sc4.metric("Shortlist cutoff", _fmt_num(cutoff, digits=3))
+                            sc4.caption(f"Lowest visible • gap vs typical: {(cutoff - med):+.3f}" + (" (off-scale)" if (cutoff is not None and math.isfinite(float(cutoff)) and (not cutoff_in_range)) else ""))
                         else:
                             sc4.metric("Shortlist cutoff", "—")
-
-                        nbins = int(max(20, min(50, math.sqrt(n) * 3)))
-                        fig_hist = go.Figure(
-                            go.Histogram(
-                                x=_arr,
-                                nbinsx=nbins,
-                                marker=dict(color=ACCENT_BLUE),
-                                opacity=0.85,
-                                showlegend=False,
-                            )
-                        )
-                        _style_fig(fig_hist, title=None)
-                        fig_hist.update_layout(margin=dict(l=20, r=20, t=120, b=20))
-                        fig_hist.update_xaxes(title="Stability score (higher is better)")
-                        fig_hist.update_yaxes(title="Count")
-
-                        def _vline(x: float, label: str, dash: str, color: str, *, y: float = 1.06) -> None:
+                            sc4.caption("Lowest visible")
+                        
+                        # Plain-English verdict: how distinct is the strong tail from typical?
+                        try:
+                            _span = float(x_p995 - x_p2) if (math.isfinite(float(x_p995)) and math.isfinite(float(x_p2)) and (x_p995 > x_p2)) else float(x1 - x0)
+                            _sep = float(p80 - med)
+                            _ratio = (abs(_sep) / _span) if (_span and math.isfinite(_span) and _span > 0) else 0.0
+                            if _ratio < 0.08:
+                                _verdict = "Separation is small: strong configs aren’t much different from typical."
+                            elif _ratio < 0.18:
+                                _verdict = "Separation is moderate: strong configs are meaningfully better than typical."
+                            else:
+                                _verdict = "Separation is large: strong configs clearly stand out from typical."
+                        except Exception:
+                            _verdict = "This shows where survivors land on Stability (higher = more repeatable)."
+                        
+                        _cut_note = ""
+                        if cutoff is not None and math.isfinite(float(cutoff)):
+                            if not cutoff_in_range:
+                                _cut_note = " Your shortlist cutoff is very low (off-scale) — the visible shortlist is permissive."
+                            else:
+                                if float(cutoff) >= float(p80):
+                                    _cut_note = " Your shortlist cutoff sits in the strong zone — the visible shortlist is selective."
+                                else:
+                                    _cut_note = " Your shortlist cutoff is below the strong zone — the visible shortlist is permissive."
+                        st.markdown(f"**Verdict:** {_verdict}{_cut_note}")
+                        
+                        # Density curve + simple zones (cleaner than a histogram)
+                        try:
+                            _arr_f = _arr[np.isfinite(_arr)]
+                            n_eff = int(len(_arr_f))
+                            if n_eff < 3:
+                                raise ValueError('not enough points for KDE')
+                        
+                            xs = np.linspace(float(x0), float(x1), 420)
+                        
+                            # Simple Gaussian KDE (no SciPy dependency)
+                            std = float(np.nanstd(_arr_f))
                             try:
-                                fig_hist.add_vline(x=x, line_width=2, line_dash=dash, line_color=color)
-                                fig_hist.add_annotation(
-                                    x=x,
-                                    xref="x",
-                                    y=y,
-                                    yref="paper",
-                                    text=label,
-                                    showarrow=False,
-                                    xanchor="center",
-                                    yanchor="bottom",
-                                    font=dict(size=12, color=color),
+                                iqr = float(np.nanpercentile(_arr_f, 75) - np.nanpercentile(_arr_f, 25))
+                            except Exception:
+                                iqr = 0.0
+                            sigma = std
+                            if iqr and math.isfinite(iqr) and iqr > 0:
+                                sigma = min(std, iqr / 1.349) if (std and math.isfinite(std) and std > 0) else (iqr / 1.349)
+                            if (not sigma) or (not math.isfinite(sigma)) or sigma <= 0:
+                                sigma = max(1e-9, float((x1 - x0) / 10.0))
+                        
+                            h = 1.06 * sigma * (n_eff ** (-1.0 / 5.0))
+                            h_floor = float((x1 - x0) / 250.0) if (x1 > x0) else 1e-6
+                            if (not math.isfinite(h)) or h <= 0:
+                                h = h_floor
+                            h = max(h, h_floor)
+                        
+                            u = (xs[:, None] - _arr_f[None, :]) / h
+                            ys = np.exp(-0.5 * (u ** 2)).sum(axis=1) / (n_eff * h * math.sqrt(2.0 * math.pi))
+                            y_max = float(np.nanmax(ys)) if len(ys) else 1.0
+                        
+                            fig_den = go.Figure()
+                            fig_den.add_trace(
+                                go.Scatter(
+                                    x=xs,
+                                    y=ys,
+                                    mode="lines",
+                                    line=dict(color=ACCENT_BLUE, width=2),
+                                    fill="tozeroy",
+                                    hovertemplate="Survivor density<extra></extra>",
+                                    showlegend=False,
                                 )
+                            )
+                        
+                            # Zones: right tail is where stronger candidates live
+                            try:
+                                fig_den.add_vrect(x0=float(p80), x1=float(x1), fillcolor=ACCENT_BLUE, opacity=0.08, line_width=0, layer="below")
                             except Exception:
                                 pass
-
-                        _vline(med, "Median", "solid", "#111827", y=1.06)
-                        _vline(p80, "P80", "dash", ACCENT_BLUE, y=1.12)
-                        if p90 is not None and math.isfinite(float(p90)):
-                            _vline(float(p90), "P90", "dot", ACCENT_BLUE, y=1.18)
-                        if cutoff is not None and math.isfinite(float(cutoff)):
-                            _vline(float(cutoff), "Cutoff", "dashdot", WARN_COLOR, y=1.06)
-
-                        _plotly(fig_hist)
-
-                # Common issues bar (cheap: uses the sampled reasons computed above)
+                            if p90 is not None and math.isfinite(float(p90)):
+                                try:
+                                    fig_den.add_vrect(x0=float(p90), x1=float(x1), fillcolor=ACCENT_BLUE, opacity=0.14, line_width=0, layer="below")
+                                except Exception:
+                                    pass
+                        
+                            def _add_marker_line(x: float, label: str, dash: str, color: str, hover_title: str, *, y_annot: float) -> None:
+                                try:
+                                    fig_den.add_trace(
+                                        go.Scatter(
+                                            x=[x, x],
+                                            y=[0.0, y_max * 1.05],
+                                            mode="lines",
+                                            line=dict(color=color, width=2, dash=dash),
+                                            hovertemplate=f"{hover_title}<br>Score: {_fmt_num(x, digits=3)}<extra></extra>",
+                                            showlegend=False,
+                                        )
+                                    )
+                                    fig_den.add_annotation(
+                                        x=x, xref="x",
+                                        y=y_annot, yref="paper",
+                                        text=label,
+                                        showarrow=False,
+                                        xanchor="center",
+                                        yanchor="bottom",
+                                        font=dict(size=12, color=color),
+                                    )
+                                except Exception:
+                                    pass
+                        
+                            _add_marker_line(float(med), "Typical", "solid", "#111827", "Typical survivor (P50)", y_annot=1.02)
+                            _add_marker_line(float(p80), "Strong zone", "dash", ACCENT_BLUE, "Strong threshold (P80)", y_annot=1.08)
+                            if p90 is not None and math.isfinite(float(p90)):
+                                _add_marker_line(float(p90), "Elite zone", "dot", ACCENT_BLUE, "Elite threshold (P90)", y_annot=1.14)
+                            if cutoff_in_range:
+                                _add_marker_line(float(cutoff), "Cutoff", "dashdot", WARN_COLOR, "Shortlist cutoff", y_annot=1.02)
+                        
+                            _style_fig(fig_den, title=None)
+                            fig_den.update_layout(margin=dict(l=20, r=20, t=110, b=20))
+                            fig_den.update_xaxes(title="Stability Score (higher = more repeatable)")
+                            fig_den.update_yaxes(title=None, showticklabels=False, showgrid=False, zeroline=False)
+                            fig_den.update_xaxes(range=[float(x0), float(x1)])
+                        
+                        
+                            st.markdown("##### Where survivors land on Stability")
+                            _plotly(fig_den)
+                            st.caption("Right = more repeatable. Higher curve = more survivor configs at that score.")
+                        except Exception:
+                            # Fallback: keep a simple histogram without stretching to cutoff
+                            nbins = int(max(20, min(50, math.sqrt(n) * 3)))
+                            fig_hist = go.Figure(
+                                go.Histogram(x=_arr, nbinsx=nbins, marker=dict(color=ACCENT_BLUE), opacity=0.85, showlegend=False)
+                            )
+                            _style_fig(fig_hist, title=None)
+                            fig_hist.update_layout(margin=dict(l=20, r=20, t=120, b=20))
+                            fig_hist.update_xaxes(title="Stability Score (higher = more repeatable)", range=[float(x0), float(x1)])
+                            fig_hist.update_yaxes(title="Count")
+                            _plotly(fig_hist)
+                # Common issues bar (clean labels + full detail in hover/table)
                 try:
                     if hi2 is not None and "_reason" in hi2.columns:
-                        rr = hi2["_reason"].astype(str).str.strip()
-                        rr = rr[rr != ""]
-                        if len(rr) > 0:
-                            vc = rr.value_counts().head(8)
-                            df_r = pd.DataFrame({"Reason": vc.index.astype(str), "Count": vc.values.astype(int)})
-                            fig_r = px.bar(df_r, x="Count", y="Reason", orientation="h")
-                            _style_fig(fig_r, title=None)
-                            fig_r.update_layout(margin=dict(l=20, r=20, t=40, b=20))
-                            st.markdown("#### Common issues in the visible shortlist")
-                            st.caption("First/highest-severity limit violation under your current lens (computed for a small sample). Use this to see what is holding candidates back.")
-                            _plotly(fig_r)
+                        _rr = hi2[["_reason"]].copy()
+                        _rr["_reason"] = _rr["_reason"].astype(str).str.strip()
+                        _rr = _rr[_rr["_reason"] != ""]
+                        if len(_rr) > 0:
+                            _sample_n = int(len(_rr))
+
+                            def _parse_reason(_s: str) -> dict:
+                                s = str(_s or "").strip()
+                                stage = "Other"
+                                body = s
+                                m0 = re.match(r"^\s*([^:]+)\s*:\s*(.*)$", s)
+                                if m0:
+                                    stage = str(m0.group(1)).strip()
+                                    body = str(m0.group(2)).strip()
+
+                                # Pattern: '<metric> is <obs>%? but your limit is >=|<= <lim>%?'
+                                m = re.search(
+                                    r"(?P<metric>.+?)\s+is\s+(?P<obs>-?\d+(?:\.\d+)?)(?P<obs_pct>%?)\s+but\s+your\s+limit\s+is\s+(?P<op>>=|<=)\s+(?P<lim>-?\d+(?:\.\d+)?)(?P<lim_pct>%?)",
+                                    body,
+                                    flags=re.IGNORECASE,
+                                )
+
+                                metric = None
+                                obs = None
+                                lim = None
+                                op = None
+                                is_pct = False
+                                issue = "outside limit"
+
+                                if m:
+                                    metric = str(m.group("metric")).strip().rstrip(".")
+                                    op = str(m.group("op")).strip()
+                                    try:
+                                        obs = float(m.group("obs"))
+                                        lim = float(m.group("lim"))
+                                    except Exception:
+                                        obs, lim = None, None
+                                    is_pct = bool(m.group("obs_pct") or m.group("lim_pct") or ("%" in body))
+
+                                    if obs is not None and lim is not None:
+                                        if op == ">=" and obs < lim:
+                                            issue = "too low"
+                                        elif op == "<=" and obs > lim:
+                                            issue = "too high"
+
+                                # Human label for the chart (casual-friendly)
+                                def _human_metric(_m: str) -> str:
+                                    m = re.sub(r"\s+", " ", str(_m or "").strip())
+                                    ml = m.lower()
+                                    if "turnover" in ml:
+                                        return "Trading frequency"
+                                    if "invested fraction" in ml:
+                                        return "Typical invested %"
+                                    if "return_p50" in ml or (ml.startswith("return") and "p50" in ml):
+                                        return "Median return"
+                                    if "underwater time" in ml:
+                                        return "Bad-streak length (p90)" if "p90" in ml else "Underwater time"
+                                    m = m.replace("Typical ", "").strip()
+                                    return m
+                                
+                                if metric:
+                                    metric_short = _human_metric(metric)
+                                else:
+                                    metric_short = _human_metric(body)
+                                if len(metric_short) > 44:
+                                    metric_short = metric_short[:42] + "…"
+                                
+                                # Convert limit direction into plain phrasing
+                                _issue_phrase = issue
+                                if issue == "outside limit" and op == ">=":
+                                    _issue_phrase = "below minimum"
+                                elif issue == "outside limit" and op == "<=":
+                                    _issue_phrase = "above maximum"
+                                # Friendlier phrasing for a couple of common blockers
+                                if metric_short.lower().startswith("typical invested") and _issue_phrase in ("too low", "below minimum"):
+                                    short_label = "Not invested enough"
+                                else:
+                                    short_label = f"{metric_short} {_issue_phrase}".strip()
+                                return {
+                                    "stage": stage,
+                                    "metric": metric or body,
+                                    "metric_short": metric_short,
+                                    "op": op or "",
+                                    "limit": lim,
+                                    "observed": obs,
+                                    "is_pct": bool(is_pct),
+                                    "issue": issue,
+                                    "short_label": short_label,
+                                    "raw": s,
+                                }
+
+                            _parsed = _rr["_reason"].map(_parse_reason).tolist()
+                            df_p = pd.DataFrame(_parsed)
+                            if not df_p.empty:
+                                # Group duplicate reasons (same issue, different observed values)
+                                g = (
+                                    df_p.groupby(["stage","short_label","metric","op","limit","is_pct","issue"], dropna=False)
+                                    .agg(
+                                        count=("raw","size"),
+                                        obs_median=("observed","median"),
+                                        obs_min=("observed","min"),
+                                        obs_max=("observed","max"),
+                                        example=("raw","first"),
+                                    )
+                                    .reset_index()
+                                )
+                                g["pct"] = g["count"] / max(1, _sample_n)
+
+                                def _fmt(v, is_pct: bool) -> str:
+                                    if v is None or (isinstance(v, float) and not math.isfinite(v)):
+                                        return "—"
+                                    return (f"{v:.2f}%" if is_pct else f"{v:.4g}")
+
+                                g["Observed"] = g.apply(
+                                    lambda r: (
+                                        f"{_fmt(r['obs_median'], r['is_pct'])} ({_fmt(r['obs_min'], r['is_pct'])}–{_fmt(r['obs_max'], r['is_pct'])})"
+                                        if r.get("obs_median") is not None else "—"
+                                    ),
+                                    axis=1,
+                                )
+                                g["Limit"] = g.apply(
+                                    lambda r: (f"{r['op']} {_fmt(r['limit'], r['is_pct'])}" if r.get("op") else "—"),
+                                    axis=1,
+                                )
+                                g["Delta"] = g.apply(
+                                    lambda r: (
+                                        _fmt((r['obs_median'] - r['limit']) if (r.get('obs_median') is not None and r.get('limit') is not None) else None, r['is_pct'])
+                                    ),
+                                    axis=1,
+                                )
+                                g["Share"] = (g["pct"] * 100.0).round(0).astype(int).astype(str) + "%"
+                                g["Label"] = g.apply(lambda r: f"{int(r['count'])} ({int(round(r['pct']*100.0))}%)", axis=1)
+                                g["Example"] = g["example"].astype(str).str.slice(0, 140)
+
+                                # Keep the chart focused: hide one-off noise (details table still keeps everything)
+                                _rare = (g["count"] < 2) & (g["pct"] < 0.02)
+                                g_main = g[~_rare].copy()
+                                if _rare.any():
+                                    g_other = pd.DataFrame([{
+                                        "stage": "Other",
+                                        "short_label": "Other (rare)",
+                                        "metric": "Other (rare)",
+                                        "op": "",
+                                        "limit": None,
+                                        "is_pct": False,
+                                        "issue": "rare",
+                                        "count": int(g.loc[_rare, "count"].sum()),
+                                        "obs_median": None,
+                                        "obs_min": None,
+                                        "obs_max": None,
+                                        "example": str(g.loc[_rare, "example"].iloc[0]) if len(g.loc[_rare]) else "",
+                                        "pct": float(g.loc[_rare, "pct"].sum()),
+                                    }])
+                                    # Populate display fields so the table/hover don't show "None"
+                                    g_other["Observed"] = "—"
+                                    g_other["Limit"] = "—"
+                                    g_other["Delta"] = "—"
+                                    g_other["Share"] = (g_other["pct"] * 100.0).round(0).astype(int).astype(str) + "%"
+                                    g_other["Label"] = g_other.apply(lambda r: f"{int(r['count'])} ({int(round(r['pct']*100.0))}%)", axis=1)
+                                    g_other["Example"] = g_other["example"].astype(str).str.slice(0, 140)
+                                    g_main = pd.concat([g_main, g_other], ignore_index=True)
+                                
+                                # Show the most common blockers
+                                g_top = g_main.sort_values(["count","pct"], ascending=False).head(8).copy()
+                                g_plot = g_top.sort_values(["count","pct"], ascending=True).copy()
+
+                                # Plot: clean labels + stage color; full detail in hover
+                                fig_r = px.bar(
+                                    g_plot,
+                                    x="count",
+                                    y="short_label",
+                                    color="stage",
+                                    category_orders={"stage": ["Batch", "RS", "WF", "Other"]},
+                                    orientation="h",
+                                    text="Label",
+                                    hover_data={
+                                        "stage": True,
+                                        "short_label": False,
+                                        "count": False,
+                                        "pct": False,
+                                        "Observed": True,
+                                        "Limit": True,
+                                        "Delta": True,
+                                        "Example": True,
+                                    },
+                                )
+                                _style_fig(fig_r, title=None)
+                                fig_r.update_layout(margin=dict(l=20, r=20, t=40, b=20), legend_title_text="")
+                                fig_r.update_traces(textposition="outside", cliponaxis=False)
+                                fig_r.update_yaxes(title=None, categoryorder="array", categoryarray=g_plot["short_label"].tolist())
+                                fig_r.update_xaxes(title="Count (in sample)")
+
+                                st.markdown("#### What\'s blocking the visible shortlist?")
+                                st.caption(f"Top reasons candidates fail your current filters (N={_sample_n:,}).")
+                                _plotly(fig_r)
+
+                                with st.expander("Details (numbers)", expanded=False):
+                                    df_det = g_top[["stage","short_label","count","Share","Observed","Limit","Delta","Example"]].copy()
+                                    df_det = df_det.rename(columns={
+                                        "stage": "Stage",
+                                        "short_label": "Issue",
+                                        "count": "Count",
+                                    })
+                                    for _c in ["Share", "Observed", "Limit", "Delta", "Example"]:
+                                        if _c in df_det.columns:
+                                            df_det[_c] = df_det[_c].fillna("—")
+                                    st.dataframe(df_det, width="stretch", height=260)
                 except Exception:
                     pass
             else:
@@ -8498,6 +8813,10 @@ if stage_pick == "grand":
     display_df = display_df.rename(columns={c: rename_map.get(c, c) for c in display_df.columns})
 
     st.dataframe(display_df, width="stretch", height=520)
+    # Evidence drawer state
+    if "ui.open_evidence" not in st.session_state:
+        st.session_state["ui.open_evidence"] = False
+
     with st.expander("Cards view (optional)", expanded=False):
         st.caption("Quick scan of the top rows in your shortlist. Same filters + sorting. Use **Inspect →** to jump straight to Evidence.")
 
@@ -8739,7 +9058,7 @@ if stage_pick == "grand":
 
                     if st.button("Inspect →", key=f"top10.inspect.{cid}", type="primary"):
                         st.session_state["cockpit.pick"] = str(cid)
-                        st.session_state["ui.jump_to_evidence"] = True
+                        st.session_state["ui.open_evidence"] = True
                         st.session_state["ui.jump_tab"] = "Batch scan"
                         st.rerun()
 
@@ -8755,1415 +9074,1439 @@ if stage_pick == "grand":
     if not pick:
         st.stop()
 
-    row = df2[df2["config_id"].astype(str) == str(pick)].iloc[0].to_dict()
-
-    cfg_map = {r.get("config_id"): r.get("normalized") for r in _load_jsonl(run_dir / "configs_resolved.jsonl")}
-    cfg_norm = cfg_map.get(str(pick), {})
-
-    art_dir = top_map.get(str(pick))
-    if not (art_dir and art_dir.exists()):
-        cache_dir = run_dir / "replay_cache" / str(pick)
-        if cache_dir.exists():
-            art_dir = cache_dir
-
-    st.divider()
-
-    st.subheader("Evidence")
-    st.markdown('<div id="evidence-anchor"></div>', unsafe_allow_html=True)
-    # Selected strategy summary (quick read before diving into tabs)
-    with st.container(border=True):
-        st.markdown("#### Selected strategy")
-        dd_col_s = _pick_col(df2, ["performance.max_drawdown_equity", "performance.max_drawdown", "equity.max_drawdown", "dd_p90"])
-        ret_col_s = _pick_col(df2, ["performance.twr_total_return", "equity.net_profit_ex_cashflows", "equity.net_profit", "return_p50"])
-
-        v_grand = str(row.get("grand.verdict", "—"))
-        v_rs = str(row.get("rsq.verdict", row.get("rs.verdict", "UNMEASURED")))
-        v_wf = str(row.get("wfq.verdict", row.get("wf.verdict", "UNMEASURED")))
-
-        score_s = row.get("score.grand_robust", row.get("robustness_score", None))
-
-        dd_s = None
-        if dd_col_s:
-            try:
-                dd_s = _drawdown_to_frac(pd.to_numeric(pd.Series([row.get(dd_col_s)]), errors="coerce")).iloc[0]
-            except Exception:
-                dd_s = None
-
-        ret_s = None
-        is_currency_s = False
-        if ret_col_s:
-            try:
-                ret_s = float(pd.to_numeric(pd.Series([row.get(ret_col_s)]), errors="coerce").iloc[0])
-                is_currency_s = ("net_profit" in str(ret_col_s).lower()) or ("profit" in str(ret_col_s).lower() and "return" not in str(ret_col_s).lower())
-            except Exception:
-                ret_s = None
-
-        s1, s2, s3, s4 = st.columns(4)
-        s1.metric("ID", str(pick))
-        s2.metric("Grand verdict", str(v_grand))
-        s3.metric("Stability score", _fmt_num(score_s, digits=3) if score_s is not None else "—")
-        if is_currency_s and ret_s is not None and math.isfinite(float(ret_s)):
-            s4.metric("Net profit", f"${ret_s:,.0f}")
-        else:
-            s4.metric("Total return", _fmt_pct(ret_s, digits=1) if (ret_s is not None and math.isfinite(float(ret_s))) else "—")
-
-        b1, b2, b3 = st.columns(3)
-        b1.metric("Max drawdown", _fmt_pct(dd_s, digits=1) if (dd_s is not None and math.isfinite(float(dd_s))) else "—")
-        b2.metric("Rolling Starts", str(v_rs))
-        b3.metric("Walkforward", str(v_wf))
-
-        st.caption("Tip: Start with **Batch scan** → then check **Start-date test** (Rolling Starts) → then **Time-split test** (Walkforward).")
 
 
-    _jump_to_evidence = bool(st.session_state.pop("ui.jump_to_evidence", False))
-    _jump_tab = str(st.session_state.pop("ui.jump_tab", "Batch scan")) if _jump_to_evidence else ""
-    _tabs_base = ["Receipts", "Batch scan", "Start-date test", "Time-split test", "Exports"]
+    # Open Evidence drawer (manual path if you didn't use an Inspect button)
+    open_evidence = bool(st.session_state.get('ui.open_evidence', False))
+    obL, obR = st.columns([0.22, 0.78])
+    with obL:
+        if st.button('Open Evidence →', key='evidence.open_outside', type='primary'):
+            st.session_state['ui.open_evidence'] = True
+            st.session_state['ui.jump_tab'] = 'Batch scan'
+            st.rerun()
+    with obR:
+        st.caption('Opens the Evidence drawer below for the selected strategy. (Cards view **Inspect →** does this automatically.)')
 
-    # Keep tab order stable across reruns.
-    if "ui.evidence_tab_order" not in st.session_state:
-        st.session_state["ui.evidence_tab_order"] = list(_tabs_base)
-
-    if _jump_to_evidence and _jump_tab in _tabs_base:
-        st.session_state["ui.evidence_tab_order"] = [_jump_tab] + [t for t in _tabs_base if t != _jump_tab]
-
-    _tabs = st.session_state.get("ui.evidence_tab_order", list(_tabs_base))
-    _tab_containers = st.tabs(_tabs)
-    _tab = dict(zip(_tabs, _tab_containers))
-    if _jump_to_evidence:
+    # ------------------------------------------------------------
+    # Evidence drawer (collapsed by default; opens when you Inspect)
+    # ------------------------------------------------------------
+    open_evidence = bool(st.session_state.get("ui.open_evidence", False))
+    _ev_label = "Evidence (open to inspect a candidate)"
+    if open_evidence:
         try:
-            com.html(
-                "<script>try{const el=document.getElementById('evidence-anchor'); if(el){el.scrollIntoView({behavior:'smooth',block:'start'});}}catch(e){};</script>",
-                height=0,
-            )
+            _rv = df2[df2['config_id'].astype(str) == str(pick)].iloc[0].to_dict()
+            _gv = str(_rv.get('grand.verdict', '')).upper().strip()
+            _ev_label = f"Evidence — {pick}" + (f" ({_gv})" if _gv else "")
         except Exception:
-            pass
+            _ev_label = f"Evidence — {pick}"
 
-
-
-    # (Run overview rendered above; previous Deep dives block removed)
-
-    with _tab.get("Receipts", _tab_containers[0]):
-        st.caption("High-level autopsy for the selected strategy: what it does, what it earned, and the biggest failure modes.")
-
-        st.markdown("#### Receipts (why the verdict is what it is)")
-
-        def _stage_receipt_block(title: str, q_fn, ans: Dict[str, int]) -> None:
-            out = evaluate_row_with_questions(row, q_fn(), ans)
-            badge = out.verdict
-            st.markdown(f"**{title}: `{badge}`**  —  {out.crits} crit, {out.warns} warn, {out.missing} missing")
-            if out.violations:
-                vdf = pd.DataFrame(out.violations)
-                keep = [c for c in ["severity", "metric", "value", "op", "threshold", "message"] if c in vdf.columns]
-                st.dataframe(vdf[keep], width="stretch", height=240)
-            elif out.missing_metrics:
-                st.caption("No violations, but some metrics were missing for this stage.")
-                st.code(", ".join(out.missing_metrics))
-            else:
-                st.caption("No violations.")
-
-        _stage_receipt_block("Batch", batch_questions, batch_ans)
-        if rs_sum is not None and not rs_sum.empty:
-            _stage_receipt_block("Rolling Starts", rolling_questions, rs_ans)
+    with st.expander(_ev_label, expanded=open_evidence):
+        if not open_evidence:
+            st.caption("Pick a strategy above and click **Open Evidence →** (or use **Inspect →** in Cards view) to open the autopsy drawer.")
         else:
-            st.info("Rolling Starts evidence is missing for this run (run it from Build & Run).")
-        if wf_sum is not None and not wf_sum.empty:
-            _stage_receipt_block("Walkforward", walkforward_questions, wf_ans)
-        else:
-            st.info("Walkforward evidence is missing for this run (run it from Build & Run).")
-
-        if cfg_norm:
-            with st.expander("Config (normalized)", expanded=False):
-                st.json(cfg_norm)
-
-    with _tab.get("Batch scan", _tab_containers[0]):
-        st.caption("Fast scan across the whole sample. Look for obvious deal-breakers (fee drag, drawdown, low trade activity).")
-
-        st.markdown("#### Backtest build sheet")
-        if art_dir and art_dir.exists():
-            eq_path = art_dir / "equity_curve.csv"
-            cfg_path = art_dir / "config.json"
-            met_path = art_dir / "metrics.json"
-            tr_path = art_dir / "trades.csv"
-            fi_path = art_dir / "fills.csv"
-
-
-            # ---------------------------
-            # Strategy build sheet (SPOT)
-            # ---------------------------
-            cfg_obj = _read_json(cfg_path)
-            met_obj = _read_json(met_path)
-
-            eq_df = _load_csv(eq_path)
-            if eq_df is None:
-                eq_df = pd.DataFrame()
-            tr_df = _load_csv(tr_path)
-            if tr_df is None:
-                tr_df = pd.DataFrame()
-
-            # Events are optional; if missing we still render the build.
-            ev_path = art_dir / "events.csv"
-            ev_df = _load_csv(ev_path) if ev_path.exists() else pd.DataFrame()
-
-            rr_sel = row if isinstance(row, dict) else {}
-            cid_sel = str(pick)
-            label_sel = str(rr_sel.get("label") or rr_sel.get("strategy_label") or rr_sel.get("config_label") or "").strip()
-            if not label_sel:
-                label_sel = cid_sel
-
-            # --- Config params (spot DCA/swing) ---
-            # Prefer replay artifact config.json; fall back to resolved normalized config if missing.
-            if not isinstance(cfg_obj, dict) or not cfg_obj:
-                cfg_obj = cfg_norm if isinstance(cfg_norm, dict) else {}
-
-            # Support both wrapped config {"strategy_name","side","params":{...}} and older params-only dict.
-            if isinstance(cfg_obj, dict) and isinstance(cfg_obj.get("params"), dict):
-                params = dict(cfg_obj.get("params") or {})
-            else:
-                params = dict(cfg_obj) if isinstance(cfg_obj, dict) else {}
-
-            strategy_name = str((cfg_obj.get("strategy_name") if isinstance(cfg_obj, dict) else None) or rr_sel.get("strategy_name") or "strategy").strip()
-            side = str((cfg_obj.get("side") if isinstance(cfg_obj, dict) else None) or rr_sel.get("side") or "long").strip().lower()
-
-            def _p(key: str, default: Any) -> Any:
-                v = params.get(key, None)
-                return default if v is None else v
-
-            # Defaults mirror dca_swing.py behavior.
-            deposit_freq = str(_p("deposit_freq", "none") or "none")
-            deposit_amt = float(_p("deposit_amount_usd", 0.0) or 0.0)
-
-            buy_freq = str(_p("buy_freq", "weekly") or "weekly")
-            buy_amt = float(_p("buy_amount_usd", 0.0) or 0.0)
-
-            buy_filter = str(_p("buy_filter", "none") or "none")
-            entry_logic = params.get("entry_logic") if isinstance(params.get("entry_logic"), dict) else None
-            n_clauses = len((entry_logic or {}).get("clauses") or []) if entry_logic else 0
-            n_regime = len((entry_logic or {}).get("regime") or []) if entry_logic else 0
-
-            max_alloc_pct = float(_p("max_alloc_pct", 1.0) or 1.0)
-            sl_pct = float(_p("sl_pct", 0.0) or 0.0)
-            trail_pct = float(_p("trail_pct", 0.0) or 0.0)
-            max_hold_bars = int(_p("max_hold_bars", 0) or 0)
-
-            tp_pct = float(_p("tp_pct", 0.0) or 0.0)
-            tp_sell_fraction = float(_p("tp_sell_fraction", 0.0) or 0.0)
-
-            # --- Core stats from selected row (already in artifacts) ---
-            batch_ret = rr_sel.get("performance.twr_total_return", np.nan)
-            batch_dd = rr_sel.get("performance.max_drawdown_equity", np.nan)
-
-            rs_p10 = rr_sel.get("twr_p10", np.nan)
-            rs_p50 = rr_sel.get("twr_p50", np.nan)
-            rs_fail = _rs_fail_rate(cid_sel)
-
-            wf_p10 = rr_sel.get("return_p10", np.nan)
-            wf_p50 = rr_sel.get("return_p50", np.nan)
-            wf_neg = rr_sel.get("pct_windows_negative", np.nan)
-
-            # Stability percentile is computed over visible population earlier (same as the cards)
-            score_pct = _score_pct.get(cid_sel) if isinstance(_score_pct, dict) else None
-
-            def _clamp01(x: Any) -> float:
-                try:
-                    v = float(x)
-                    if not math.isfinite(v):
-                        return 0.0
-                    return float(max(0.0, min(1.0, v)))
-                except Exception:
-                    return 0.0
-
-            # --- Trade stats (derived from trades.csv only) ---
-            trade_count = int(len(tr_df)) if tr_df is not None else 0
-            pnl_col = _pick_col(tr_df, ["net_pnl", "pnl_after_fees", "pnl", "gross_pnl"]) if trade_count else None
-            win_rate = np.nan
-            pf = np.nan
-            if pnl_col:
-                pnl = pd.to_numeric(tr_df[pnl_col], errors="coerce").fillna(0.0).astype(float)
-                win_rate = float((pnl > 0).mean()) if len(pnl) else np.nan
-                wins = float(pnl[pnl > 0].sum())
-                losses = float(pnl[pnl < 0].sum())
-                pf = (wins / abs(losses)) if losses < 0 else (float("inf") if wins > 0 else np.nan)
-
-            # Holding time
-            med_hold_days = np.nan
-            if trade_count and ("entry_dt" in tr_df.columns) and ("exit_dt" in tr_df.columns):
-                fmt = "%Y-%m-%d %H:%M:%S%z"
-                ent = pd.to_datetime(tr_df["entry_dt"], utc=True, errors="coerce", format=fmt, cache=True)
-                ex = pd.to_datetime(tr_df["exit_dt"], utc=True, errors="coerce", format=fmt, cache=True)
-                dur = (ex - ent).dt.total_seconds() / 86400.0
-                med_hold_days = float(dur.median()) if dur.notna().any() else np.nan
-
-            # Activity (trades / month) using equity curve date span if present
-            trades_per_month = np.nan
-            if eq_df is not None and not eq_df.empty:
-                xcol_tmp = _pick_col(eq_df, ["dt", "timestamp", "time", "date"])
-                if xcol_tmp:
-                    dts = pd.to_datetime(eq_df[xcol_tmp], utc=True, errors="coerce")
-                    dts = dts.dropna()
-                    if len(dts) >= 2:
-                        span_days = max((dts.max() - dts.min()).days, 1)
-                        months = span_days / 30.44
-                        trades_per_month = float(trade_count / months) if months > 0 else np.nan
-            try:
-                if not math.isfinite(float(trades_per_month)):
-                    trades_per_month = float(trade_count)
-            except Exception:
-                trades_per_month = float(trade_count)
-
-            # DCA intensity from events tape if present
-            adds_per_entry = np.nan
-            entries = 0
-            adds = 0
-            if ev_df is not None and not ev_df.empty and "event" in ev_df.columns:
-                entries = int((ev_df["event"].astype(str) == "ENTRY").sum())
-                adds = int((ev_df["event"].astype(str) == "ADD").sum())
-                adds_per_entry = float(adds / max(entries, 1))
-
-            # --- Build “traits” (game-style bars; deterministic transforms) ---
-            activity_score = _clamp01(float(trades_per_month) / 20.0)  # 20 trades/mo ~ max
-            patience_score = _clamp01(float(med_hold_days) / 14.0) if math.isfinite(float(med_hold_days)) else 0.0
-            dca_score = _clamp01(float(adds_per_entry) / 3.0) if math.isfinite(float(adds_per_entry)) else 0.0
-            toughness_score = _clamp01(1.0 - (float(batch_dd) / 0.25)) if math.isfinite(float(batch_dd)) else 0.0
-            consistency_score = _clamp01((float(rs_p10) + 0.10) / 0.25) if math.isfinite(float(rs_p10)) else 0.0
-            if rs_fail is not None and math.isfinite(float(rs_fail)):
-                consistency_score = _clamp01(consistency_score * (1.0 - float(rs_fail)))
-            general_score = _clamp01((float(wf_p10) + 0.10) / 0.25) if math.isfinite(float(wf_p10)) else 0.0
-
-            # “Overall fit” mirrors the Top-10 cards: base by grand verdict + percentile adjustment.
-            grand_v = str(rr_sel.get("grand_verdict") or rr_sel.get("verdict") or rr_sel.get("g.verdict") or "").upper().strip()
-            base = 0.75 if grand_v == "PASS" else (0.55 if grand_v == "WARN" else 0.35)
-            sp = float(score_pct) if (score_pct is not None and math.isfinite(float(score_pct))) else 0.50
-            adj = 0.20 * ((sp - 0.50) * 2.0)
-            confidence = float(max(0.0, min(1.0, base + adj)))
-
-            # Stage “checks passed”
-            batch_v = str(rr_sel.get("batchq.verdict") or rr_sel.get("batch.verdict") or rr_sel.get("batch_verdict") or "").upper().strip()
-            rs_v = str(rr_sel.get("rsq.verdict") or rr_sel.get("rs.verdict") or rr_sel.get("rs_verdict") or "").upper().strip()
-            wf_v = str(rr_sel.get("wfq.verdict") or rr_sel.get("wf.verdict") or rr_sel.get("wf_verdict") or "").upper().strip()
-
-            stage_checks = []
-            if batch_v:
-                stage_checks.append(batch_v)
-            if rs_sum is not None and not rs_sum.empty and rs_v:
-                stage_checks.append(rs_v)
-            if wf_sum is not None and not wf_sum.empty and wf_v:
-                stage_checks.append(wf_v)
-            checks_total = len(stage_checks)
-            checks_passed = sum(1 for x in stage_checks if x == "PASS")
-            checks_ratio = (checks_passed / checks_total) if checks_total else 0.0
-
-            # Grade (same logic as cards)
-            if grand_v == "PASS":
-                if score_pct is not None and score_pct >= 0.90:
-                    grade = "S"
-                elif score_pct is not None and score_pct >= 0.75:
-                    grade = "A"
-                else:
-                    grade = "A-"
-            elif grand_v == "WARN":
-                grade = "B"
-            else:
-                grade = "C"
-
-            # Top reason (receipt snippet)
-            top_reason = _top_reason_snippet(rr_sel) if "_top_reason_snippet" in globals() or True else ""
-            if not top_reason:
-                top_reason = "—"
-
-            with st.container(border=True):
-                st.caption("Diagnostics derived from saved historical backtest artifacts (spot only, no leverage). Not investment advice.")
-
-                # Header
-                hL, hR = st.columns([0.78, 0.22])
-                with hL:
-                    st.markdown(f"**{label_sel}**")
-                    st.caption(f"`{cid_sel}` · `{strategy_name}` · side: `{side}` · market: **spot**")
-                with hR:
-                    st.markdown(f"**#{int(rr_sel.get('rank', 0) or 0)}**" if rr_sel.get('rank') else "")
-                    st.caption(f"Rank band: **{grade}** (relative to this run)")
-
-                # Verdict strip (filters/results flags, not advice)
-                tags = [f"**Grand:** {_chip(grand_v)}"]
-                if batch_v:
-                    tags.append(f"**Batch:** {_chip(batch_v)}")
-                if rs_sum is not None and not rs_sum.empty and rs_v:
-                    tags.append(f"**RS:** {_chip(rs_v)}")
-                if wf_sum is not None and not wf_sum.empty and wf_v:
-                    tags.append(f"**WF:** {_chip(wf_v)}")
-                st.markdown(" &nbsp;|&nbsp; ".join(tags), unsafe_allow_html=True)
-
-                # Progress bars (gamified, but explicitly relative)
-                pL, pR = st.columns(2)
-                with pL:
-                    st.caption(f"Filters passed: {checks_passed}/{checks_total}" if checks_total else "Filters passed: —")
-                    st.progress(float(checks_ratio))
-                with pR:
-                    st.caption(f"Diagnostics score (relative): {int(round(confidence * 100))}/100")
-                    st.progress(float(confidence))
-
-                # Three-panel layout: config | characteristics | diagnostics
-                c1, c2, c3 = st.columns([0.38, 0.34, 0.28])
-
-                with c1:
-                    st.markdown("**Configuration**")
-                    # Render effective schedule/readout (neutral wording; not advice).
-                    dep_off = (str(deposit_freq).strip().lower() in {"none", "off", "0", ""} or float(deposit_amt) <= 0.0)
-                    buy_off = (str(buy_freq).strip().lower() in {"none", "off", "0", ""} or float(buy_amt) <= 0.0)
-                    dep_desc = "`off`" if dep_off else f"`{deposit_freq}` · `${deposit_amt:,.0f}`"
-                    buy_desc = "`off`" if buy_off else f"`{buy_freq}` · `${buy_amt:,.0f}`"
-
-                    if entry_logic:
-                        if n_clauses or n_regime:
-                            entry_desc = f"`logic` (clauses {n_clauses}, regime {n_regime})"
-                        else:
-                            entry_desc = "`logic`"
-                    elif buy_filter and str(buy_filter).lower() != "none":
-                        entry_desc = f"`{buy_filter}`"
-                    else:
-                        entry_desc = f"`scheduled` ({buy_freq})" if not buy_off else "`off`"
-
-                    st.markdown(
-                        f"- **Cash additions:** {dep_desc}\n"
-                        f"- **Buy schedule:** {buy_desc}\n"
-                        f"- **Entry rule:** {entry_desc}\n"
-                        f"- **Allocation cap:** `{max_alloc_pct * 100:.0f}%`\n"
-                        f"- **Risk controls:** SL `{sl_pct * 100:.1f}%` · Trail `{trail_pct * 100:.1f}%` · Time `{max_hold_bars}` bars\n"
-                        f"- **Take profit:** `{tp_pct * 100:.1f}%` · sell `{tp_sell_fraction * 100:.0f}%`"
-                    )
-
-                with c2:
-                    st.markdown("**Derived characteristics**")
-                    tL, tR = st.columns(2)
-                    with tL:
-                        st.caption(f"Trade frequency · {trades_per_month:.2f}/mo" if math.isfinite(float(trades_per_month)) else "Trade frequency · —")
-                        st.progress(float(activity_score))
-                        st.caption(f"Median hold · {med_hold_days:.2f} days" if math.isfinite(float(med_hold_days)) else "Median hold · —")
-                        st.progress(float(patience_score))
-                        st.caption(f"Adds per entry · {adds_per_entry:.2f}" if math.isfinite(float(adds_per_entry)) else "Adds per entry · —")
-                        st.progress(float(dca_score))
-                    with tR:
-                        st.caption(f"Drawdown score · Max DD {_fmt_pct(batch_dd)}" if math.isfinite(float(batch_dd)) else "Drawdown score · —")
-                        st.progress(float(toughness_score))
-                        st.caption(f"RS stability · p10 {_fmt_pct(rs_p10)}" if math.isfinite(float(rs_p10)) else "RS stability · —")
-                        st.progress(float(consistency_score))
-                        st.caption(f"WF stability · p10 {_fmt_pct(wf_p10)}" if math.isfinite(float(wf_p10)) else "WF stability · —")
-                        st.progress(float(general_score))
-
-                with c3:
-                    st.markdown("**Diagnostics**")
-                    d1, d2 = st.columns(2)
-                    with d1:
-                        st.metric("Stability score", f"{int(round(score_pct * 100))}th pct" if (score_pct is not None and math.isfinite(float(score_pct))) else "—")
-                        st.metric("Batch return", _fmt_pct(batch_ret))
-                    with d2:
-                        st.metric("Max DD", _fmt_pct(batch_dd))
-                        st.metric("Trades", f"{trade_count}")
-
-                    # RS / WF summaries (text to avoid tall metric stacks)
-                    if math.isfinite(float(rs_p10)):
-                        fr = "—" if rs_fail is None else f"{rs_fail * 100:.0f}%"
-                        st.caption(f"RS: p10 {_fmt_pct(rs_p10)} · p50 {_fmt_pct(rs_p50)} · fail {fr} (thr {_fmt_pct(_rs_fail_thr, digits=0)})")
-                    else:
-                        st.caption("RS: —")
-                    if math.isfinite(float(wf_p10)) or math.isfinite(float(wf_p50)):
-                        neg_txt = f"{float(wf_neg) * 100:.0f}% neg" if math.isfinite(float(wf_neg)) else "neg: —"
-                        st.caption(f"WF: p10 {_fmt_pct(wf_p10)} · p50 {_fmt_pct(wf_p50)} · {neg_txt}")
-                    else:
-                        st.caption("WF: missing")
-
-                    # Trade outcome stats
-                    wr_txt = f"{win_rate * 100:.0f}%" if math.isfinite(float(win_rate)) else "—"
-                    pf_txt = (f"{pf:.2f}" if (pf is not None and math.isfinite(float(pf)) and pf != float('inf')) else ("∞" if pf == float('inf') else "—"))
-                    hold_txt = f"{med_hold_days:.2f} d" if math.isfinite(float(med_hold_days)) else "—"
-                    st.caption(f"Outcomes: win {wr_txt} · PF {pf_txt} · median hold {hold_txt}")
-
-                # Constraint highlight
-                st.markdown(f"**Constraint hit:** {top_reason}")
-
-                with st.expander("Show full configuration", expanded=False):
-                    st.json(params if isinstance(params, dict) else cfg_obj)
-
-            st.divider()
-            st.markdown("#### Batch replay artifacts")
-
-
-            # Price + event timeline (receipts on the tape)
-            ev_path = art_dir / "events.csv"
-            if ev_path.exists():
-                st.markdown("##### Price + event timeline (entries/exits/TPs on the tape)")
-                ev = _load_csv(ev_path)
-                if ev is None or ev.empty:
-                    st.info("events.csv exists, but it has 0 rows (likely generated before event logging was added, or the replay generator hit an error).")
-                    # Allow regeneration even if cached artifacts exist (needed when new artifact types are added).
-                    replay_script = REPO_ROOT / "tools" / "generate_replay_artifacts.py"
-                    can_replay = (run_dir / "configs_resolved.jsonl").exists() and replay_script.exists()
-                    if st.button("Regenerate replay artifacts (refresh cache)", key=f"replay.regen.empty.{pick}", disabled=(not can_replay)):
-                        try:
-                            if replay_dir.exists():
-                                shutil.rmtree(replay_dir)
-                        except Exception:
-                            pass
-                        cmd = [PY, str(replay_script), "--from-run", str(run_dir), "--config-id", str(pick)]
-                        _run_cmd(cmd, cwd=REPO_ROOT, label="Replay: regenerate artifacts")
-                        st.rerun()
-                else:
-                    if "dt" in ev.columns:
-                        ev["dt"] = pd.to_datetime(ev["dt"], errors="coerce", utc=True)
-                    ev = ev.dropna(subset=["dt"]).sort_values("dt")
-
-                    # Load price series from df_feat (preferred) for the exact run's training tape
-                    price = None
-                    feat_path = run_dir / "df_feat.parquet"
-                    if feat_path.exists():
-                        try:
-                            # Try fast column-select read first
-                            price = pd.read_parquet(feat_path, columns=["dt", "close"])
-                        except Exception:
-                            try:
-                                df_tmp = pd.read_parquet(feat_path)
-                                if "dt" in df_tmp.columns and "close" in df_tmp.columns:
-                                    price = df_tmp[["dt", "close"]].copy()
-                            except Exception:
-                                price = None
-
-                    if price is not None and not price.empty and "dt" in price.columns:
-                        price["dt"] = pd.to_datetime(price["dt"], errors="coerce", utc=True)
-                        price = price.dropna(subset=["dt"]).sort_values("dt")
-
-                        # Focus the view around event range (with buffer)
-                        if not ev.empty:
-                            lo = ev["dt"].min() - pd.Timedelta(days=7)
-                            hi = ev["dt"].max() + pd.Timedelta(days=7)
-                            price = price[(price["dt"] >= lo) & (price["dt"] <= hi)]
-
-                        # Downsample for speed (plotly gets sluggish with huge lines)
-                        max_points = 3500
-                        if len(price) > max_points:
-                            idxs = np.linspace(0, len(price) - 1, max_points).astype(int)
-                            price = price.iloc[idxs]
-
-                        show_events = st.multiselect(
-                            "Show events",
-                            ["ENTRY", "ADD", "TP", "EXIT"],
-                            default=["ENTRY", "TP", "EXIT"],
-                            key=f"ev_show_{pick}",
-                        )
-
-                        if go is not None:
-                            fig_ev = go.Figure()
-                            fig_ev.add_trace(
-                                go.Scatter(
-                                    x=price["dt"],
-                                    y=price["close"],
-                                    mode="lines",
-                                    name="Close",
-                                )
-                            )
-
-                            def _add_ev(etype: str, symbol: str, name: str):
-                                if etype not in show_events:
-                                    return
-                                sub = ev[ev.get("event") == etype] if "event" in ev.columns else pd.DataFrame()
-                                if sub is None or sub.empty:
-                                    return
-                                y = pd.to_numeric(sub.get("price"), errors="coerce")
-                                text = None
-                                if "reason" in sub.columns or "detail" in sub.columns:
-                                    if "reason" in sub.columns:
-                                        r = sub["reason"].fillna("").astype(str)
-                                    else:
-                                        r = pd.Series([""] * len(sub), index=sub.index)
-                                    if "detail" in sub.columns:
-                                        d = sub["detail"].fillna("").astype(str)
-                                    else:
-                                        d = pd.Series([""] * len(sub), index=sub.index)
-                                    text = (r + "\n" + d).str.strip()
-                                fig_ev.add_trace(
-                                    go.Scatter(
-                                        x=sub["dt"],
-                                        y=y,
-                                        mode="markers",
-                                        name=name,
-                                        marker=dict(symbol=symbol, size=10),
-                                        text=text,
-                                        hovertemplate="%{x}<br>%{y}<br>%{text}<extra></extra>" if text is not None else "%{x}<br>%{y}<extra></extra>",
-                                    )
-                                )
-
-                            _add_ev("ENTRY", "triangle-up", "Entry")
-                            _add_ev("ADD", "circle", "Add (DCA)")
-                            _add_ev("TP", "diamond", "TP / Partial sell")
-                            _add_ev("EXIT", "triangle-down", "Exit")
-
-                            fig_ev.update_layout(
-                                height=430,
-                                margin=dict(l=10, r=10, t=10, b=10),
-                                xaxis_title="Date",
-                                yaxis_title="Price",
-                                legend=dict(orientation="h", yanchor="bottom", y=1.10, xanchor="left", x=0, font=dict(size=12)),
-                            )
-                            _plotly(fig_ev)
-                        else:
-                            st.info("Plotly is not available; cannot render event timeline chart.")
-                    else:
-                        st.info("events.csv exists, but df_feat.parquet (dt/close) isn't available for price overlay.")
-                st.download_button("Download events.csv", data=ev_path.read_bytes(), file_name=f"{pick}_events.csv")
-            else:
-                st.caption("No events.csv found for this config yet (replay artifacts need regeneration).")
-
-                # Allow regeneration even if cached artifacts exist (needed when new artifact types are added).
-                replay_script = REPO_ROOT / "tools" / "generate_replay_artifacts.py"
-                can_replay = (run_dir / "configs_resolved.jsonl").exists() and replay_script.exists()
-                if st.button("Regenerate replay artifacts (refresh cache)", key=f"replay.regen.{pick}", disabled=(not can_replay)):
-                    try:
-                        if replay_dir.exists():
-                            shutil.rmtree(replay_dir)
-                    except Exception:
-                        pass
-                    cmd = [PY, str(replay_script), "--from-run", str(run_dir), "--config-id", str(pick)]
-                    _run_cmd(cmd, cwd=REPO_ROOT, label="Replay: regenerate artifacts")
+            # Drawer controls
+            _cL, _cR = st.columns([0.78, 0.22])
+            with _cL:
+                st.caption("Autopsy for the selected strategy. Close the drawer to keep browsing the shortlist.")
+            with _cR:
+                if st.button("Close", key="evidence.close"):
+                    st.session_state["ui.open_evidence"] = False
                     st.rerun()
 
 
+            row = df2[df2["config_id"].astype(str) == str(pick)].iloc[0].to_dict()
+
+            cfg_map = {r.get("config_id"): r.get("normalized") for r in _load_jsonl(run_dir / "configs_resolved.jsonl")}
+            cfg_norm = cfg_map.get(str(pick), {})
+
+            art_dir = top_map.get(str(pick))
+            if not (art_dir and art_dir.exists()):
+                cache_dir = run_dir / "replay_cache" / str(pick)
+                if cache_dir.exists():
+                    art_dir = cache_dir
+
+            st.divider()
+
+            # Selected strategy summary (quick read before diving into tabs)
+            with st.container(border=True):
+                st.markdown("#### Selected strategy")
+                dd_col_s = _pick_col(df2, ["performance.max_drawdown_equity", "performance.max_drawdown", "equity.max_drawdown", "dd_p90"])
+                ret_col_s = _pick_col(df2, ["performance.twr_total_return", "equity.net_profit_ex_cashflows", "equity.net_profit", "return_p50"])
+
+                v_grand = str(row.get("grand.verdict", "—"))
+                v_rs = str(row.get("rsq.verdict", row.get("rs.verdict", "UNMEASURED")))
+                v_wf = str(row.get("wfq.verdict", row.get("wf.verdict", "UNMEASURED")))
+
+                score_s = row.get("score.grand_robust", row.get("robustness_score", None))
+
+                dd_s = None
+                if dd_col_s:
+                    try:
+                        dd_s = _drawdown_to_frac(pd.to_numeric(pd.Series([row.get(dd_col_s)]), errors="coerce")).iloc[0]
+                    except Exception:
+                        dd_s = None
+
+                ret_s = None
+                is_currency_s = False
+                if ret_col_s:
+                    try:
+                        ret_s = float(pd.to_numeric(pd.Series([row.get(ret_col_s)]), errors="coerce").iloc[0])
+                        is_currency_s = ("net_profit" in str(ret_col_s).lower()) or ("profit" in str(ret_col_s).lower() and "return" not in str(ret_col_s).lower())
+                    except Exception:
+                        ret_s = None
+
+                s1, s2, s3, s4 = st.columns(4)
+                s1.metric("ID", str(pick))
+                s2.metric("Grand verdict", str(v_grand))
+                s3.metric("Stability score", _fmt_num(score_s, digits=3) if score_s is not None else "—")
+                if is_currency_s and ret_s is not None and math.isfinite(float(ret_s)):
+                    s4.metric("Net profit", f"${ret_s:,.0f}")
+                else:
+                    s4.metric("Total return", _fmt_pct(ret_s, digits=1) if (ret_s is not None and math.isfinite(float(ret_s))) else "—")
+
+                b1, b2, b3 = st.columns(3)
+                b1.metric("Max drawdown", _fmt_pct(dd_s, digits=1) if (dd_s is not None and math.isfinite(float(dd_s))) else "—")
+                b2.metric("Rolling Starts", str(v_rs))
+                b3.metric("Walkforward", str(v_wf))
+
+                st.caption("Tip: Start with **Batch scan** → then check **Start-date test** (Rolling Starts) → then **Time-split test** (Walkforward).")
 
 
-            if eq_path.exists():
-                eq = _load_csv(eq_path)
-                if eq is not None and not eq.empty:
-                    if "dt" in eq.columns:
-                        eq["dt"] = pd.to_datetime(eq["dt"], errors="coerce", utc=True)
+            _jump_tab = str(st.session_state.pop('ui.jump_tab', ''))
+            _tabs_base = ['Receipts', 'Batch scan', 'Start-date test', 'Time-split test', 'Exports']
 
-                    # Equity vs contributions (+ optional profit) + drawdown
-                    if go is not None and make_subplots is not None and "equity" in eq.columns:
+            # Keep tab order stable across reruns (but allow a one-off jump when opening the drawer).
+            if 'ui.evidence_tab_order' not in st.session_state:
+                st.session_state['ui.evidence_tab_order'] = list(_tabs_base)
+            if _jump_tab and _jump_tab in _tabs_base:
+                st.session_state['ui.evidence_tab_order'] = [_jump_tab] + [t for t in _tabs_base if t != _jump_tab]
+
+            _tabs = st.session_state.get('ui.evidence_tab_order', list(_tabs_base))
+            _tab_containers = st.tabs(_tabs)
+            _tab = dict(zip(_tabs, _tab_containers))
+
+            with _tab.get("Receipts", _tab_containers[0]):
+                st.caption("High-level autopsy for the selected strategy: what it does, what it earned, and the biggest failure modes.")
+
+                st.markdown("#### Receipts (why the verdict is what it is)")
+
+                def _stage_receipt_block(title: str, q_fn, ans: Dict[str, int]) -> None:
+                    out = evaluate_row_with_questions(row, q_fn(), ans)
+                    badge = out.verdict
+                    st.markdown(f"**{title}: `{badge}`**  —  {out.crits} crit, {out.warns} warn, {out.missing} missing")
+                    if out.violations:
+                        vdf = pd.DataFrame(out.violations)
+                        keep = [c for c in ["severity", "metric", "value", "op", "threshold", "message"] if c in vdf.columns]
+                        st.dataframe(vdf[keep], width="stretch", height=240)
+                    elif out.missing_metrics:
+                        st.caption("No violations, but some metrics were missing for this stage.")
+                        st.code(", ".join(out.missing_metrics))
+                    else:
+                        st.caption("No violations.")
+
+                _stage_receipt_block("Batch", batch_questions, batch_ans)
+                if rs_sum is not None and not rs_sum.empty:
+                    _stage_receipt_block("Rolling Starts", rolling_questions, rs_ans)
+                else:
+                    st.info("Rolling Starts evidence is missing for this run (run it from Build & Run).")
+                if wf_sum is not None and not wf_sum.empty:
+                    _stage_receipt_block("Walkforward", walkforward_questions, wf_ans)
+                else:
+                    st.info("Walkforward evidence is missing for this run (run it from Build & Run).")
+
+                if cfg_norm:
+                    with st.expander("Config (normalized)", expanded=False):
+                        st.json(cfg_norm)
+
+            with _tab.get("Batch scan", _tab_containers[0]):
+                st.caption("Fast scan across the whole sample. Look for obvious deal-breakers (fee drag, drawdown, low trade activity).")
+
+                st.markdown("#### Backtest build sheet")
+                if art_dir and art_dir.exists():
+                    eq_path = art_dir / "equity_curve.csv"
+                    cfg_path = art_dir / "config.json"
+                    met_path = art_dir / "metrics.json"
+                    tr_path = art_dir / "trades.csv"
+                    fi_path = art_dir / "fills.csv"
+
+
+                    # ---------------------------
+                    # Strategy build sheet (SPOT)
+                    # ---------------------------
+                    cfg_obj = _read_json(cfg_path)
+                    met_obj = _read_json(met_path)
+
+                    eq_df = _load_csv(eq_path)
+                    if eq_df is None:
+                        eq_df = pd.DataFrame()
+                    tr_df = _load_csv(tr_path)
+                    if tr_df is None:
+                        tr_df = pd.DataFrame()
+
+                    # Events are optional; if missing we still render the build.
+                    ev_path = art_dir / "events.csv"
+                    ev_df = _load_csv(ev_path) if ev_path.exists() else pd.DataFrame()
+
+                    rr_sel = row if isinstance(row, dict) else {}
+                    cid_sel = str(pick)
+                    label_sel = str(rr_sel.get("label") or rr_sel.get("strategy_label") or rr_sel.get("config_label") or "").strip()
+                    if not label_sel:
+                        label_sel = cid_sel
+
+                    # --- Config params (spot DCA/swing) ---
+                    # Prefer replay artifact config.json; fall back to resolved normalized config if missing.
+                    if not isinstance(cfg_obj, dict) or not cfg_obj:
+                        cfg_obj = cfg_norm if isinstance(cfg_norm, dict) else {}
+
+                    # Support both wrapped config {"strategy_name","side","params":{...}} and older params-only dict.
+                    if isinstance(cfg_obj, dict) and isinstance(cfg_obj.get("params"), dict):
+                        params = dict(cfg_obj.get("params") or {})
+                    else:
+                        params = dict(cfg_obj) if isinstance(cfg_obj, dict) else {}
+
+                    strategy_name = str((cfg_obj.get("strategy_name") if isinstance(cfg_obj, dict) else None) or rr_sel.get("strategy_name") or "strategy").strip()
+                    side = str((cfg_obj.get("side") if isinstance(cfg_obj, dict) else None) or rr_sel.get("side") or "long").strip().lower()
+
+                    def _p(key: str, default: Any) -> Any:
+                        v = params.get(key, None)
+                        return default if v is None else v
+
+                    # Defaults mirror dca_swing.py behavior.
+                    deposit_freq = str(_p("deposit_freq", "none") or "none")
+                    deposit_amt = float(_p("deposit_amount_usd", 0.0) or 0.0)
+
+                    buy_freq = str(_p("buy_freq", "weekly") or "weekly")
+                    buy_amt = float(_p("buy_amount_usd", 0.0) or 0.0)
+
+                    buy_filter = str(_p("buy_filter", "none") or "none")
+                    entry_logic = params.get("entry_logic") if isinstance(params.get("entry_logic"), dict) else None
+                    n_clauses = len((entry_logic or {}).get("clauses") or []) if entry_logic else 0
+                    n_regime = len((entry_logic or {}).get("regime") or []) if entry_logic else 0
+
+                    max_alloc_pct = float(_p("max_alloc_pct", 1.0) or 1.0)
+                    sl_pct = float(_p("sl_pct", 0.0) or 0.0)
+                    trail_pct = float(_p("trail_pct", 0.0) or 0.0)
+                    max_hold_bars = int(_p("max_hold_bars", 0) or 0)
+
+                    tp_pct = float(_p("tp_pct", 0.0) or 0.0)
+                    tp_sell_fraction = float(_p("tp_sell_fraction", 0.0) or 0.0)
+
+                    # --- Core stats from selected row (already in artifacts) ---
+                    batch_ret = rr_sel.get("performance.twr_total_return", np.nan)
+                    batch_dd = rr_sel.get("performance.max_drawdown_equity", np.nan)
+
+                    rs_p10 = rr_sel.get("twr_p10", np.nan)
+                    rs_p50 = rr_sel.get("twr_p50", np.nan)
+                    rs_fail = _rs_fail_rate(cid_sel)
+
+                    wf_p10 = rr_sel.get("return_p10", np.nan)
+                    wf_p50 = rr_sel.get("return_p50", np.nan)
+                    wf_neg = rr_sel.get("pct_windows_negative", np.nan)
+
+                    # Stability percentile is computed over visible population earlier (same as the cards)
+                    score_pct = _score_pct.get(cid_sel) if isinstance(_score_pct, dict) else None
+
+                    def _clamp01(x: Any) -> float:
                         try:
-                            eq2 = eq.copy()
-                            eq2["equity"] = pd.to_numeric(eq2["equity"], errors="coerce")
-                            eq2 = eq2.dropna(subset=["equity"])
-                            if not eq2.empty:
-                                xcol = "dt" if "dt" in eq2.columns else None
+                            v = float(x)
+                            if not math.isfinite(v):
+                                return 0.0
+                            return float(max(0.0, min(1.0, v)))
+                        except Exception:
+                            return 0.0
 
-                                # Prefer columns precomputed in replay artifacts; fall back for legacy caches.
-                                cf = pd.to_numeric(eq2["cashflow"], errors="coerce").fillna(0.0) if "cashflow" in eq2.columns else pd.Series([0.0] * len(eq2), index=eq2.index)
-                                deposits = cf.clip(lower=0.0)
+                    # --- Trade stats (derived from trades.csv only) ---
+                    trade_count = int(len(tr_df)) if tr_df is not None else 0
+                    pnl_col = _pick_col(tr_df, ["net_pnl", "pnl_after_fees", "pnl", "gross_pnl"]) if trade_count else None
+                    win_rate = np.nan
+                    pf = np.nan
+                    if pnl_col:
+                        pnl = pd.to_numeric(tr_df[pnl_col], errors="coerce").fillna(0.0).astype(float)
+                        win_rate = float((pnl > 0).mean()) if len(pnl) else np.nan
+                        wins = float(pnl[pnl > 0].sum())
+                        losses = float(pnl[pnl < 0].sum())
+                        pf = (wins / abs(losses)) if losses < 0 else (float("inf") if wins > 0 else np.nan)
 
-                                if "contrib_total" not in eq2.columns:
-                                    contrib0 = float(eq2["equity"].iloc[0])
-                                    eq2["contrib_total"] = contrib0 + deposits.cumsum()
+                    # Holding time
+                    med_hold_days = np.nan
+                    if trade_count and ("entry_dt" in tr_df.columns) and ("exit_dt" in tr_df.columns):
+                        fmt = "%Y-%m-%d %H:%M:%S%z"
+                        ent = pd.to_datetime(tr_df["entry_dt"], utc=True, errors="coerce", format=fmt, cache=True)
+                        ex = pd.to_datetime(tr_df["exit_dt"], utc=True, errors="coerce", format=fmt, cache=True)
+                        dur = (ex - ent).dt.total_seconds() / 86400.0
+                        med_hold_days = float(dur.median()) if dur.notna().any() else np.nan
+
+                    # Activity (trades / month) using equity curve date span if present
+                    trades_per_month = np.nan
+                    if eq_df is not None and not eq_df.empty:
+                        xcol_tmp = _pick_col(eq_df, ["dt", "timestamp", "time", "date"])
+                        if xcol_tmp:
+                            dts = pd.to_datetime(eq_df[xcol_tmp], utc=True, errors="coerce")
+                            dts = dts.dropna()
+                            if len(dts) >= 2:
+                                span_days = max((dts.max() - dts.min()).days, 1)
+                                months = span_days / 30.44
+                                trades_per_month = float(trade_count / months) if months > 0 else np.nan
+                    try:
+                        if not math.isfinite(float(trades_per_month)):
+                            trades_per_month = float(trade_count)
+                    except Exception:
+                        trades_per_month = float(trade_count)
+
+                    # DCA intensity from events tape if present
+                    adds_per_entry = np.nan
+                    entries = 0
+                    adds = 0
+                    if ev_df is not None and not ev_df.empty and "event" in ev_df.columns:
+                        entries = int((ev_df["event"].astype(str) == "ENTRY").sum())
+                        adds = int((ev_df["event"].astype(str) == "ADD").sum())
+                        adds_per_entry = float(adds / max(entries, 1))
+
+                    # --- Build “traits” (game-style bars; deterministic transforms) ---
+                    activity_score = _clamp01(float(trades_per_month) / 20.0)  # 20 trades/mo ~ max
+                    patience_score = _clamp01(float(med_hold_days) / 14.0) if math.isfinite(float(med_hold_days)) else 0.0
+                    dca_score = _clamp01(float(adds_per_entry) / 3.0) if math.isfinite(float(adds_per_entry)) else 0.0
+                    toughness_score = _clamp01(1.0 - (float(batch_dd) / 0.25)) if math.isfinite(float(batch_dd)) else 0.0
+                    consistency_score = _clamp01((float(rs_p10) + 0.10) / 0.25) if math.isfinite(float(rs_p10)) else 0.0
+                    if rs_fail is not None and math.isfinite(float(rs_fail)):
+                        consistency_score = _clamp01(consistency_score * (1.0 - float(rs_fail)))
+                    general_score = _clamp01((float(wf_p10) + 0.10) / 0.25) if math.isfinite(float(wf_p10)) else 0.0
+
+                    # “Overall fit” mirrors the Top-10 cards: base by grand verdict + percentile adjustment.
+                    grand_v = str(rr_sel.get("grand_verdict") or rr_sel.get("verdict") or rr_sel.get("g.verdict") or "").upper().strip()
+                    base = 0.75 if grand_v == "PASS" else (0.55 if grand_v == "WARN" else 0.35)
+                    sp = float(score_pct) if (score_pct is not None and math.isfinite(float(score_pct))) else 0.50
+                    adj = 0.20 * ((sp - 0.50) * 2.0)
+                    confidence = float(max(0.0, min(1.0, base + adj)))
+
+                    # Stage “checks passed”
+                    batch_v = str(rr_sel.get("batchq.verdict") or rr_sel.get("batch.verdict") or rr_sel.get("batch_verdict") or "").upper().strip()
+                    rs_v = str(rr_sel.get("rsq.verdict") or rr_sel.get("rs.verdict") or rr_sel.get("rs_verdict") or "").upper().strip()
+                    wf_v = str(rr_sel.get("wfq.verdict") or rr_sel.get("wf.verdict") or rr_sel.get("wf_verdict") or "").upper().strip()
+
+                    stage_checks = []
+                    if batch_v:
+                        stage_checks.append(batch_v)
+                    if rs_sum is not None and not rs_sum.empty and rs_v:
+                        stage_checks.append(rs_v)
+                    if wf_sum is not None and not wf_sum.empty and wf_v:
+                        stage_checks.append(wf_v)
+                    checks_total = len(stage_checks)
+                    checks_passed = sum(1 for x in stage_checks if x == "PASS")
+                    checks_ratio = (checks_passed / checks_total) if checks_total else 0.0
+
+                    # Grade (same logic as cards)
+                    if grand_v == "PASS":
+                        if score_pct is not None and score_pct >= 0.90:
+                            grade = "S"
+                        elif score_pct is not None and score_pct >= 0.75:
+                            grade = "A"
+                        else:
+                            grade = "A-"
+                    elif grand_v == "WARN":
+                        grade = "B"
+                    else:
+                        grade = "C"
+
+                    # Top reason (receipt snippet)
+                    top_reason = _top_reason_snippet(rr_sel) if "_top_reason_snippet" in globals() or True else ""
+                    if not top_reason:
+                        top_reason = "—"
+
+                    with st.container(border=True):
+                        st.caption("Diagnostics derived from saved historical backtest artifacts (spot only, no leverage). Not investment advice.")
+
+                        # Header
+                        hL, hR = st.columns([0.78, 0.22])
+                        with hL:
+                            st.markdown(f"**{label_sel}**")
+                            st.caption(f"`{cid_sel}` · `{strategy_name}` · side: `{side}` · market: **spot**")
+                        with hR:
+                            st.markdown(f"**#{int(rr_sel.get('rank', 0) or 0)}**" if rr_sel.get('rank') else "")
+                            st.caption(f"Rank band: **{grade}** (relative to this run)")
+
+                        # Verdict strip (filters/results flags, not advice)
+                        tags = [f"**Grand:** {_chip(grand_v)}"]
+                        if batch_v:
+                            tags.append(f"**Batch:** {_chip(batch_v)}")
+                        if rs_sum is not None and not rs_sum.empty and rs_v:
+                            tags.append(f"**RS:** {_chip(rs_v)}")
+                        if wf_sum is not None and not wf_sum.empty and wf_v:
+                            tags.append(f"**WF:** {_chip(wf_v)}")
+                        st.markdown(" &nbsp;|&nbsp; ".join(tags), unsafe_allow_html=True)
+
+                        # Progress bars (gamified, but explicitly relative)
+                        pL, pR = st.columns(2)
+                        with pL:
+                            st.caption(f"Filters passed: {checks_passed}/{checks_total}" if checks_total else "Filters passed: —")
+                            st.progress(float(checks_ratio))
+                        with pR:
+                            st.caption(f"Diagnostics score (relative): {int(round(confidence * 100))}/100")
+                            st.progress(float(confidence))
+
+                        # Three-panel layout: config | characteristics | diagnostics
+                        c1, c2, c3 = st.columns([0.38, 0.34, 0.28])
+
+                        with c1:
+                            st.markdown("**Configuration**")
+                            # Render effective schedule/readout (neutral wording; not advice).
+                            dep_off = (str(deposit_freq).strip().lower() in {"none", "off", "0", ""} or float(deposit_amt) <= 0.0)
+                            buy_off = (str(buy_freq).strip().lower() in {"none", "off", "0", ""} or float(buy_amt) <= 0.0)
+                            dep_desc = "`off`" if dep_off else f"`{deposit_freq}` · `${deposit_amt:,.0f}`"
+                            buy_desc = "`off`" if buy_off else f"`{buy_freq}` · `${buy_amt:,.0f}`"
+
+                            if entry_logic:
+                                if n_clauses or n_regime:
+                                    entry_desc = f"`logic` (clauses {n_clauses}, regime {n_regime})"
                                 else:
-                                    eq2["contrib_total"] = pd.to_numeric(eq2["contrib_total"], errors="coerce")
+                                    entry_desc = "`logic`"
+                            elif buy_filter and str(buy_filter).lower() != "none":
+                                entry_desc = f"`{buy_filter}`"
+                            else:
+                                entry_desc = f"`scheduled` ({buy_freq})" if not buy_off else "`off`"
 
-                                if "profit" not in eq2.columns:
-                                    eq2["profit"] = eq2["equity"] - eq2["contrib_total"]
+                            st.markdown(
+                                f"- **Cash additions:** {dep_desc}\n"
+                                f"- **Buy schedule:** {buy_desc}\n"
+                                f"- **Entry rule:** {entry_desc}\n"
+                                f"- **Allocation cap:** `{max_alloc_pct * 100:.0f}%`\n"
+                                f"- **Risk controls:** SL `{sl_pct * 100:.1f}%` · Trail `{trail_pct * 100:.1f}%` · Time `{max_hold_bars}` bars\n"
+                                f"- **Take profit:** `{tp_pct * 100:.1f}%` · sell `{tp_sell_fraction * 100:.0f}%`"
+                            )
+
+                        with c2:
+                            st.markdown("**Derived characteristics**")
+                            tL, tR = st.columns(2)
+                            with tL:
+                                st.caption(f"Trade frequency · {trades_per_month:.2f}/mo" if math.isfinite(float(trades_per_month)) else "Trade frequency · —")
+                                st.progress(float(activity_score))
+                                st.caption(f"Median hold · {med_hold_days:.2f} days" if math.isfinite(float(med_hold_days)) else "Median hold · —")
+                                st.progress(float(patience_score))
+                                st.caption(f"Adds per entry · {adds_per_entry:.2f}" if math.isfinite(float(adds_per_entry)) else "Adds per entry · —")
+                                st.progress(float(dca_score))
+                            with tR:
+                                st.caption(f"Drawdown score · Max DD {_fmt_pct(batch_dd)}" if math.isfinite(float(batch_dd)) else "Drawdown score · —")
+                                st.progress(float(toughness_score))
+                                st.caption(f"RS stability · p10 {_fmt_pct(rs_p10)}" if math.isfinite(float(rs_p10)) else "RS stability · —")
+                                st.progress(float(consistency_score))
+                                st.caption(f"WF stability · p10 {_fmt_pct(wf_p10)}" if math.isfinite(float(wf_p10)) else "WF stability · —")
+                                st.progress(float(general_score))
+
+                        with c3:
+                            st.markdown("**Diagnostics**")
+                            d1, d2 = st.columns(2)
+                            with d1:
+                                st.metric("Stability score", f"{int(round(score_pct * 100))}th pct" if (score_pct is not None and math.isfinite(float(score_pct))) else "—")
+                                st.metric("Batch return", _fmt_pct(batch_ret))
+                            with d2:
+                                st.metric("Max DD", _fmt_pct(batch_dd))
+                                st.metric("Trades", f"{trade_count}")
+
+                            # RS / WF summaries (text to avoid tall metric stacks)
+                            if math.isfinite(float(rs_p10)):
+                                fr = "—" if rs_fail is None else f"{rs_fail * 100:.0f}%"
+                                st.caption(f"RS: p10 {_fmt_pct(rs_p10)} · p50 {_fmt_pct(rs_p50)} · fail {fr} (thr {_fmt_pct(_rs_fail_thr, digits=0)})")
+                            else:
+                                st.caption("RS: —")
+                            if math.isfinite(float(wf_p10)) or math.isfinite(float(wf_p50)):
+                                neg_txt = f"{float(wf_neg) * 100:.0f}% neg" if math.isfinite(float(wf_neg)) else "neg: —"
+                                st.caption(f"WF: p10 {_fmt_pct(wf_p10)} · p50 {_fmt_pct(wf_p50)} · {neg_txt}")
+                            else:
+                                st.caption("WF: missing")
+
+                            # Trade outcome stats
+                            wr_txt = f"{win_rate * 100:.0f}%" if math.isfinite(float(win_rate)) else "—"
+                            pf_txt = (f"{pf:.2f}" if (pf is not None and math.isfinite(float(pf)) and pf != float('inf')) else ("∞" if pf == float('inf') else "—"))
+                            hold_txt = f"{med_hold_days:.2f} d" if math.isfinite(float(med_hold_days)) else "—"
+                            st.caption(f"Outcomes: win {wr_txt} · PF {pf_txt} · median hold {hold_txt}")
+
+                        # Constraint highlight
+                        st.markdown(f"**Constraint hit:** {top_reason}")
+
+                        with st.expander("Show full configuration", expanded=False):
+                            st.json(params if isinstance(params, dict) else cfg_obj)
+
+                    st.divider()
+                    st.markdown("#### Batch replay artifacts")
+
+
+                    # Price + event timeline (receipts on the tape)
+                    ev_path = art_dir / "events.csv"
+                    if ev_path.exists():
+                        st.markdown("##### Price + event timeline (entries/exits/TPs on the tape)")
+                        ev = _load_csv(ev_path)
+                        if ev is None or ev.empty:
+                            st.info("events.csv exists, but it has 0 rows (likely generated before event logging was added, or the replay generator hit an error).")
+                            # Allow regeneration even if cached artifacts exist (needed when new artifact types are added).
+                            replay_script = REPO_ROOT / "tools" / "generate_replay_artifacts.py"
+                            can_replay = (run_dir / "configs_resolved.jsonl").exists() and replay_script.exists()
+                            if st.button("Regenerate replay artifacts (refresh cache)", key=f"replay.regen.empty.{pick}", disabled=(not can_replay)):
+                                try:
+                                    if replay_dir.exists():
+                                        shutil.rmtree(replay_dir)
+                                except Exception:
+                                    pass
+                                cmd = [PY, str(replay_script), "--from-run", str(run_dir), "--config-id", str(pick)]
+                                _run_cmd(cmd, cwd=REPO_ROOT, label="Replay: regenerate artifacts")
+                                st.rerun()
+                        else:
+                            if "dt" in ev.columns:
+                                ev["dt"] = pd.to_datetime(ev["dt"], errors="coerce", utc=True)
+                            ev = ev.dropna(subset=["dt"]).sort_values("dt")
+
+                            # Load price series from df_feat (preferred) for the exact run's training tape
+                            price = None
+                            feat_path = run_dir / "df_feat.parquet"
+                            if feat_path.exists():
+                                try:
+                                    # Try fast column-select read first
+                                    price = pd.read_parquet(feat_path, columns=["dt", "close"])
+                                except Exception:
+                                    try:
+                                        df_tmp = pd.read_parquet(feat_path)
+                                        if "dt" in df_tmp.columns and "close" in df_tmp.columns:
+                                            price = df_tmp[["dt", "close"]].copy()
+                                    except Exception:
+                                        price = None
+
+                            if price is not None and not price.empty and "dt" in price.columns:
+                                price["dt"] = pd.to_datetime(price["dt"], errors="coerce", utc=True)
+                                price = price.dropna(subset=["dt"]).sort_values("dt")
+
+                                # Focus the view around event range (with buffer)
+                                if not ev.empty:
+                                    lo = ev["dt"].min() - pd.Timedelta(days=7)
+                                    hi = ev["dt"].max() + pd.Timedelta(days=7)
+                                    price = price[(price["dt"] >= lo) & (price["dt"] <= hi)]
+
+                                # Downsample for speed (plotly gets sluggish with huge lines)
+                                max_points = 3500
+                                if len(price) > max_points:
+                                    idxs = np.linspace(0, len(price) - 1, max_points).astype(int)
+                                    price = price.iloc[idxs]
+
+                                show_events = st.multiselect(
+                                    "Show events",
+                                    ["ENTRY", "ADD", "TP", "EXIT"],
+                                    default=["ENTRY", "TP", "EXIT"],
+                                    key=f"ev_show_{pick}",
+                                )
+
+                                if go is not None:
+                                    fig_ev = go.Figure()
+                                    fig_ev.add_trace(
+                                        go.Scatter(
+                                            x=price["dt"],
+                                            y=price["close"],
+                                            mode="lines",
+                                            name="Close",
+                                        )
+                                    )
+
+                                    def _add_ev(etype: str, symbol: str, name: str):
+                                        if etype not in show_events:
+                                            return
+                                        sub = ev[ev.get("event") == etype] if "event" in ev.columns else pd.DataFrame()
+                                        if sub is None or sub.empty:
+                                            return
+                                        y = pd.to_numeric(sub.get("price"), errors="coerce")
+                                        text = None
+                                        if "reason" in sub.columns or "detail" in sub.columns:
+                                            if "reason" in sub.columns:
+                                                r = sub["reason"].fillna("").astype(str)
+                                            else:
+                                                r = pd.Series([""] * len(sub), index=sub.index)
+                                            if "detail" in sub.columns:
+                                                d = sub["detail"].fillna("").astype(str)
+                                            else:
+                                                d = pd.Series([""] * len(sub), index=sub.index)
+                                            text = (r + "\n" + d).str.strip()
+                                        fig_ev.add_trace(
+                                            go.Scatter(
+                                                x=sub["dt"],
+                                                y=y,
+                                                mode="markers",
+                                                name=name,
+                                                marker=dict(symbol=symbol, size=10),
+                                                text=text,
+                                                hovertemplate="%{x}<br>%{y}<br>%{text}<extra></extra>" if text is not None else "%{x}<br>%{y}<extra></extra>",
+                                            )
+                                        )
+
+                                    _add_ev("ENTRY", "triangle-up", "Entry")
+                                    _add_ev("ADD", "circle", "Add (DCA)")
+                                    _add_ev("TP", "diamond", "TP / Partial sell")
+                                    _add_ev("EXIT", "triangle-down", "Exit")
+
+                                    fig_ev.update_layout(
+                                        height=430,
+                                        margin=dict(l=10, r=10, t=10, b=10),
+                                        xaxis_title="Date",
+                                        yaxis_title="Price",
+                                        legend=dict(orientation="h", yanchor="bottom", y=1.10, xanchor="left", x=0, font=dict(size=12)),
+                                    )
+                                    _plotly(fig_ev)
                                 else:
-                                    eq2["profit"] = pd.to_numeric(eq2["profit"], errors="coerce")
+                                    st.info("Plotly is not available; cannot render event timeline chart.")
+                            else:
+                                st.info("events.csv exists, but df_feat.parquet (dt/close) isn't available for price overlay.")
+                        st.download_button("Download events.csv", data=ev_path.read_bytes(), file_name=f"{pick}_events.csv")
+                    else:
+                        st.caption("No events.csv found for this config yet (replay artifacts need regeneration).")
 
-                                peak = eq2["equity"].cummax()
-                                eq2["drawdown"] = (eq2["equity"] / peak) - 1.0
-                                dd_abs = (eq2["equity"] - peak)
+                        # Allow regeneration even if cached artifacts exist (needed when new artifact types are added).
+                        replay_script = REPO_ROOT / "tools" / "generate_replay_artifacts.py"
+                        can_replay = (run_dir / "configs_resolved.jsonl").exists() and replay_script.exists()
+                        if st.button("Regenerate replay artifacts (refresh cache)", key=f"replay.regen.{pick}", disabled=(not can_replay)):
+                            try:
+                                if replay_dir.exists():
+                                    shutil.rmtree(replay_dir)
+                            except Exception:
+                                pass
+                            cmd = [PY, str(replay_script), "--from-run", str(run_dir), "--config-id", str(pick)]
+                            _run_cmd(cmd, cwd=REPO_ROOT, label="Replay: regenerate artifacts")
+                            st.rerun()
 
-                                # Quick human numbers (so deposits can't gaslight you).
-                                last_eq = float(eq2["equity"].iloc[-1])
-                                last_contrib = float(eq2["contrib_total"].iloc[-1])
-                                last_profit = float(eq2["profit"].iloc[-1])
 
-                                                                # Headline numbers (make the cash-in story unambiguous)
-                                initial_cap = float(eq2["contrib_total"].iloc[0]) if "contrib_total" in eq2.columns and len(eq2) else float(eq2["equity"].iloc[0])
-                                deposits_only = max(0.0, last_contrib - initial_cap)
 
-                                c1, c2, c3, c4, c5 = st.columns(5)
-                                with c1:
-                                    st.metric("Initial capital", f"{initial_cap:,.2f}")
-                                with c2:
-                                    st.metric("Cash in (initial + deposits)", f"{last_contrib:,.2f}")
-                                with c3:
-                                    st.metric("Deposits only", f"{deposits_only:,.2f}")
-                                with c4:
-                                    st.metric("Net liquidation value", f"{last_eq:,.2f}")
-                                with c5:
-                                    st.metric("Profit (equity − cash in)", f"{last_profit:,.2f}")
-# Unified hover makes the 3-line story legible.
-                                roi = np.where(eq2["contrib_total"].to_numpy() > 0, (eq2["profit"].to_numpy() / eq2["contrib_total"].to_numpy()), np.nan)
 
-                                fig2 = make_subplots(
-                                    rows=2,
-                                    cols=1,
-                                    shared_xaxes=True,
-                                    vertical_spacing=0.06,
-                                    row_heights=[0.68, 0.32],
-                                    subplot_titles=("Equity vs cash in", "Drawdown = drop from running equity peak"),
-                                )
+                    if eq_path.exists():
+                        eq = _load_csv(eq_path)
+                        if eq is not None and not eq.empty:
+                            if "dt" in eq.columns:
+                                eq["dt"] = pd.to_datetime(eq["dt"], errors="coerce", utc=True)
 
-                                fig2.add_trace(
-                                    go.Scatter(
-                                        x=eq2[xcol] if xcol else None,
-                                        y=eq2["equity"],
-                                        mode="lines",
-                                        name="Equity (NLV)",
-                                        customdata=np.stack([eq2["contrib_total"].to_numpy(), eq2["profit"].to_numpy(), cf.to_numpy()], axis=1),
-                                        hovertemplate="Equity (NLV): %{y:,.2f}<br>Cash in (to date): %{customdata[0]:,.2f}<br>Profit: %{customdata[1]:,.2f}<br>Cashflow this bar: %{customdata[2]:+,.2f}<extra></extra>",
-                                        line=dict(width=3, color=ACCENT_BLUE),
-                                    ),
-                                    row=1,
-                                    col=1,
-                                )
+                            # Equity vs contributions (+ optional profit) + drawdown
+                            if go is not None and make_subplots is not None and "equity" in eq.columns:
+                                try:
+                                    eq2 = eq.copy()
+                                    eq2["equity"] = pd.to_numeric(eq2["equity"], errors="coerce")
+                                    eq2 = eq2.dropna(subset=["equity"])
+                                    if not eq2.empty:
+                                        xcol = "dt" if "dt" in eq2.columns else None
 
-                                fig2.add_trace(
-                                    go.Scatter(
-                                        x=eq2[xcol] if xcol else None,
-                                        y=eq2["contrib_total"],
-                                        mode="lines",
-                                        name="Cash in (to date)",
-                                        customdata=np.stack([cf.to_numpy()], axis=1),
-                                        hovertemplate="Cash in (to date): %{y:,.2f}<br>Cashflow this bar: %{customdata[0]:+,.2f}<extra></extra>",
-                                        line=dict(width=2),
-                                    ),
-                                    row=1,
-                                    col=1,
-                                )
+                                        # Prefer columns precomputed in replay artifacts; fall back for legacy caches.
+                                        cf = pd.to_numeric(eq2["cashflow"], errors="coerce").fillna(0.0) if "cashflow" in eq2.columns else pd.Series([0.0] * len(eq2), index=eq2.index)
+                                        deposits = cf.clip(lower=0.0)
 
-                                fig2.add_trace(
-                                    go.Scatter(
-                                        x=eq2[xcol] if xcol else None,
-                                        y=eq2["profit"],
-                                        mode="lines",
-                                        name="Profit (Eq − cash-in)",
-                                        customdata=np.stack([roi, cf.to_numpy()], axis=1),
-                                        hovertemplate="Profit: %{y:,.2f}<br>ROI on cash in: %{customdata[0]:.2%}<br>Cashflow this bar: %{customdata[1]:+,.2f}<extra></extra>",
-                                        line=dict(width=2, dash="dot"),
-                                    ),
-                                    row=1,
-                                    col=1,
-                                )
+                                        if "contrib_total" not in eq2.columns:
+                                            contrib0 = float(eq2["equity"].iloc[0])
+                                            eq2["contrib_total"] = contrib0 + deposits.cumsum()
+                                        else:
+                                            eq2["contrib_total"] = pd.to_numeric(eq2["contrib_total"], errors="coerce")
 
-                                fig2.add_trace(
-                                    go.Scatter(
-                                        x=eq2[xcol] if xcol else None,
-                                        y=eq2["drawdown"],
-                                        mode="lines",
-                                        name="Drawdown",
-                                        customdata=np.stack([peak.to_numpy(), dd_abs.to_numpy()], axis=1),
-                                        hovertemplate="Drawdown: %{y:.2%}<br>Peak equity: %{customdata[0]:,.2f}<br>Peak→now: %{customdata[1]:,.2f}<extra></extra>",
-                                        line=dict(width=2, color=FAIL_COLOR),
-                                        fill="tozeroy",
-                                        fillcolor="rgba(255,23,68,0.18)",
-                                    ),
-                                    row=2,
-                                    col=1,
-                                )
+                                        if "profit" not in eq2.columns:
+                                            eq2["profit"] = eq2["equity"] - eq2["contrib_total"]
+                                        else:
+                                            eq2["profit"] = pd.to_numeric(eq2["profit"], errors="coerce")
 
-                                fig2.update_yaxes(tickformat=".0f", row=1, col=1)
-                                fig2.update_yaxes(tickformat=".0%", row=2, col=1)
-                                fig2.update_layout(hovermode="x unified")
-                                st.markdown("#### Equity, cash in, profit + drawdown")
-                                _style_fig(fig2, title=None)
-                                # Title is rendered by Streamlit header; keep Plotly's top margin for a clean legend.
-                                fig2.update_layout(
-                                    title_text="",
-                                    margin=dict(t=85),
-                                    legend=dict(
-                                        orientation="h",
-                                        yanchor="top",
-                                        y=1.12,
-                                        xanchor="left",
-                                        x=0,
-                                    ),
-                                )
-                                st.caption(
-                                    "Drawdown = drop from the running equity peak. "
-                                    "Cash in = initial capital + deposits (cashflow > 0). "
-                                    "Initial capital = cash in at the first bar. "
-                                    "Deposits only = cash in − initial capital. "
-                                    "Profit = equity − cash in."
-                                )
-                                _plotly(fig2)
-                                with st.expander("Show raw equity curve (table)", expanded=False):
-                                    # A simple, no-frills view for sanity checks.
-                                    if go is not None:
-                                        fig_raw = go.Figure()
-                                        fig_raw.add_trace(
+                                        peak = eq2["equity"].cummax()
+                                        eq2["drawdown"] = (eq2["equity"] / peak) - 1.0
+                                        dd_abs = (eq2["equity"] - peak)
+
+                                        # Quick human numbers (so deposits can't gaslight you).
+                                        last_eq = float(eq2["equity"].iloc[-1])
+                                        last_contrib = float(eq2["contrib_total"].iloc[-1])
+                                        last_profit = float(eq2["profit"].iloc[-1])
+
+                                                                        # Headline numbers (make the cash-in story unambiguous)
+                                        initial_cap = float(eq2["contrib_total"].iloc[0]) if "contrib_total" in eq2.columns and len(eq2) else float(eq2["equity"].iloc[0])
+                                        deposits_only = max(0.0, last_contrib - initial_cap)
+
+                                        c1, c2, c3, c4, c5 = st.columns(5)
+                                        with c1:
+                                            st.metric("Initial capital", f"{initial_cap:,.2f}")
+                                        with c2:
+                                            st.metric("Cash in (initial + deposits)", f"{last_contrib:,.2f}")
+                                        with c3:
+                                            st.metric("Deposits only", f"{deposits_only:,.2f}")
+                                        with c4:
+                                            st.metric("Net liquidation value", f"{last_eq:,.2f}")
+                                        with c5:
+                                            st.metric("Profit (equity − cash in)", f"{last_profit:,.2f}")
+        # Unified hover makes the 3-line story legible.
+                                        roi = np.where(eq2["contrib_total"].to_numpy() > 0, (eq2["profit"].to_numpy() / eq2["contrib_total"].to_numpy()), np.nan)
+
+                                        fig2 = make_subplots(
+                                            rows=2,
+                                            cols=1,
+                                            shared_xaxes=True,
+                                            vertical_spacing=0.06,
+                                            row_heights=[0.68, 0.32],
+                                            subplot_titles=("Equity vs cash in", "Drawdown = drop from running equity peak"),
+                                        )
+
+                                        fig2.add_trace(
                                             go.Scatter(
                                                 x=eq2[xcol] if xcol else None,
                                                 y=eq2["equity"],
                                                 mode="lines",
-                                                name="Equity",
-                                                customdata=np.stack([cf.to_numpy()], axis=1),
-                                                hovertemplate="Equity: %{y:,.2f}<br>Cashflow this bar: %{customdata[0]:+,.2f}<extra></extra>",
-                                                line=dict(width=2, color=ACCENT_BLUE),
-                                            )
+                                                name="Equity (NLV)",
+                                                customdata=np.stack([eq2["contrib_total"].to_numpy(), eq2["profit"].to_numpy(), cf.to_numpy()], axis=1),
+                                                hovertemplate="Equity (NLV): %{y:,.2f}<br>Cash in (to date): %{customdata[0]:,.2f}<br>Profit: %{customdata[1]:,.2f}<br>Cashflow this bar: %{customdata[2]:+,.2f}<extra></extra>",
+                                                line=dict(width=3, color=ACCENT_BLUE),
+                                            ),
+                                            row=1,
+                                            col=1,
                                         )
-                                        fig_raw.add_trace(
+
+                                        fig2.add_trace(
                                             go.Scatter(
                                                 x=eq2[xcol] if xcol else None,
                                                 y=eq2["contrib_total"],
                                                 mode="lines",
                                                 name="Cash in (to date)",
-                                                hovertemplate="Cash in (to date): %{y:,.2f}<extra></extra>",
-                                                line=dict(width=1),
-                                            )
+                                                customdata=np.stack([cf.to_numpy()], axis=1),
+                                                hovertemplate="Cash in (to date): %{y:,.2f}<br>Cashflow this bar: %{customdata[0]:+,.2f}<extra></extra>",
+                                                line=dict(width=2),
+                                            ),
+                                            row=1,
+                                            col=1,
                                         )
-                                        fig_raw.add_trace(
+
+                                        fig2.add_trace(
                                             go.Scatter(
                                                 x=eq2[xcol] if xcol else None,
                                                 y=eq2["profit"],
                                                 mode="lines",
-                                                name="Profit",
-                                                customdata=np.stack([roi], axis=1),
-                                                hovertemplate="Profit: %{y:,.2f}<br>ROI on cash in: %{customdata[0]:.2%}<extra></extra>",
-                                                line=dict(width=1, dash="dot"),
-                                            )
-                                        )
-                                        fig_raw.update_layout(hovermode="x unified")
-                                        _style_fig(fig_raw, title="Raw equity curve (no drawdown)")
-                                        _plotly(fig_raw)
-                                        # Profit-only view (separate scale) helps when profit is visually squished.
-                                        fig_profit = go.Figure()
-                                        fig_profit.add_trace(
-                                            go.Scatter(
-                                                x=eq2[xcol] if xcol else None,
-                                                y=eq2["profit"],
-                                                mode="lines",
-                                                name="Profit",
+                                                name="Profit (Eq − cash-in)",
                                                 customdata=np.stack([roi, cf.to_numpy()], axis=1),
                                                 hovertemplate="Profit: %{y:,.2f}<br>ROI on cash in: %{customdata[0]:.2%}<br>Cashflow this bar: %{customdata[1]:+,.2f}<extra></extra>",
                                                 line=dict(width=2, dash="dot"),
-                                            )
+                                            ),
+                                            row=1,
+                                            col=1,
                                         )
-                                        # Mark deposit/withdraw bars for quick intuition.
-                                        if float(np.nanmax(np.abs(cf.to_numpy()))) > 0:
-                                            mask = cf != 0
-                                            x_ev = (eq2.loc[mask, xcol] if xcol else None)
-                                            y_ev = eq2.loc[mask, "profit"]
-                                            fig_profit.add_trace(
-                                                go.Scatter(
-                                                    x=x_ev,
-                                                    y=y_ev,
-                                                    mode="markers",
-                                                    name="Cashflow event",
-                                                    customdata=np.stack([cf.loc[mask].to_numpy()], axis=1),
-                                                    hovertemplate="Cashflow: %{customdata[0]:+,.2f}<extra></extra>",
+
+                                        fig2.add_trace(
+                                            go.Scatter(
+                                                x=eq2[xcol] if xcol else None,
+                                                y=eq2["drawdown"],
+                                                mode="lines",
+                                                name="Drawdown",
+                                                customdata=np.stack([peak.to_numpy(), dd_abs.to_numpy()], axis=1),
+                                                hovertemplate="Drawdown: %{y:.2%}<br>Peak equity: %{customdata[0]:,.2f}<br>Peak→now: %{customdata[1]:,.2f}<extra></extra>",
+                                                line=dict(width=2, color=FAIL_COLOR),
+                                                fill="tozeroy",
+                                                fillcolor="rgba(255,23,68,0.18)",
+                                            ),
+                                            row=2,
+                                            col=1,
+                                        )
+
+                                        fig2.update_yaxes(tickformat=".0f", row=1, col=1)
+                                        fig2.update_yaxes(tickformat=".0%", row=2, col=1)
+                                        fig2.update_layout(hovermode="x unified")
+                                        st.markdown("#### Equity, cash in, profit + drawdown")
+                                        _style_fig(fig2, title=None)
+                                        # Title is rendered by Streamlit header; keep Plotly's top margin for a clean legend.
+                                        fig2.update_layout(
+                                            title_text="",
+                                            margin=dict(t=85),
+                                            legend=dict(
+                                                orientation="h",
+                                                yanchor="top",
+                                                y=1.12,
+                                                xanchor="left",
+                                                x=0,
+                                            ),
+                                        )
+                                        st.caption(
+                                            "Drawdown = drop from the running equity peak. "
+                                            "Cash in = initial capital + deposits (cashflow > 0). "
+                                            "Initial capital = cash in at the first bar. "
+                                            "Deposits only = cash in − initial capital. "
+                                            "Profit = equity − cash in."
+                                        )
+                                        _plotly(fig2)
+                                        with st.expander("Show raw equity curve (table)", expanded=False):
+                                            # A simple, no-frills view for sanity checks.
+                                            if go is not None:
+                                                fig_raw = go.Figure()
+                                                fig_raw.add_trace(
+                                                    go.Scatter(
+                                                        x=eq2[xcol] if xcol else None,
+                                                        y=eq2["equity"],
+                                                        mode="lines",
+                                                        name="Equity",
+                                                        customdata=np.stack([cf.to_numpy()], axis=1),
+                                                        hovertemplate="Equity: %{y:,.2f}<br>Cashflow this bar: %{customdata[0]:+,.2f}<extra></extra>",
+                                                        line=dict(width=2, color=ACCENT_BLUE),
+                                                    )
                                                 )
-                                            )
-                                        fig_profit.update_layout(hovermode="x unified")
-                                        _style_fig(fig_profit, title="Profit only (separate scale)")
-                                        _plotly(fig_profit)
+                                                fig_raw.add_trace(
+                                                    go.Scatter(
+                                                        x=eq2[xcol] if xcol else None,
+                                                        y=eq2["contrib_total"],
+                                                        mode="lines",
+                                                        name="Cash in (to date)",
+                                                        hovertemplate="Cash in (to date): %{y:,.2f}<extra></extra>",
+                                                        line=dict(width=1),
+                                                    )
+                                                )
+                                                fig_raw.add_trace(
+                                                    go.Scatter(
+                                                        x=eq2[xcol] if xcol else None,
+                                                        y=eq2["profit"],
+                                                        mode="lines",
+                                                        name="Profit",
+                                                        customdata=np.stack([roi], axis=1),
+                                                        hovertemplate="Profit: %{y:,.2f}<br>ROI on cash in: %{customdata[0]:.2%}<extra></extra>",
+                                                        line=dict(width=1, dash="dot"),
+                                                    )
+                                                )
+                                                fig_raw.update_layout(hovermode="x unified")
+                                                _style_fig(fig_raw, title="Raw equity curve (no drawdown)")
+                                                _plotly(fig_raw)
+                                                # Profit-only view (separate scale) helps when profit is visually squished.
+                                                fig_profit = go.Figure()
+                                                fig_profit.add_trace(
+                                                    go.Scatter(
+                                                        x=eq2[xcol] if xcol else None,
+                                                        y=eq2["profit"],
+                                                        mode="lines",
+                                                        name="Profit",
+                                                        customdata=np.stack([roi, cf.to_numpy()], axis=1),
+                                                        hovertemplate="Profit: %{y:,.2f}<br>ROI on cash in: %{customdata[0]:.2%}<br>Cashflow this bar: %{customdata[1]:+,.2f}<extra></extra>",
+                                                        line=dict(width=2, dash="dot"),
+                                                    )
+                                                )
+                                                # Mark deposit/withdraw bars for quick intuition.
+                                                if float(np.nanmax(np.abs(cf.to_numpy()))) > 0:
+                                                    mask = cf != 0
+                                                    x_ev = (eq2.loc[mask, xcol] if xcol else None)
+                                                    y_ev = eq2.loc[mask, "profit"]
+                                                    fig_profit.add_trace(
+                                                        go.Scatter(
+                                                            x=x_ev,
+                                                            y=y_ev,
+                                                            mode="markers",
+                                                            name="Cashflow event",
+                                                            customdata=np.stack([cf.loc[mask].to_numpy()], axis=1),
+                                                            hovertemplate="Cashflow: %{customdata[0]:+,.2f}<extra></extra>",
+                                                        )
+                                                    )
+                                                fig_profit.update_layout(hovermode="x unified")
+                                                _style_fig(fig_profit, title="Profit only (separate scale)")
+                                                _plotly(fig_profit)
 
-                                    # Table is the ultimate audit log.
-                                    show_cols = [c for c in ["dt", "equity", "contrib_total", "profit", "drawdown", "cashflow"] if c in eq2.columns]
-                                    st.dataframe(eq2[show_cols].tail(500), width="stretch")
-                        except Exception:
-                            pass
-            else:
-                st.info("No equity_curve.csv found in artifacts for this config.")
+                                            # Table is the ultimate audit log.
+                                            show_cols = [c for c in ["dt", "equity", "contrib_total", "profit", "drawdown", "cashflow"] if c in eq2.columns]
+                                            st.dataframe(eq2[show_cols].tail(500), width="stretch")
+                                except Exception:
+                                    pass
+                    else:
+                        st.info("No equity_curve.csv found in artifacts for this config.")
 
 
-            
-            if cfg_path.exists():
-                with st.expander("Config (artifact config.json)", expanded=False):
-                    st.json(_read_json(cfg_path))
-            # Trade outcomes (easy read)
-            with st.expander("Trade outcomes (Batch)", expanded=False):
-                if tr_path.exists():
-                    tr = _load_csv(tr_path)
-                    if tr is not None and not tr.empty:
-                        st.markdown("##### Trade outcomes (Batch)")
-                        pnl_col = _pick_col(tr, ["net_pnl", "gross_pnl", "pnl", "profit"])
-                        if pnl_col and pnl_col in tr.columns and go is not None:
-                            pnl = pd.to_numeric(tr[pnl_col], errors="coerce").dropna()
-                            if len(pnl) > 0:
-                                win_rate = float((pnl > 0).mean())
-                                avg = float(pnl.mean())
-                                med = float(pnl.median())
-                                m1, m2, m3 = st.columns(3)
-                                with m1:
-                                    st.metric("Win rate", f"{win_rate*100:.1f}%")
-                                with m2:
-                                    st.metric("Avg trade PnL", f"{avg:.2f}")
-                                with m3:
-                                    st.metric("Median trade PnL", f"{med:.2f}")
 
-                                figp = go.Figure(go.Histogram(x=pnl, nbinsx=40, marker=dict(color=ACCENT_BLUE)))
-                                _style_fig(figp, title="Trade PnL distribution")
-                                figp.update_xaxes(title=f"{pnl_col}")
-                                figp.update_yaxes(title="Count")
-                                _plotly(figp)
+                    if cfg_path.exists():
+                        with st.expander("Config (artifact config.json)", expanded=False):
+                            st.json(_read_json(cfg_path))
+                    # Trade outcomes (easy read)
+                    with st.expander("Trade outcomes (Batch)", expanded=False):
+                        if tr_path.exists():
+                            tr = _load_csv(tr_path)
+                            if tr is not None and not tr.empty:
+                                st.markdown("##### Trade outcomes (Batch)")
+                                pnl_col = _pick_col(tr, ["net_pnl", "gross_pnl", "pnl", "profit"])
+                                if pnl_col and pnl_col in tr.columns and go is not None:
+                                    pnl = pd.to_numeric(tr[pnl_col], errors="coerce").dropna()
+                                    if len(pnl) > 0:
+                                        win_rate = float((pnl > 0).mean())
+                                        avg = float(pnl.mean())
+                                        med = float(pnl.median())
+                                        m1, m2, m3 = st.columns(3)
+                                        with m1:
+                                            st.metric("Win rate", f"{win_rate*100:.1f}%")
+                                        with m2:
+                                            st.metric("Avg trade PnL", f"{avg:.2f}")
+                                        with m3:
+                                            st.metric("Median trade PnL", f"{med:.2f}")
 
-                        st.caption("Exit reasons are shown above on the price + event timeline (entries/exits/TPs).")
+                                        figp = go.Figure(go.Histogram(x=pnl, nbinsx=40, marker=dict(color=ACCENT_BLUE)))
+                                        _style_fig(figp, title="Trade PnL distribution")
+                                        figp.update_xaxes(title=f"{pnl_col}")
+                                        figp.update_yaxes(title="Count")
+                                        _plotly(figp)
 
-            cdl1, cdl2, cdl3, cdl4 = st.columns(4)
-            with cdl1:
-                if met_path.exists():
-                    st.download_button("Download metrics.json", data=met_path.read_bytes(), file_name=f"{pick}_metrics.json")
-            with cdl2:
-                if tr_path.exists():
-                    st.download_button("Download trades.csv", data=tr_path.read_bytes(), file_name=f"{pick}_trades.csv")
-            with cdl3:
-                if fi_path.exists():
-                    st.download_button("Download fills.csv", data=fi_path.read_bytes(), file_name=f"{pick}_fills.csv")
-            with cdl4:
-                if eq_path.exists():
-                    st.download_button("Download equity_curve.csv", data=eq_path.read_bytes(), file_name=f"{pick}_equity_curve.csv")
-        else:
-            st.info("No saved artifacts for this config yet.")
-            replay_script = REPO_ROOT / "tools" / "generate_replay_artifacts.py"
-            can_replay = (run_dir / "configs_resolved.jsonl").exists() and replay_script.exists()
-            if st.button("Generate replay artifacts (cached)", key="replay.gen", disabled=(not can_replay)):
-                cmd = [PY, str(replay_script), "--from-run", str(run_dir), "--config-id", str(pick)]
-                _run_cmd(cmd, cwd=REPO_ROOT, label="Replay: generate artifacts")
-                st.rerun()
+                                st.caption("Exit reasons are shown above on the price + event timeline (entries/exits/TPs).")
 
-    with _tab.get("Start-date test", _tab_containers[0]):
-        st.caption("Rolling Starts: same strategy, many start dates. You want a tight distribution and low disappoint rate (not one lucky start).")
-
-        st.markdown("#### Rolling Starts detail")
-        if rs_dir_effective and (rs_dir_effective / "rolling_starts_detail.csv").exists():
-            rs_det = load_rs_detail(run_dir, rs_dir_effective)
-            if rs_det is not None and not rs_det.empty and "config_id" in rs_det.columns:
-                d = rs_det[rs_det["config_id"].astype(str) == str(pick)].copy()
-                if d.empty:
-                    st.info("No Rolling Starts detail rows for this config.")
+                    cdl1, cdl2, cdl3, cdl4 = st.columns(4)
+                    with cdl1:
+                        if met_path.exists():
+                            st.download_button("Download metrics.json", data=met_path.read_bytes(), file_name=f"{pick}_metrics.json")
+                    with cdl2:
+                        if tr_path.exists():
+                            st.download_button("Download trades.csv", data=tr_path.read_bytes(), file_name=f"{pick}_trades.csv")
+                    with cdl3:
+                        if fi_path.exists():
+                            st.download_button("Download fills.csv", data=fi_path.read_bytes(), file_name=f"{pick}_fills.csv")
+                    with cdl4:
+                        if eq_path.exists():
+                            st.download_button("Download equity_curve.csv", data=eq_path.read_bytes(), file_name=f"{pick}_equity_curve.csv")
                 else:
-                    _rs_stats = {}
-                    # ---- Summary strip (worst / p10 / median / negative / disappoint) ----
-                    try:
-                        _vals = pd.to_numeric(d.get("performance.twr_total_return"), errors="coerce").dropna()
-                    except Exception:
-                        _vals = pd.Series(dtype=float)
-                    if len(_vals) > 0:
-                        _worst = float(_vals.min())
-                        _p10 = float(_vals.quantile(0.10))
-                        _med = float(_vals.quantile(0.50))
-                        _neg = float((_vals < 0.0).mean())
-                        try:
-                            _thr = float(_rs_fail_thr)
-                        except Exception:
-                            _thr = 0.0
-                        _disappoint = float((_vals < _thr).mean())
+                    st.info("No saved artifacts for this config yet.")
+                    replay_script = REPO_ROOT / "tools" / "generate_replay_artifacts.py"
+                    can_replay = (run_dir / "configs_resolved.jsonl").exists() and replay_script.exists()
+                    if st.button("Generate replay artifacts (cached)", key="replay.gen", disabled=(not can_replay)):
+                        cmd = [PY, str(replay_script), "--from-run", str(run_dir), "--config-id", str(pick)]
+                        _run_cmd(cmd, cwd=REPO_ROOT, label="Replay: generate artifacts")
+                        st.rerun()
 
-                        _rs_stats = dict(worst=_worst, p10=_p10, med=_med, thr=_thr, neg=_neg, disappoint=_disappoint, n=int(len(_vals)))
+            with _tab.get("Start-date test", _tab_containers[0]):
+                st.caption("Rolling Starts: same strategy, many start dates. You want a tight distribution and low disappoint rate (not one lucky start).")
 
-                        st.markdown("##### Start-date sensitivity summary")
-                        s1, s2, s3, s4, s5 = st.columns(5)
-                        s1.metric("Worst case", f"{_worst*100:.1f}%")
-                        s2.metric("10th percentile", f"{_p10*100:.1f}%")
-                        s3.metric("Median", f"{_med*100:.1f}%")
-                        s4.metric("% negative", f"{_neg*100:.0f}%")
-                        s5.metric(f"Disappoint rate (<{_thr*100:.0f}%)", f"{_disappoint*100:.0f}%")
-
-                        st.caption(f"N={len(_vals)} start dates. “Disappoint” means total return below {_thr*100:.0f}% under your current Rolling Starts tolerance.")
-                        if len(_vals) < 30:
-                            st.caption("Note: small N makes percentiles chunky.")
-                        st.divider()
-
-                    if "start_dt" in d.columns:
-                        d["start_dt"] = pd.to_datetime(d.get("start_dt"), errors="coerce", utc=True)
-                    # Distribution view (clean default): violin + box + reference lines
-                    if go is not None and "performance.twr_total_return" in d.columns:
-                        try:
-                            _dist_vals = pd.to_numeric(d["performance.twr_total_return"], errors="coerce").dropna()
-                        except Exception:
-                            _dist_vals = pd.Series(dtype=float)
-                        if len(_dist_vals) > 0:
-                            st.markdown("##### Rolling-start return distribution")
-                            figd = go.Figure()
-                            figd.add_trace(
-                                go.Violin(
-                                    x=_dist_vals,
-                                    orientation="h",
-                                    name="",
-                                    box_visible=True,
-                                    meanline_visible=False,
-                                    points=False,
-                                    line_color=ACCENT_BLUE,
-                                    fillcolor="rgba(41,121,255,0.22)",
-                                )
-                            )
-
-                            # Reference lines (from summary if available)
-                            _thr_line = None
-                            _p10_line = None
-                            _med_line = None
+                st.markdown("#### Rolling Starts detail")
+                if rs_dir_effective and (rs_dir_effective / "rolling_starts_detail.csv").exists():
+                    rs_det = load_rs_detail(run_dir, rs_dir_effective)
+                    if rs_det is not None and not rs_det.empty and "config_id" in rs_det.columns:
+                        d = rs_det[rs_det["config_id"].astype(str) == str(pick)].copy()
+                        if d.empty:
+                            st.info("No Rolling Starts detail rows for this config.")
+                        else:
+                            _rs_stats = {}
+                            # ---- Summary strip (worst / p10 / median / negative / disappoint) ----
                             try:
-                                _thr_line = float((_rs_stats or {}).get("thr", _rs_fail_thr))
+                                _vals = pd.to_numeric(d.get("performance.twr_total_return"), errors="coerce").dropna()
                             except Exception:
-                                _thr_line = None
-                            try:
-                                _p10_line = float((_rs_stats or {}).get("p10"))
-                            except Exception:
-                                _p10_line = None
-                            try:
-                                _med_line = float((_rs_stats or {}).get("med"))
-                            except Exception:
-                                _med_line = None
-
-                            if _med_line is not None:
-                                figd.add_vline(x=_med_line, line_width=1, line_dash="solid", line_color="rgba(17,24,39,0.45)", annotation_text="Median", annotation_position="top")
-                            if _p10_line is not None:
-                                figd.add_vline(x=_p10_line, line_width=1, line_dash="dot", line_color="rgba(17,24,39,0.45)", annotation_text="10th pct", annotation_position="top")
-                            if _thr_line is not None:
-                                figd.add_vline(x=_thr_line, line_width=1, line_dash="dash", line_color="rgba(255,23,68,0.55)", annotation_text="Tolerance", annotation_position="top")
-
-                            _style_fig(figd, title=None)
-                            figd.update_layout(showlegend=False)
-                            figd.update_xaxes(tickformat=".0%", title="Total return")
-                            figd.update_yaxes(showticklabels=False, title="")
-                            _plotly(figd)
-
-                            with st.expander("Show histogram (bins)", expanded=False):
-                                if px is not None:
-                                    figh = px.histogram(d, x="performance.twr_total_return", nbins=40)
-                                    _style_fig(figh, title=None)
-                                    figh.update_xaxes(tickformat=".0%", title="Total return")
-                                    figh.update_yaxes(title="Count")
-                                    _plotly(figh)
-
-
-
-                    # Timeline view: start date → outcome (helps spot "bad eras")
-                    if go is not None and "start_dt" in d.columns and "performance.twr_total_return" in d.columns:
-                        try:
-                            dd = d.copy()
-                            dd["start_dt"] = pd.to_datetime(dd.get("start_dt"), errors="coerce", utc=True)
-                            dd["ret"] = pd.to_numeric(dd["performance.twr_total_return"], errors="coerce")
-                            dd = dd.dropna(subset=["ret", "start_dt"]).sort_values("start_dt")
-                            if not dd.empty:
+                                _vals = pd.Series(dtype=float)
+                            if len(_vals) > 0:
+                                _worst = float(_vals.min())
+                                _p10 = float(_vals.quantile(0.10))
+                                _med = float(_vals.quantile(0.50))
+                                _neg = float((_vals < 0.0).mean())
                                 try:
-                                    _thr = float((_rs_stats or {}).get("thr", _rs_fail_thr))
+                                    _thr = float(_rs_fail_thr)
                                 except Exception:
                                     _thr = 0.0
+                                _disappoint = float((_vals < _thr).mean())
 
-                                figt = go.Figure()
+                                _rs_stats = dict(worst=_worst, p10=_p10, med=_med, thr=_thr, neg=_neg, disappoint=_disappoint, n=int(len(_vals)))
 
-                                # Shading + reference lines
-                                figt.add_hrect(y0=-1.0, y1=_thr, fillcolor="rgba(255,23,68,0.06)", line_width=0, layer="below")
-                                figt.add_hline(y=_thr, line_dash="dash", line_color="rgba(255,23,68,0.55)")
-                                figt.add_hline(y=0.0, line_dash="dot", line_color="rgba(17,24,39,0.25)")
+                                st.markdown("##### Start-date sensitivity summary")
+                                s1, s2, s3, s4, s5 = st.columns(5)
+                                s1.metric("Worst case", f"{_worst*100:.1f}%")
+                                s2.metric("10th percentile", f"{_p10*100:.1f}%")
+                                s3.metric("Median", f"{_med*100:.1f}%")
+                                s4.metric("% negative", f"{_neg*100:.0f}%")
+                                s5.metric(f"Disappoint rate (<{_thr*100:.0f}%)", f"{_disappoint*100:.0f}%")
 
-                                m_bad = dd["ret"] < _thr
-                                m_neg = (dd["ret"] >= _thr) & (dd["ret"] < 0.0)
-                                m_pos = dd["ret"] >= 0.0
+                                st.caption(f"N={len(_vals)} start dates. “Disappoint” means total return below {_thr*100:.0f}% under your current Rolling Starts tolerance.")
+                                if len(_vals) < 30:
+                                    st.caption("Note: small N makes percentiles chunky.")
+                                st.divider()
 
-                                def _add_points(mask, name, color):
-                                    if mask.any():
-                                        figt.add_trace(
-                                            go.Scatter(
-                                                x=dd.loc[mask, "start_dt"],
-                                                y=dd.loc[mask, "ret"],
-                                                mode="markers",
-                                                marker=dict(size=7, color=color, opacity=0.85),
-                                                name=name,
-                                                hovertemplate="%{x|%Y-%m-%d}<br>return=%{y:.2%}<extra></extra>",
-                                            )
-                                        )
-
-                                _add_points(m_pos, "Above 0", PASS_COLOR)
-                                _add_points(m_neg, "Below 0", WARN_COLOR)
-                                _add_points(m_bad, "Below tolerance", FAIL_COLOR)
-
-                                # Optional rolling median line (helps spot regime sensitivity)
+                            if "start_dt" in d.columns:
+                                d["start_dt"] = pd.to_datetime(d.get("start_dt"), errors="coerce", utc=True)
+                            # Distribution view (clean default): violin + box + reference lines
+                            if go is not None and "performance.twr_total_return" in d.columns:
                                 try:
-                                    w = int(min(21, max(5, len(dd) // 10)))
-                                    if w % 2 == 0:
-                                        w += 1
-                                    dd["roll_med"] = dd["ret"].rolling(w, center=True, min_periods=max(3, w // 2)).median()
-                                    if dd["roll_med"].notna().sum() >= 3:
-                                        figt.add_trace(
-                                            go.Scatter(
-                                                x=dd["start_dt"],
-                                                y=dd["roll_med"],
-                                                mode="lines",
-                                                line=dict(width=2, color="rgba(17,24,39,0.35)"),
-                                                name="Rolling median",
-                                                hovertemplate="%{x|%Y-%m-%d}<br>median=%{y:.2%}<extra></extra>",
-                                            )
+                                    _dist_vals = pd.to_numeric(d["performance.twr_total_return"], errors="coerce").dropna()
+                                except Exception:
+                                    _dist_vals = pd.Series(dtype=float)
+                                if len(_dist_vals) > 0:
+                                    st.markdown("##### Rolling-start return distribution")
+                                    figd = go.Figure()
+                                    figd.add_trace(
+                                        go.Violin(
+                                            x=_dist_vals,
+                                            orientation="h",
+                                            name="",
+                                            box_visible=True,
+                                            meanline_visible=False,
+                                            points=False,
+                                            line_color=ACCENT_BLUE,
+                                            fillcolor="rgba(41,121,255,0.22)",
                                         )
+                                    )
+
+                                    # Reference lines (from summary if available)
+                                    _thr_line = None
+                                    _p10_line = None
+                                    _med_line = None
+                                    try:
+                                        _thr_line = float((_rs_stats or {}).get("thr", _rs_fail_thr))
+                                    except Exception:
+                                        _thr_line = None
+                                    try:
+                                        _p10_line = float((_rs_stats or {}).get("p10"))
+                                    except Exception:
+                                        _p10_line = None
+                                    try:
+                                        _med_line = float((_rs_stats or {}).get("med"))
+                                    except Exception:
+                                        _med_line = None
+
+                                    if _med_line is not None:
+                                        figd.add_vline(x=_med_line, line_width=1, line_dash="solid", line_color="rgba(17,24,39,0.45)", annotation_text="Median", annotation_position="top")
+                                    if _p10_line is not None:
+                                        figd.add_vline(x=_p10_line, line_width=1, line_dash="dot", line_color="rgba(17,24,39,0.45)", annotation_text="10th pct", annotation_position="top")
+                                    if _thr_line is not None:
+                                        figd.add_vline(x=_thr_line, line_width=1, line_dash="dash", line_color="rgba(255,23,68,0.55)", annotation_text="Tolerance", annotation_position="top")
+
+                                    _style_fig(figd, title=None)
+                                    figd.update_layout(showlegend=False)
+                                    figd.update_xaxes(tickformat=".0%", title="Total return")
+                                    figd.update_yaxes(showticklabels=False, title="")
+                                    _plotly(figd)
+
+                                    with st.expander("Show histogram (bins)", expanded=False):
+                                        if px is not None:
+                                            figh = px.histogram(d, x="performance.twr_total_return", nbins=40)
+                                            _style_fig(figh, title=None)
+                                            figh.update_xaxes(tickformat=".0%", title="Total return")
+                                            figh.update_yaxes(title="Count")
+                                            _plotly(figh)
+
+
+
+                            # Timeline view: start date → outcome (helps spot "bad eras")
+                            if go is not None and "start_dt" in d.columns and "performance.twr_total_return" in d.columns:
+                                try:
+                                    dd = d.copy()
+                                    dd["start_dt"] = pd.to_datetime(dd.get("start_dt"), errors="coerce", utc=True)
+                                    dd["ret"] = pd.to_numeric(dd["performance.twr_total_return"], errors="coerce")
+                                    dd = dd.dropna(subset=["ret", "start_dt"]).sort_values("start_dt")
+                                    if not dd.empty:
+                                        try:
+                                            _thr = float((_rs_stats or {}).get("thr", _rs_fail_thr))
+                                        except Exception:
+                                            _thr = 0.0
+
+                                        figt = go.Figure()
+
+                                        # Shading + reference lines
+                                        figt.add_hrect(y0=-1.0, y1=_thr, fillcolor="rgba(255,23,68,0.06)", line_width=0, layer="below")
+                                        figt.add_hline(y=_thr, line_dash="dash", line_color="rgba(255,23,68,0.55)")
+                                        figt.add_hline(y=0.0, line_dash="dot", line_color="rgba(17,24,39,0.25)")
+
+                                        m_bad = dd["ret"] < _thr
+                                        m_neg = (dd["ret"] >= _thr) & (dd["ret"] < 0.0)
+                                        m_pos = dd["ret"] >= 0.0
+
+                                        def _add_points(mask, name, color):
+                                            if mask.any():
+                                                figt.add_trace(
+                                                    go.Scatter(
+                                                        x=dd.loc[mask, "start_dt"],
+                                                        y=dd.loc[mask, "ret"],
+                                                        mode="markers",
+                                                        marker=dict(size=7, color=color, opacity=0.85),
+                                                        name=name,
+                                                        hovertemplate="%{x|%Y-%m-%d}<br>return=%{y:.2%}<extra></extra>",
+                                                    )
+                                                )
+
+                                        _add_points(m_pos, "Above 0", PASS_COLOR)
+                                        _add_points(m_neg, "Below 0", WARN_COLOR)
+                                        _add_points(m_bad, "Below tolerance", FAIL_COLOR)
+
+                                        # Optional rolling median line (helps spot regime sensitivity)
+                                        try:
+                                            w = int(min(21, max(5, len(dd) // 10)))
+                                            if w % 2 == 0:
+                                                w += 1
+                                            dd["roll_med"] = dd["ret"].rolling(w, center=True, min_periods=max(3, w // 2)).median()
+                                            if dd["roll_med"].notna().sum() >= 3:
+                                                figt.add_trace(
+                                                    go.Scatter(
+                                                        x=dd["start_dt"],
+                                                        y=dd["roll_med"],
+                                                        mode="lines",
+                                                        line=dict(width=2, color="rgba(17,24,39,0.35)"),
+                                                        name="Rolling median",
+                                                        hovertemplate="%{x|%Y-%m-%d}<br>median=%{y:.2%}<extra></extra>",
+                                                    )
+                                                )
+                                        except Exception:
+                                            pass
+
+                                        st.markdown("##### Start-date outcomes over time")
+                                        _style_fig(figt, title=None)
+                                        figt.update_layout(margin=dict(l=20, r=20, t=55, b=20), legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, font=dict(size=12)))
+                                        figt.update_yaxes(tickformat=".0%", title="Total return")
+                                        figt.update_xaxes(title="Start date")
+                                        _plotly(figt)
                                 except Exception:
                                     pass
 
-                                st.markdown("##### Start-date outcomes over time")
-                                _style_fig(figt, title=None)
-                                figt.update_layout(margin=dict(l=20, r=20, t=55, b=20), legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, font=dict(size=12)))
-                                figt.update_yaxes(tickformat=".0%", title="Total return")
-                                figt.update_xaxes(title="Start date")
-                                _plotly(figt)
-                        except Exception:
-                            pass
-
-                        except Exception:
-                            pass
-                    st.download_button(
-                        "Download rolling_starts_detail.csv (full)",
-                        data=(rs_dir_effective / "rolling_starts_detail.csv").read_bytes(),
-                        file_name=f"{selected_run_name}_rolling_starts_detail.csv",
-                    )
-        else:
-            st.info("Rolling Starts evidence not available for this run (run it from Build & Run).")
-
-    with _tab.get("Time-split test", _tab_containers[0]):
-        st.caption("Walkforward: train/test through time windows. You want consistency across windows — not one regime doing all the work.")
-
-        st.markdown("#### Walkforward detail")
-        if wf_dir_effective and (wf_dir_effective / "wf_results.csv").exists():
-            wf_rows = load_wf_results(wf_dir_effective)
-            if wf_rows is not None and not wf_rows.empty and "config_id" in wf_rows.columns:
-                pick_eff = str(pick).strip()
-
-                # Fallback: if user picked something non-canonical (e.g., a legacy integer id),
-                # try to map it to the real config_id using the current candidates table.
-                if ("config.id" in df2.columns) and (pick_eff.isdigit() or (pick_eff and not pick_eff.startswith("cfg_"))):
-                    # 1) If it's a config line number, map line_no -> config_id
-                    if pick_eff.isdigit() and ("config.line_no" in df2.columns):
-                        try:
-                            li = int(pick_eff)
-                            m = df2[df2["config.line_no"].astype(int) == li]
-                            if len(m) == 1:
-                                pick_eff = str(m["config_id"].iloc[0]).strip()
-                        except Exception:
-                            pass
-
-                    # 2) If it's an index-like integer, treat it as 1-based row id into df_show (common confusion).
-                    if pick_eff.isdigit():
-                        try:
-                            i = int(pick_eff)
-                            if 1 <= i <= len(df_show):
-                                pick_eff = str(df_show["config_id"].astype(str).iloc[i - 1]).strip()
-                        except Exception:
-                            pass
-
-                d = wf_rows[wf_rows["config_id"].astype(str).str.strip() == str(pick_eff)].copy()
-                if d.empty:
-                    st.info("No Walkforward detail rows for this config.")
-                else:
-                    # -----------------------------
-                    # Step 6: window ranges + missing windows made explicit
-                    # -----------------------------
-                    meta = _read_json(Path(wf_dir_effective) / "wf_meta.json") if wf_dir_effective else {}
-                    expected_total = None
-                    try:
-                        expected_total = int(meta.get("windows")) if meta.get("windows") is not None else None
-                    except Exception:
-                        expected_total = None
-
-                    # Build a global window -> date range mapping from all configs (cheap, artifact-derived)
-                    window_map = None
-                    if ("window_idx" in wf_rows.columns) and ("window_start_dt" in wf_rows.columns) and ("window_end_dt" in wf_rows.columns):
-                        try:
-                            wm = wf_rows[["window_idx", "window_start_dt", "window_end_dt"]].copy()
-                            wm["window_idx"] = pd.to_numeric(wm["window_idx"], errors="coerce")
-                            wm = wm.dropna(subset=["window_idx"])
-                            wm["window_idx"] = wm["window_idx"].astype(int)
-                            window_map = (
-                                wm.sort_values("window_idx")
-                                .groupby("window_idx", as_index=False)[["window_start_dt", "window_end_dt"]]
-                                .first()
+                                except Exception:
+                                    pass
+                            st.download_button(
+                                "Download rolling_starts_detail.csv (full)",
+                                data=(rs_dir_effective / "rolling_starts_detail.csv").read_bytes(),
+                                file_name=f"{selected_run_name}_rolling_starts_detail.csv",
                             )
-                        except Exception:
-                            window_map = None
-
-                    if expected_total is None:
-                        try:
-                            if window_map is not None and not window_map.empty:
-                                expected_total = int(window_map["window_idx"].max()) + 1
-                            elif "window_idx" in d.columns and not d["window_idx"].isna().all():
-                                expected_total = int(pd.to_numeric(d["window_idx"], errors="coerce").dropna().max()) + 1
-                            else:
-                                expected_total = int(len(d))
-                        except Exception:
-                            expected_total = int(len(d))
-
-                    expected_total = int(max(0, expected_total or 0))
-                    exp = pd.DataFrame({"window_idx": list(range(expected_total))})
-                    if window_map is not None and not window_map.empty:
-                        exp = exp.merge(window_map, how="left", on="window_idx")
-
-                    # Attach this-config returns
-                    dd = d.copy()
-                    if "window_idx" not in dd.columns:
-                        dd["window_idx"] = list(range(len(dd)))
-                    dd["window_idx"] = pd.to_numeric(dd["window_idx"], errors="coerce")
-                    dd["window_return"] = pd.to_numeric(dd.get("window_return"), errors="coerce") if "window_return" in dd.columns else np.nan
-                    dd = dd.dropna(subset=["window_idx"])
-                    dd["window_idx"] = dd["window_idx"].astype(int)
-                    dd_ret = dd.groupby("window_idx", as_index=False)[["window_return"]].first()
-                    exp = exp.merge(dd_ret, how="left", on="window_idx")
-
-                    def _short_dt(x: Any) -> str:
-                        try:
-                            if x is None:
-                                return ""
-                            s = str(x).strip()
-                            if not s:
-                                return ""
-                            return pd.to_datetime(s, errors="coerce").strftime("%Y-%m-%d")
-                        except Exception:
-                            return str(x)[:10] if x is not None else ""
-
-                    exp["start_s"] = exp.get("window_start_dt", "").apply(_short_dt) if "window_start_dt" in exp.columns else ""
-                    exp["end_s"] = exp.get("window_end_dt", "").apply(_short_dt) if "window_end_dt" in exp.columns else ""
-                    exp["range_label"] = exp.apply(
-                        lambda r: (f"{r['start_s']} → {r['end_s']}".strip() if (str(r.get("start_s") or "").strip() and str(r.get("end_s") or "").strip()) else f"Window {int(r['window_idx'])}"),
-                        axis=1,
-                    )
-
-                    present_mask = exp["window_return"].notna()
-                    present_n = int(present_mask.sum())
-                    expected_n = int(len(exp))
-                    missing_n = int(expected_n - present_n)
-
-                    # Summary metrics (from present windows only)
-                    rvals = exp.loc[present_mask, "window_return"].astype(float)
-                    if len(rvals) == 0:
-                        st.info("No Walkforward window returns available for this config.")
-                    else:
-                        p10 = float(np.nanpercentile(rvals, 10))
-                        p50 = float(np.nanpercentile(rvals, 50))
-                        pct_neg = float((rvals < 0.0).mean() * 100.0)
-
-                        st.markdown("##### Walkforward window summary")
-                        c1, c2, c3, c4 = st.columns(4)
-                        with c1:
-                            st.metric("10th percentile", _fmt_pct(p10))
-                        with c2:
-                            st.metric("Median", _fmt_pct(p50))
-                        with c3:
-                            st.metric("% negative", f"{pct_neg:.0f}%")
-                        with c4:
-                            st.metric("Windows present", f"{present_n}/{expected_n}")
-
-                        if expected_n and expected_n < 20:
-                            st.caption("Small N: window percentiles can be chunky.")
-                        if missing_n > 0:
-                            st.caption(f"Missing windows are shown as faint placeholders at 0 with hover label “no data” ({missing_n} missing).")
-
-                        # Chart: explicit “no data” windows + compact x labels (full ranges in hover)
-                        if go is not None:
-                            try:
-                                exp_plot = exp.copy()
-                                exp_plot["x_i"] = exp_plot["window_idx"].astype(int)
-
-                                # Full date-range label for hover (most informative)
-                                exp_plot["label_full"] = exp_plot["range_label"].astype(str)
-
-                                # Compact tick label: start date (YY-MM-DD) if available; else Window #
-                                def _tick_lbl(r):
-                                    s = str(r.get("start_s") or "").strip()
-                                    if s:
-                                        try:
-                                            return pd.to_datetime(s, errors="coerce").strftime("%y-%m-%d")
-                                        except Exception:
-                                            return s[:8]
-                                    return f"W{int(r['window_idx'])}"
-
-                                exp_plot["label_tick"] = exp_plot.apply(_tick_lbl, axis=1)
-
-                                # Choose tick density (~12 labels max) to prevent overlap
-                                max_ticks = 12
-                                step = max(1, int(math.ceil(len(exp_plot) / max_ticks)))
-                                tickvals = exp_plot["x_i"].iloc[::step].tolist()
-                                ticktext = exp_plot["label_tick"].iloc[::step].tolist()
-
-                                # Bar colors: green >= 0, amber < 0, grey for missing
-                                raw_vals = exp_plot["window_return"].tolist()
-                                base_colors = [
-                                    (PASS_COLOR if (v is not None and not pd.isna(v) and float(v) >= 0.0) else WARN_COLOR)
-                                    for v in raw_vals
-                                ]
-                                colors = [
-                                    (base_colors[i] if bool(present_mask.iloc[i]) else "rgba(17,24,39,0.10)")
-                                    for i in range(len(base_colors))
-                                ]
-
-                                fig_wf = go.Figure()
-
-                                # Main bars (use 0 for missing so axis stays honest)
-                                y_main = exp_plot["window_return"].fillna(0.0).astype(float).tolist()
-                                hover = []
-                                for i, row in exp_plot.iterrows():
-                                    v = row.get("window_return")
-                                    if pd.isna(v):
-                                        hover.append(f"<b>{row['label_full']}</b><br>Return: <b>no data</b>")
-                                    else:
-                                        hover.append(f"<b>{row['label_full']}</b><br>Window return: <b>{_fmt_pct(float(v))}</b>")
-
-                                fig_wf.add_trace(
-                                    go.Bar(
-                                        x=exp_plot["x_i"],
-                                        y=y_main,
-                                        marker_color=colors,
-                                        hovertext=hover,
-                                        hoverinfo="text",
-                                        showlegend=False,
-                                    )
-                                )
-
-                                # Missing placeholders: tiny eps bar + “no data” label (so it’s visible but not misleading)
-                                miss = exp_plot.loc[~present_mask].copy()
-                                if not miss.empty:
-                                    eps = 1e-6
-                                    fig_wf.add_trace(
-                                        go.Bar(
-                                            x=miss["x_i"],
-                                            y=[eps] * len(miss),
-                                            marker_color="rgba(17,24,39,0.06)",
-                                            marker_line_color="rgba(17,24,39,0.15)",
-                                            marker_line_width=1,
-                                            text=["no data"] * len(miss) if len(miss) <= 30 else None,
-                                            textposition="outside",
-                                            textfont=dict(size=10, color="rgba(17,24,39,0.55)"),
-                                            hovertext=[f"<b>{lbl}</b><br>Return: <b>no data</b>" for lbl in miss["label_full"].tolist()],
-                                            hoverinfo="text",
-                                            showlegend=False,
-                                        )
-                                    )
-
-                                # Styling + axis labels
-                                fig_wf.update_layout(barmode="overlay")
-                                _style_fig(fig_wf, title=None)
-                                fig_wf.update_yaxes(tickformat=".0%", title="Window return")
-                                fig_wf.update_xaxes(
-                                    title="Test window (start date)",
-                                    tickmode="array",
-                                    tickvals=tickvals,
-                                    ticktext=ticktext,
-                                    tickangle=0,
-                                )
-                                fig_wf.update_xaxes(range=[-0.5, float(len(exp_plot) - 0.5)])
-
-                                _plotly(fig_wf)
-                            except Exception:
-                                pass
-
-                    st.download_button(
-                        "Download wf_results.csv (full)",
-                        data=(wf_dir_effective / "wf_results.csv").read_bytes(),
-                        file_name=f"{selected_run_name}_wf_results.csv",
-                    )
-            else:
-                st.info("Walkforward results file exists but appears empty.")
-        else:
-            st.info("Walkforward evidence not available for this run (run it from Build & Run).")
-    with _tab.get("Exports", _tab_containers[-1]):
-        st.caption("Export artifacts for sharing or replay. This app is tooling — exporting is how you keep work portable.")
-
-        st.markdown("#### Exports")
-
-        st.download_button(
-            "Download candidates (CSV)",
-            data=df2.to_csv(index=False).encode("utf-8"),
-            file_name=f"{selected_run_name}_candidates.csv",
-        )
-
-        st.download_button(
-            "Download manifest.json",
-            data=json.dumps(manifest, indent=2, ensure_ascii=False).encode("utf-8"),
-            file_name=f"{selected_run_name}_manifest.json",
-            key="exports.manifest",
-        )
-
-        st.divider()
-        st.markdown("#### Strategy pack (.zip)")
-        st.caption("Portable bundle for one strategy: manifest + config + filtered Batch/RS/WF evidence, with verifiable hashes (Pack v2).")
-
-        copt1, copt2 = st.columns(2)
-        with copt1:
-            include_replay = st.checkbox("Include replay/top artifacts", value=True, key="pack.include_replay")
-        with copt2:
-            include_dataset = st.checkbox("Include dataset file (usually off)", value=False, key="pack.include_dataset")
-
-        pack_key = f"pack.bytes.{selected_run_name}.{pick}.v2"
-        if st.button("Build strategy pack", key="pack.build", type="primary"):
-            try:
-                pack_bytes = _build_strategy_pack_zip(
-                    run_dir=run_dir,
-                    run_name=str(selected_run_name),
-                    config_id=str(pick),
-                    manifest=manifest,
-                    candidate_row=row,
-                    cfg_norm=cfg_norm,
-                    rs_dir=rs_dir_effective if isinstance(rs_dir_effective, Path) else None,
-                    wf_dir=wf_dir_effective if isinstance(wf_dir_effective, Path) else None,
-                    top_art_dir=art_dir if (art_dir and art_dir.exists()) else None,
-                    include_replay=bool(include_replay),
-                    include_dataset=bool(include_dataset),
-                )
-                st.session_state[pack_key] = pack_bytes
-                st.success("Strategy pack is ready.")
-            except Exception as e:
-                st.error(f"Failed to build strategy pack: {e}")
-
-        if pack_key in st.session_state:
-            st.download_button(
-                "Download strategy pack (.zip)",
-                data=st.session_state[pack_key],
-                file_name=f"{selected_run_name}_strategy_pack_v2_{str(pick)[:10]}.zip",
-                key="pack.download",
-            )
-
-        st.divider()
-        st.markdown("#### Verify a strategy pack (.zip)")
-        up = st.file_uploader("Upload a strategy pack to verify", type=["zip"], key="pack.verify.upload")
-        if up is not None:
-            try:
-                z = zipfile.ZipFile(io.BytesIO(up.getvalue()), "r")
-                names = set(z.namelist())
-                missing = [p for p in ["manifest.json", "meta/pack_index.json", "README.md"] if p not in names]
-                if missing:
-                    st.warning("Missing required files: " + ", ".join(missing))
-
-                pack_index = {}
-                try:
-                    pack_index = json.loads(z.read("meta/pack_index.json").decode("utf-8"))
-                except Exception:
-                    pack_index = {}
-
-                ok = True
-                mismatches = []
-                files = (pack_index.get("files") or {}) if isinstance(pack_index, dict) else {}
-                if files:
-                    for arc, rec in files.items():
-                        try:
-                            b = z.read(arc)
-                            dig = hashlib.sha256(b).hexdigest()
-                            exp = str((rec or {}).get("digest") or "")
-                            if exp and dig != exp:
-                                ok = False
-                                mismatches.append((arc, exp, dig))
-                        except KeyError:
-                            ok = False
-                            mismatches.append((arc, "missing", "missing"))
-                        except Exception:
-                            pass
                 else:
-                    st.info("No pack_index hashes found; cannot fully verify integrity.")
+                    st.info("Rolling Starts evidence not available for this run (run it from Build & Run).")
 
-                if ok and files:
-                    st.success("Pack integrity verified (hashes match).")
-                elif mismatches:
-                    st.error("Pack integrity issues found.")
-                    for arc, exp, got in mismatches[:20]:
-                        st.write(f"- {arc}: expected {exp[:10]}… got {got[:10]}…")
+            with _tab.get("Time-split test", _tab_containers[0]):
+                st.caption("Walkforward: train/test through time windows. You want consistency across windows — not one regime doing all the work.")
 
-                # Dataset verification (optional)
-                try:
-                    man = json.loads(z.read("manifest.json").decode("utf-8"))
-                except Exception:
-                    man = {}
-                ds = (man.get("dataset") or {}) if isinstance(man, dict) else {}
-                fp = (ds.get("fingerprint") or {}) if isinstance(ds, dict) else {}
-                exp_digest = str(fp.get("digest") or "")
+                st.markdown("#### Walkforward detail")
+                if wf_dir_effective and (wf_dir_effective / "wf_results.csv").exists():
+                    wf_rows = load_wf_results(wf_dir_effective)
+                    if wf_rows is not None and not wf_rows.empty and "config_id" in wf_rows.columns:
+                        pick_eff = str(pick).strip()
 
-                if exp_digest:
-                    st.caption("Optional: verify a local dataset file against this pack's dataset fingerprint.")
-                    ds_path = st.text_input("Local dataset path", value="", key="pack.verify.dataset_path")
-                    if st.button("Verify dataset fingerprint", key="pack.verify.dataset_btn") and ds_path:
-                        p = Path(ds_path).expanduser()
-                        if not p.exists():
-                            st.error("Dataset file not found at that path.")
+                        # Fallback: if user picked something non-canonical (e.g., a legacy integer id),
+                        # try to map it to the real config_id using the current candidates table.
+                        if ("config.id" in df2.columns) and (pick_eff.isdigit() or (pick_eff and not pick_eff.startswith("cfg_"))):
+                            # 1) If it's a config line number, map line_no -> config_id
+                            if pick_eff.isdigit() and ("config.line_no" in df2.columns):
+                                try:
+                                    li = int(pick_eff)
+                                    m = df2[df2["config.line_no"].astype(int) == li]
+                                    if len(m) == 1:
+                                        pick_eff = str(m["config_id"].iloc[0]).strip()
+                                except Exception:
+                                    pass
+
+                            # 2) If it's an index-like integer, treat it as 1-based row id into df_show (common confusion).
+                            if pick_eff.isdigit():
+                                try:
+                                    i = int(pick_eff)
+                                    if 1 <= i <= len(df_show):
+                                        pick_eff = str(df_show["config_id"].astype(str).iloc[i - 1]).strip()
+                                except Exception:
+                                    pass
+
+                        d = wf_rows[wf_rows["config_id"].astype(str).str.strip() == str(pick_eff)].copy()
+                        if d.empty:
+                            st.info("No Walkforward detail rows for this config.")
                         else:
-                            cur = _fingerprint_file(p)
-                            got = str(cur.get("digest") or "")
-                            if got == exp_digest:
-                                st.success("Dataset fingerprint matches (comparable).")
+                            # -----------------------------
+                            # Step 6: window ranges + missing windows made explicit
+                            # -----------------------------
+                            meta = _read_json(Path(wf_dir_effective) / "wf_meta.json") if wf_dir_effective else {}
+                            expected_total = None
+                            try:
+                                expected_total = int(meta.get("windows")) if meta.get("windows") is not None else None
+                            except Exception:
+                                expected_total = None
+
+                            # Build a global window -> date range mapping from all configs (cheap, artifact-derived)
+                            window_map = None
+                            if ("window_idx" in wf_rows.columns) and ("window_start_dt" in wf_rows.columns) and ("window_end_dt" in wf_rows.columns):
+                                try:
+                                    wm = wf_rows[["window_idx", "window_start_dt", "window_end_dt"]].copy()
+                                    wm["window_idx"] = pd.to_numeric(wm["window_idx"], errors="coerce")
+                                    wm = wm.dropna(subset=["window_idx"])
+                                    wm["window_idx"] = wm["window_idx"].astype(int)
+                                    window_map = (
+                                        wm.sort_values("window_idx")
+                                        .groupby("window_idx", as_index=False)[["window_start_dt", "window_end_dt"]]
+                                        .first()
+                                    )
+                                except Exception:
+                                    window_map = None
+
+                            if expected_total is None:
+                                try:
+                                    if window_map is not None and not window_map.empty:
+                                        expected_total = int(window_map["window_idx"].max()) + 1
+                                    elif "window_idx" in d.columns and not d["window_idx"].isna().all():
+                                        expected_total = int(pd.to_numeric(d["window_idx"], errors="coerce").dropna().max()) + 1
+                                    else:
+                                        expected_total = int(len(d))
+                                except Exception:
+                                    expected_total = int(len(d))
+
+                            expected_total = int(max(0, expected_total or 0))
+                            exp = pd.DataFrame({"window_idx": list(range(expected_total))})
+                            if window_map is not None and not window_map.empty:
+                                exp = exp.merge(window_map, how="left", on="window_idx")
+
+                            # Attach this-config returns
+                            dd = d.copy()
+                            if "window_idx" not in dd.columns:
+                                dd["window_idx"] = list(range(len(dd)))
+                            dd["window_idx"] = pd.to_numeric(dd["window_idx"], errors="coerce")
+                            dd["window_return"] = pd.to_numeric(dd.get("window_return"), errors="coerce") if "window_return" in dd.columns else np.nan
+                            dd = dd.dropna(subset=["window_idx"])
+                            dd["window_idx"] = dd["window_idx"].astype(int)
+                            dd_ret = dd.groupby("window_idx", as_index=False)[["window_return"]].first()
+                            exp = exp.merge(dd_ret, how="left", on="window_idx")
+
+                            def _short_dt(x: Any) -> str:
+                                try:
+                                    if x is None:
+                                        return ""
+                                    s = str(x).strip()
+                                    if not s:
+                                        return ""
+                                    return pd.to_datetime(s, errors="coerce").strftime("%Y-%m-%d")
+                                except Exception:
+                                    return str(x)[:10] if x is not None else ""
+
+                            exp["start_s"] = exp.get("window_start_dt", "").apply(_short_dt) if "window_start_dt" in exp.columns else ""
+                            exp["end_s"] = exp.get("window_end_dt", "").apply(_short_dt) if "window_end_dt" in exp.columns else ""
+                            exp["range_label"] = exp.apply(
+                                lambda r: (f"{r['start_s']} → {r['end_s']}".strip() if (str(r.get("start_s") or "").strip() and str(r.get("end_s") or "").strip()) else f"Window {int(r['window_idx'])}"),
+                                axis=1,
+                            )
+
+                            present_mask = exp["window_return"].notna()
+                            present_n = int(present_mask.sum())
+                            expected_n = int(len(exp))
+                            missing_n = int(expected_n - present_n)
+
+                            # Summary metrics (from present windows only)
+                            rvals = exp.loc[present_mask, "window_return"].astype(float)
+                            if len(rvals) == 0:
+                                st.info("No Walkforward window returns available for this config.")
                             else:
-                                st.error("Dataset fingerprint does NOT match.")
-            except Exception as e:
-                st.error(f"Could not verify pack: {e}")
+                                p10 = float(np.nanpercentile(rvals, 10))
+                                p50 = float(np.nanpercentile(rvals, 50))
+                                pct_neg = float((rvals < 0.0).mean() * 100.0)
+
+                                st.markdown("##### Walkforward window summary")
+                                c1, c2, c3, c4 = st.columns(4)
+                                with c1:
+                                    st.metric("10th percentile", _fmt_pct(p10))
+                                with c2:
+                                    st.metric("Median", _fmt_pct(p50))
+                                with c3:
+                                    st.metric("% negative", f"{pct_neg:.0f}%")
+                                with c4:
+                                    st.metric("Windows present", f"{present_n}/{expected_n}")
+
+                                if expected_n and expected_n < 20:
+                                    st.caption("Small N: window percentiles can be chunky.")
+                                if missing_n > 0:
+                                    st.caption(f"Missing windows are shown as faint placeholders at 0 with hover label “no data” ({missing_n} missing).")
+
+                                # Chart: explicit “no data” windows + compact x labels (full ranges in hover)
+                                if go is not None:
+                                    try:
+                                        exp_plot = exp.copy()
+                                        exp_plot["x_i"] = exp_plot["window_idx"].astype(int)
+
+                                        # Full date-range label for hover (most informative)
+                                        exp_plot["label_full"] = exp_plot["range_label"].astype(str)
+
+                                        # Compact tick label: start date (YY-MM-DD) if available; else Window #
+                                        def _tick_lbl(r):
+                                            s = str(r.get("start_s") or "").strip()
+                                            if s:
+                                                try:
+                                                    return pd.to_datetime(s, errors="coerce").strftime("%y-%m-%d")
+                                                except Exception:
+                                                    return s[:8]
+                                            return f"W{int(r['window_idx'])}"
+
+                                        exp_plot["label_tick"] = exp_plot.apply(_tick_lbl, axis=1)
+
+                                        # Choose tick density (~12 labels max) to prevent overlap
+                                        max_ticks = 12
+                                        step = max(1, int(math.ceil(len(exp_plot) / max_ticks)))
+                                        tickvals = exp_plot["x_i"].iloc[::step].tolist()
+                                        ticktext = exp_plot["label_tick"].iloc[::step].tolist()
+
+                                        # Bar colors: green >= 0, amber < 0, grey for missing
+                                        raw_vals = exp_plot["window_return"].tolist()
+                                        base_colors = [
+                                            (PASS_COLOR if (v is not None and not pd.isna(v) and float(v) >= 0.0) else WARN_COLOR)
+                                            for v in raw_vals
+                                        ]
+                                        colors = [
+                                            (base_colors[i] if bool(present_mask.iloc[i]) else "rgba(17,24,39,0.10)")
+                                            for i in range(len(base_colors))
+                                        ]
+
+                                        fig_wf = go.Figure()
+
+                                        # Main bars (use 0 for missing so axis stays honest)
+                                        y_main = exp_plot["window_return"].fillna(0.0).astype(float).tolist()
+                                        hover = []
+                                        for i, row in exp_plot.iterrows():
+                                            v = row.get("window_return")
+                                            if pd.isna(v):
+                                                hover.append(f"<b>{row['label_full']}</b><br>Return: <b>no data</b>")
+                                            else:
+                                                hover.append(f"<b>{row['label_full']}</b><br>Window return: <b>{_fmt_pct(float(v))}</b>")
+
+                                        fig_wf.add_trace(
+                                            go.Bar(
+                                                x=exp_plot["x_i"],
+                                                y=y_main,
+                                                marker_color=colors,
+                                                hovertext=hover,
+                                                hoverinfo="text",
+                                                showlegend=False,
+                                            )
+                                        )
+
+                                        # Missing placeholders: tiny eps bar + “no data” label (so it’s visible but not misleading)
+                                        miss = exp_plot.loc[~present_mask].copy()
+                                        if not miss.empty:
+                                            eps = 1e-6
+                                            fig_wf.add_trace(
+                                                go.Bar(
+                                                    x=miss["x_i"],
+                                                    y=[eps] * len(miss),
+                                                    marker_color="rgba(17,24,39,0.06)",
+                                                    marker_line_color="rgba(17,24,39,0.15)",
+                                                    marker_line_width=1,
+                                                    text=["no data"] * len(miss) if len(miss) <= 30 else None,
+                                                    textposition="outside",
+                                                    textfont=dict(size=10, color="rgba(17,24,39,0.55)"),
+                                                    hovertext=[f"<b>{lbl}</b><br>Return: <b>no data</b>" for lbl in miss["label_full"].tolist()],
+                                                    hoverinfo="text",
+                                                    showlegend=False,
+                                                )
+                                            )
+
+                                        # Styling + axis labels
+                                        fig_wf.update_layout(barmode="overlay")
+                                        _style_fig(fig_wf, title=None)
+                                        fig_wf.update_yaxes(tickformat=".0%", title="Window return")
+                                        fig_wf.update_xaxes(
+                                            title="Test window (start date)",
+                                            tickmode="array",
+                                            tickvals=tickvals,
+                                            ticktext=ticktext,
+                                            tickangle=0,
+                                        )
+                                        fig_wf.update_xaxes(range=[-0.5, float(len(exp_plot) - 0.5)])
+
+                                        _plotly(fig_wf)
+                                    except Exception:
+                                        pass
+
+                            st.download_button(
+                                "Download wf_results.csv (full)",
+                                data=(wf_dir_effective / "wf_results.csv").read_bytes(),
+                                file_name=f"{selected_run_name}_wf_results.csv",
+                            )
+                    else:
+                        st.info("Walkforward results file exists but appears empty.")
+                else:
+                    st.info("Walkforward evidence not available for this run (run it from Build & Run).")
+            with _tab.get("Exports", _tab_containers[-1]):
+                st.caption("Export artifacts for sharing or replay. This app is tooling — exporting is how you keep work portable.")
+
+                st.markdown("#### Exports")
+
+                st.download_button(
+                    "Download candidates (CSV)",
+                    data=df2.to_csv(index=False).encode("utf-8"),
+                    file_name=f"{selected_run_name}_candidates.csv",
+                )
+
+                st.download_button(
+                    "Download manifest.json",
+                    data=json.dumps(manifest, indent=2, ensure_ascii=False).encode("utf-8"),
+                    file_name=f"{selected_run_name}_manifest.json",
+                    key="exports.manifest",
+                )
+
+                st.divider()
+                st.markdown("#### Strategy pack (.zip)")
+                st.caption("Portable bundle for one strategy: manifest + config + filtered Batch/RS/WF evidence, with verifiable hashes (Pack v2).")
+
+                copt1, copt2 = st.columns(2)
+                with copt1:
+                    include_replay = st.checkbox("Include replay/top artifacts", value=True, key="pack.include_replay")
+                with copt2:
+                    include_dataset = st.checkbox("Include dataset file (usually off)", value=False, key="pack.include_dataset")
+
+                pack_key = f"pack.bytes.{selected_run_name}.{pick}.v2"
+                if st.button("Build strategy pack", key="pack.build", type="primary"):
+                    try:
+                        pack_bytes = _build_strategy_pack_zip(
+                            run_dir=run_dir,
+                            run_name=str(selected_run_name),
+                            config_id=str(pick),
+                            manifest=manifest,
+                            candidate_row=row,
+                            cfg_norm=cfg_norm,
+                            rs_dir=rs_dir_effective if isinstance(rs_dir_effective, Path) else None,
+                            wf_dir=wf_dir_effective if isinstance(wf_dir_effective, Path) else None,
+                            top_art_dir=art_dir if (art_dir and art_dir.exists()) else None,
+                            include_replay=bool(include_replay),
+                            include_dataset=bool(include_dataset),
+                        )
+                        st.session_state[pack_key] = pack_bytes
+                        st.success("Strategy pack is ready.")
+                    except Exception as e:
+                        st.error(f"Failed to build strategy pack: {e}")
+
+                if pack_key in st.session_state:
+                    st.download_button(
+                        "Download strategy pack (.zip)",
+                        data=st.session_state[pack_key],
+                        file_name=f"{selected_run_name}_strategy_pack_v2_{str(pick)[:10]}.zip",
+                        key="pack.download",
+                    )
+
+                st.divider()
+                st.markdown("#### Verify a strategy pack (.zip)")
+                up = st.file_uploader("Upload a strategy pack to verify", type=["zip"], key="pack.verify.upload")
+                if up is not None:
+                    try:
+                        z = zipfile.ZipFile(io.BytesIO(up.getvalue()), "r")
+                        names = set(z.namelist())
+                        missing = [p for p in ["manifest.json", "meta/pack_index.json", "README.md"] if p not in names]
+                        if missing:
+                            st.warning("Missing required files: " + ", ".join(missing))
+
+                        pack_index = {}
+                        try:
+                            pack_index = json.loads(z.read("meta/pack_index.json").decode("utf-8"))
+                        except Exception:
+                            pack_index = {}
+
+                        ok = True
+                        mismatches = []
+                        files = (pack_index.get("files") or {}) if isinstance(pack_index, dict) else {}
+                        if files:
+                            for arc, rec in files.items():
+                                try:
+                                    b = z.read(arc)
+                                    dig = hashlib.sha256(b).hexdigest()
+                                    exp = str((rec or {}).get("digest") or "")
+                                    if exp and dig != exp:
+                                        ok = False
+                                        mismatches.append((arc, exp, dig))
+                                except KeyError:
+                                    ok = False
+                                    mismatches.append((arc, "missing", "missing"))
+                                except Exception:
+                                    pass
+                        else:
+                            st.info("No pack_index hashes found; cannot fully verify integrity.")
+
+                        if ok and files:
+                            st.success("Pack integrity verified (hashes match).")
+                        elif mismatches:
+                            st.error("Pack integrity issues found.")
+                            for arc, exp, got in mismatches[:20]:
+                                st.write(f"- {arc}: expected {exp[:10]}… got {got[:10]}…")
+
+                        # Dataset verification (optional)
+                        try:
+                            man = json.loads(z.read("manifest.json").decode("utf-8"))
+                        except Exception:
+                            man = {}
+                        ds = (man.get("dataset") or {}) if isinstance(man, dict) else {}
+                        fp = (ds.get("fingerprint") or {}) if isinstance(ds, dict) else {}
+                        exp_digest = str(fp.get("digest") or "")
+
+                        if exp_digest:
+                            st.caption("Optional: verify a local dataset file against this pack's dataset fingerprint.")
+                            ds_path = st.text_input("Local dataset path", value="", key="pack.verify.dataset_path")
+                            if st.button("Verify dataset fingerprint", key="pack.verify.dataset_btn") and ds_path:
+                                p = Path(ds_path).expanduser()
+                                if not p.exists():
+                                    st.error("Dataset file not found at that path.")
+                                else:
+                                    cur = _fingerprint_file(p)
+                                    got = str(cur.get("digest") or "")
+                                    if got == exp_digest:
+                                        st.success("Dataset fingerprint matches (comparable).")
+                                    else:
+                                        st.error("Dataset fingerprint does NOT match.")
+                    except Exception as e:
+                        st.error(f"Could not verify pack: {e}")
