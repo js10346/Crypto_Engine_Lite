@@ -1538,12 +1538,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     
     # If we use multiprocessing (Windows spawn), avoid sending df_feat to workers.
     # Save once and have workers load it in their initializer.
+    # Persist df_feat so downstream tools/UI (replay overlays, evidence charts) can load the exact tape.
+    # Previously this was only saved when jobs > 1 (multiprocessing), which breaks UI overlays for single-job runs.
     df_feat_path = out_dir / "df_feat.parquet"
-    if jobs > 1:
+    try:
         t_save0 = time.time()
         df_feat.to_parquet(df_feat_path, index=False)
         t_save = time.time() - t_save0
-        print(f"\nSaved df_feat for workers: {df_feat_path} ({t_save:.2f}s)")
+        print(f"\nSaved df_feat: {df_feat_path} ({t_save:.2f}s)")
+    except Exception as _e:
+        print(f"\nWarning: failed to save df_feat.parquet for UI overlays: {_e}")
 
     # Sweep loop
     rows_sweep: List[Dict[str, Any]] = []

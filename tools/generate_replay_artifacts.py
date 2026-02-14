@@ -147,55 +147,24 @@ def _best_data_path(meta: Dict[str, Any]) -> Path:
 
 
 def _ensure_vol_bps_like_batch(df: pd.DataFrame, window: int) -> pd.DataFrame:
-    """Match engine.batch._ensure_vol_bps() to avoid divergences."""
-    if "vol_bps" in df.columns:
-        df = df.copy()
-        df["vol_bps"] = pd.to_numeric(df["vol_bps"], errors="coerce").fillna(0.0)
+    """Match engine.batch._ensure_vol_bps() to avoid divergences.
+
+    If vol_bps already exists, coerce to float and fill NaNs with 0. Otherwise compute
+    rolling log-return volatility and convert to basis points (bps).
+    """
+    if df is None or df.empty:
         return df
 
-    import numpy as np
-
-
-
-def _add_contrib_profit_columns(eq_df: pd.DataFrame, *, starting_equity: float) -> pd.DataFrame:
-    """Add contribution/profit clarity columns to an equity curve.
-
-    Columns added:
-      - contrib_total: cumulative cash-in (starting_equity + cumulative positive cashflow)
-      - profit: equity - contrib_total
-
-    Notes:
-    - We intentionally derive this from the *recorded* per-bar cashflow rather than
-      re-deriving deposit schedules from config params. That keeps results deterministic
-      and auditable: equity_curve.csv is the source of truth for what happened.
-    - If cashflow includes withdrawals (negative), contrib_total only counts cash-in.
-    """
-    if eq_df is None or eq_df.empty:
-        return eq_df
-
-    df = eq_df.copy()
-
-    # cashflow is recorded per bar by the backtester (0 if none).
-    if "cashflow" in df.columns:
-        cf = pd.to_numeric(df["cashflow"], errors="coerce").fillna(0.0)
-    else:
-        cf = pd.Series([0.0] * len(df), index=df.index)
-
-    deposits = cf.clip(lower=0.0)
-    contrib_total = float(starting_equity) + deposits.cumsum()
-
-    df["contrib_total"] = contrib_total
-
-    if "equity" in df.columns:
-        eq = pd.to_numeric(df["equity"], errors="coerce")
-        df["profit"] = eq - df["contrib_total"]
-
-    return df
+    if "vol_bps" in df.columns:
+        out = df.copy()
+        out["vol_bps"] = pd.to_numeric(out["vol_bps"], errors="coerce").fillna(0.0).astype(float)
+        return out
 
     w = int(max(2, window))
-    c = df["close"].astype(float)
+    c = pd.to_numeric(df["close"], errors="coerce").astype(float)
     r = np.log(c).diff()
     vol = r.rolling(w, min_periods=max(2, w // 2)).std()
+
     out = df.copy()
     out["vol_bps"] = (vol.fillna(0.0) * 10_000.0).astype(float)
     return out

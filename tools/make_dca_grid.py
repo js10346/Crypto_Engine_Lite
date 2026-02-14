@@ -291,7 +291,11 @@ def _mutate_entry_logic(
     except Exception:
         logic = {"regime": [], "clauses": []}
 
-    w = _intensity_to_width(intensity, fallback_width=str(width))
+    # Neighborhood mode already receives an explicit width ('narrow'|'medium'|'wide').
+    # The previous code referenced an undefined `intensity` variable here and crashed.
+    w = str(width or 'medium').strip().lower()
+    if w not in {'narrow','medium','wide'}:
+        w = 'medium'
 
     def mut_cond(c: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(c, dict):
