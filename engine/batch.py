@@ -895,6 +895,33 @@ def _make_constraints():
     )
 
 
+
+
+def _truthy(x: Any) -> bool:
+    try:
+        if x is True:
+            return True
+        s = str(x).strip().lower()
+        return s in {"1", "true", "yes", "y", "t"}
+    except Exception:
+        return False
+
+
+def _find_baseline_config_id(parsed_configs: List[Dict[str, Any]]) -> Optional[str]:
+    """Best-effort: identify the user's original (baseline) config_id in this grid."""
+    try:
+        for row in parsed_configs:
+            cid = row.get("config_id")
+            norm = row.get("normalized") or {}
+            params = norm.get("params") if isinstance(norm, dict) else None
+            if not isinstance(params, dict):
+                params = {}
+            if _truthy(params.get("__baseline__")):
+                return str(cid) if cid is not None else None
+    except Exception:
+        pass
+    return None
+
 def _read_jsonl(path: str) -> Iterable[Tuple[int, Dict[str, Any]]]:
     p = Path(path)
     if not p.exists():
@@ -1505,6 +1532,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     if errors:
         _write_jsonl(out_dir / "errors.jsonl", errors)
 
+    baseline_config_id = _find_baseline_config_id(parsed_configs)
+
     if len(parsed_configs) == 0:
         print(f"\nNo configs parsed successfully. Output: {out_dir}")
         if errors:
@@ -1780,6 +1809,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "starting_equity": float(args.starting_equity),
             "configs_total": int(len(parsed_configs)),
             "errors_total": int(len(errors)),
+            "baseline_config_id": str(baseline_config_id) if baseline_config_id else None,
             "note": "No configs passed gates. Try --min-trades 0 for DCA sweeps.",
             "out_dir": str(out_dir),
         }
@@ -2082,6 +2112,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "market_mode": str(args.market_mode),
         "configs_total": int(len(parsed_configs)),
         "errors_total": int(len(errors)),
+            "baseline_config_id": str(baseline_config_id) if baseline_config_id else None,
         "fast_sweep": bool(args.fast_sweep),
         "engine_supports_fast_flags": supports,
         "sweep_sort_by": args.sweep_sort_by,
