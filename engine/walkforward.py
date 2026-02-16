@@ -756,6 +756,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     meta_path = run_dir / "batch_meta.json"
     meta: Dict[str, Any] = _read_json(meta_path) if meta_path.exists() else {}
 
+    baseline_id = str(meta.get("baseline_config_id") or "").strip() or None
+
     data_path = str(args.data) if args.data else str(meta.get("data"))
     if not data_path:
         raise ValueError("No data path. Provide --data or ensure batch_meta.json has 'data'.")
@@ -839,6 +841,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         sort_by=sort_by,
         sort_desc=sort_desc,
     )
+
+    # Ensure baseline config is always included in WF (even if it failed gates / isn't in passed shortlist)
+    if baseline_id:
+        b = str(baseline_id)
+        if b in config_ids:
+            config_ids = [b] + [cid for cid in config_ids if str(cid) != b]
+        else:
+            config_ids = [b] + list(config_ids)
+        # Keep within requested limit while preserving baseline at front
+        config_ids = config_ids[: int(args.top_n)]
     if not config_ids:
         raise ValueError("No config IDs selected from results_full*.csv")
 
@@ -1031,6 +1043,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Save
     wf_rows_df = pd.DataFrame(wf_rows)
     wf_sum_df = pd.DataFrame(wf_summaries)
+
+    # Mark baseline rows for UI overlays
+    if baseline_id:
+        b = str(baseline_id)
+        try:
+            if (not wf_rows_df.empty):
+                if "config_id" in wf_rows_df.columns:
+                    wf_rows_df["is_baseline"] = wf_rows_df["config_id"].astype(str) == b
+                elif "config.id" in wf_rows_df.columns:
+                    wf_rows_df["is_baseline"] = wf_rows_df["config.id"].astype(str) == b
+            if (not wf_sum_df.empty):
+                if "config_id" in wf_sum_df.columns:
+                    wf_sum_df["is_baseline"] = wf_sum_df["config_id"].astype(str) == b
+                elif "config.id" in wf_sum_df.columns:
+                    wf_sum_df["is_baseline"] = wf_sum_df["config.id"].astype(str) == b
+        except Exception:
+            pass
 
     wf_rows_df.to_csv(out_dir / "wf_results.csv", index=False)
     wf_sum_df.to_csv(out_dir / "wf_summary.csv", index=False)

@@ -275,6 +275,114 @@ def _style_fig(fig, title: str | None = None):
 
 
 
+# =============================================================================
+# Stability visuals helpers
+# =============================================================================
+
+def _pct_rank(arr: np.ndarray, x: float) -> float:
+    """Percentile rank of x within arr (0..100). Uses <= for ties."""
+    try:
+        if arr is None:
+            return float("nan")
+        a = np.asarray(arr, dtype=float)
+        a = a[np.isfinite(a)]
+        if a.size == 0:
+            return float("nan")
+        if x is None or (not math.isfinite(float(x))):
+            return float("nan")
+        return float(np.mean(a <= float(x)) * 100.0)
+    except Exception:
+        return float("nan")
+
+
+def _stability_zone_label(pct: float) -> str:
+    """Human label for percentile band."""
+    try:
+        p = float(pct)
+    except Exception:
+        return ""
+    if not math.isfinite(p):
+        return ""
+    if p >= 90.0:
+        return "Elite"
+    if p >= 80.0:
+        return "Strong"
+    if p >= 50.0:
+        return "Typical"
+    return "Below typical"
+
+
+def _stability_percentile_bar_fig(
+    you_pct: float,
+    *,
+    selected_pct: float | None = None,
+    show_selected: bool = False,
+    cutoff_pct: float | None = None,
+) -> "go.Figure | None":
+    """Small 'credit-score' style bar (0-100) with Typical/Strong/Elite bands and markers."""
+    if go is None:
+        return None
+
+    try:
+        y0, y1 = 0.0, 1.0
+        fig = go.Figure()
+
+        # Bands (0-80 typical, 80-90 strong, 90-100 elite)
+        fig.add_shape(type="rect", x0=0, x1=80, y0=y0, y1=y1, line=dict(width=0), fillcolor="rgba(17,24,39,0.06)")
+        fig.add_shape(type="rect", x0=80, x1=90, y0=y0, y1=y1, line=dict(width=0), fillcolor="rgba(41,121,255,0.10)")
+        fig.add_shape(type="rect", x0=90, x1=100, y0=y0, y1=y1, line=dict(width=0), fillcolor="rgba(41,121,255,0.18)")
+
+        # Segment labels
+        fig.add_annotation(x=40, y=0.5, text="Typical", showarrow=False, font=dict(size=12, color="#111827"))
+        fig.add_annotation(x=85, y=0.5, text="Strong", showarrow=False, font=dict(size=12, color=ACCENT_BLUE))
+        fig.add_annotation(x=95, y=0.5, text="Elite", showarrow=False, font=dict(size=12, color=ACCENT_BLUE))
+
+        def _add_marker(pct: float, label: str, color: str, *, width: int = 3, dash: str = "solid", symbol: str = "circle") -> None:
+            if pct is None or (not math.isfinite(float(pct))):
+                return
+            x = float(min(max(float(pct), 0.0), 100.0))
+            # Tick line
+            fig.add_shape(type="line", x0=x, x1=x, y0=y0, y1=y1, line=dict(color=color, width=width, dash=dash))
+            # Marker point (helps hover + visibility)
+            fig.add_trace(
+                go.Scatter(
+                    x=[x],
+                    y=[0.5],
+                    mode="markers",
+                    marker=dict(size=12, symbol=symbol, color=color, line=dict(width=2, color="rgba(255,255,255,0.95)")),
+                    hovertemplate=f"{label}: P{float(pct):.0f}<extra></extra>",
+                    showlegend=False,
+                )
+            )
+            # Label bubble
+            fig.add_annotation(
+                x=x,
+                y=1.12,
+                yref="paper",
+                text=f"{label} (P{float(pct):.0f})",
+                showarrow=False,
+                xanchor="center",
+                yanchor="bottom",
+                font=dict(size=12, color=color),
+            )
+
+        _add_marker(you_pct, "You", "#111827", width=4, symbol="star")
+
+        if cutoff_pct is not None and math.isfinite(float(cutoff_pct)):
+            _add_marker(float(cutoff_pct), "Cutoff", WARN_COLOR, width=2, dash="dash", symbol="x")
+
+        if show_selected and selected_pct is not None and math.isfinite(float(selected_pct)):
+            _add_marker(float(selected_pct), "Selected", ACCENT_ORANGE, width=3, dash="dot", symbol="diamond")
+
+        fig.update_xaxes(range=[0, 100], tickvals=[0, 50, 80, 90, 100], ticktext=["0", "50", "80", "90", "100"], title=None, showgrid=False, zeroline=False)
+        fig.update_yaxes(range=[0, 1], visible=False, showgrid=False, zeroline=False)
+        fig.update_layout(height=140, margin=dict(l=20, r=20, t=50, b=10), showlegend=False)
+        return fig
+    except Exception:
+        return None
+
+
+
 def _rs_zone_width(tol: float) -> float:
     """Width of the 'near miss' band around the disappoint cutoff.
 
@@ -599,7 +707,7 @@ st.markdown(
                    font-size:0.82rem; background: rgba(149,165,166,0.10); white-space:nowrap; }
 
 /* ===== Founder's Foundry polish kit (dossier + build sheet) ===== */
-.ff-badge-stack { display:flex; flex-direction:column; gap:8px; align-items:flex-start; }
+.ff-badge-stack { display:flex; flex-direction:row; gap:8px; flex-wrap:wrap; justify-content:flex-end; align-items:center; }
 .ff-badge { display:inline-flex; align-items:center; gap:8px; padding:4px 10px; border-radius:999px;
             border:1px solid rgba(49,51,63,0.18); background: rgba(149,165,166,0.10);
             font-size:0.80rem; font-weight:650; white-space:nowrap; }
@@ -2374,7 +2482,7 @@ def _render_run_monitor(progress_path: Optional[Path]) -> None:
     now_text = now_map.get(_stage_key, "Running…")
 
     # Main status card
-    with st.container(border=True):
+    with st.container():
         st.markdown("### Running stress test")
         st.caption(" · ".join(parts))
 
@@ -2565,6 +2673,110 @@ def _run_cmd(
             with details:
                 st.caption(f"Completed in {dt:.1f}s")
                 st.code("".join(lines), language="text")
+
+
+def _render_replay_artifacts_controls(
+    *,
+    run_dir: Path,
+    pick: str,
+    replay_dir: Path,
+    has_core_artifacts: bool,
+    can_replay: bool,
+    key_prefix: str = "replay.controls",
+    show_when_ready: bool = True,
+) -> None:
+    """Render a single, canonical replay-artifacts control surface.
+
+    Why this exists:
+    - Users were seeing multiple buttons that effectively do the same thing (generate/regen artifacts).
+    - This helper unifies the behavior (same command, same options, same progress handling).
+    - Other sections can *reference* this control rather than duplicating buttons.
+
+    Behavior:
+    - If artifacts are missing: show an info callout + primary button.
+    - If artifacts exist: optionally show a small expander with a regen button + refresh-cache toggle.
+    """
+    replay_script = REPO_ROOT / "tools" / "generate_replay_artifacts.py"
+    if not replay_script.exists():
+        st.warning("Replay artifact generator script missing (tools/generate_replay_artifacts.py).")
+        return
+
+    def _defaults_from_meta() -> Tuple[float, int]:
+        try:
+            meta = _read_json(run_dir / "batch_meta.json")
+        except Exception:
+            meta = {}
+        try:
+            starting_equity = float((meta or {}).get("starting_equity", 10000.0) or 10000.0)
+        except Exception:
+            starting_equity = 10000.0
+        try:
+            seed = int((meta or {}).get("seed", 1) or 1)
+        except Exception:
+            seed = 1
+        return starting_equity, seed
+
+    starting_equity, seed = _defaults_from_meta()
+
+    # If the user requests a refresh, we delete the replay_dir and rebuild from scratch.
+    # This is useful when new artifact types (e.g., events.csv) were added after the original run.
+    def _run(refresh_cache: bool) -> None:
+        if refresh_cache:
+            try:
+                if replay_dir.exists():
+                    shutil.rmtree(replay_dir)
+            except Exception:
+                pass
+
+        progress_path = replay_dir / "progress.jsonl"
+        cmd = [
+            PY,
+            str(replay_script),
+            "--from-run",
+            str(run_dir),
+            "--config-id",
+            str(pick),
+            "--progress-file",
+            str(progress_path),
+            "--starting-equity",
+            str(starting_equity),
+            "--seed",
+            str(seed),
+        ]
+        _run_cmd(cmd, cwd=REPO_ROOT, label="Replay: generate artifacts", progress_path=progress_path)
+        st.rerun()
+
+    # Missing artifacts: show primary CTA immediately.
+    if not has_core_artifacts:
+        st.info(
+            "Replay artifacts for this candidate haven't been generated yet. "
+            "Generate them to unlock the price + event timeline and detailed receipts."
+        )
+        if st.button(
+            "Generate replay artifacts",
+            key=f"{key_prefix}.gen.{pick}",
+            disabled=(not can_replay),
+            type="primary",
+        ):
+            _run(refresh_cache=False)
+        return
+
+    # Artifacts exist: keep controls available but tucked away.
+    if show_when_ready:
+        with st.expander("Replay artifacts", expanded=False):
+            st.caption("Use this if artifacts look incomplete or you added new artifact types (e.g., events.csv).")
+            refresh_cache = st.checkbox(
+                "Refresh cache (rebuild from scratch)",
+                value=False,
+                key=f"{key_prefix}.refresh.{pick}",
+            )
+            if st.button(
+                "Regenerate replay artifacts",
+                key=f"{key_prefix}.regen.{pick}",
+                disabled=(not can_replay),
+            ):
+                _run(refresh_cache=bool(refresh_cache))
+
 
 
 def _run_subprocess_stream(
@@ -3747,7 +3959,7 @@ def build_dca_baseline_params() -> Dict[str, Any]:
         # -------------------------
         # Funding module
         # -------------------------
-        with st.container(border=True):
+        with st.container():
             top_a, top_b = st.columns([0.62, 0.38])
             with top_a:
                 st.markdown("**Funding**")
@@ -3778,7 +3990,7 @@ def build_dca_baseline_params() -> Dict[str, Any]:
         # -------------------------
         # Buy cadence module
         # -------------------------
-        with st.container(border=True):
+        with st.container():
             top_a, top_b = st.columns([0.62, 0.38])
             with top_a:
                 st.markdown("**Buy cadence**")
@@ -3807,7 +4019,7 @@ def build_dca_baseline_params() -> Dict[str, Any]:
         # -------------------------
         # Entry gate module
         # -------------------------
-        with st.container(border=True):
+        with st.container():
             top_a, top_b = st.columns([0.62, 0.38])
             with top_a:
                 st.markdown("**Entry gate**")
@@ -4048,7 +4260,7 @@ def build_dca_baseline_params() -> Dict[str, Any]:
         # -------------------------
         # Allocation module
         # -------------------------
-        with st.container(border=True):
+        with st.container():
             top_a, top_b = st.columns([0.62, 0.38])
             with top_a:
                 st.markdown("**Allocation**")
@@ -4073,7 +4285,7 @@ def build_dca_baseline_params() -> Dict[str, Any]:
         # -------------------------
         # Risk controls module
         # -------------------------
-        with st.container(border=True):
+        with st.container():
             top_a, top_b = st.columns([0.62, 0.38])
             with top_a:
                 st.markdown("**Risk controls**")
@@ -4234,7 +4446,7 @@ def build_dca_baseline_params() -> Dict[str, Any]:
 
     # Fill header + right preview
     with header_slot.container():
-        with st.container(border=True):
+        with st.container():
             st.caption("Build completeness")
             st.progress(completeness)
             st.caption(f"{slots}/{total_slots} modules configured")
@@ -4298,7 +4510,7 @@ def build_dca_baseline_params() -> Dict[str, Any]:
 
     with colR:
         st.markdown('<div class="sticky-preview">', unsafe_allow_html=True)
-        with st.container(border=True):
+        with st.container():
             st.markdown("**Preview**")
             st.caption("Live mechanics summary (no performance claims).")
             st.markdown("**Build checklist**")
@@ -5834,7 +6046,7 @@ if open_existing == "(new run)":
             st.session_state["new.top_k"] = int(save_details_to_topk.get(st.session_state["new.save_details"], 50))
 
         # Run overview
-        with st.container(border=True):
+        with st.container():
             st.markdown("#### Run overview")
             run_name = st.text_input("Run name (folder)", value=default_name, key="new.run_name")
 
@@ -5934,7 +6146,7 @@ if open_existing == "(new run)":
                 )
                 st.caption("Reject plans dominated by one outlier win (lower = stricter).")
 
-            with st.container(border=True):
+            with st.container():
                 st.markdown("### Increase confidence (recommended)")
                 st.caption("Batch finds candidates. These checks test whether results survive timing luck and different market periods.")
 
@@ -5987,7 +6199,7 @@ if open_existing == "(new run)":
             st.slider("Hard drawdown limit (optional) — 0 disables", 0.0, 0.99, float(st.session_state.get("new.max_dd_filter", 0.0)), 0.01, key="new.max_dd_filter")
 
         with right:
-            with st.container(border=True):
+            with st.container():
                 st.markdown("### Run receipt")
                 st.caption(f"Compute mode: **{compute_mode}**")
                 st.metric("Estimated variants", f"{int(st.session_state.get('new.grid_n', 0)):,}")
@@ -7067,24 +7279,31 @@ if stage_pick == "batch":
                         bx = float(_b["_dd"].iloc[0])
                         by = float(_b["_profit"].iloc[0])
 
-                # Fallback: even if baseline was filtered out of this view, try the full tables
+                # Fallback: even if baseline was filtered out of this view, try broader tables (full/sweep).
                 if (
                     (bx is None or by is None or (not math.isfinite(float(bx))) or (not math.isfinite(float(by))))
                     and profit_col
                     and dd_col
                 ):
-                    df_full = frames.get("full_all") or frames.get("sweep_all")
-                    if (
-                        df_full is not None
-                        and (not df_full.empty)
-                        and ("config_id" in df_full.columns)
-                        and (profit_col in df_full.columns)
-                        and (dd_col in df_full.columns)
-                    ):
-                        _b2 = df_full[df_full["config_id"].astype(str) == str(_bid)].head(1)
-                        if not _b2.empty:
-                            bx = float(_drawdown_to_frac(pd.to_numeric(_b2[dd_col], errors="coerce")).iloc[0])
-                            by = float(pd.to_numeric(_b2[profit_col], errors="coerce").iloc[0])
+                    df_full = None
+                    for _k in ["full_all", "sweep_all", "sweep_passed"]:
+                        _tmp = frames.get(_k)
+                        if _tmp is not None and hasattr(_tmp, "empty") and (not _tmp.empty):
+                            df_full = _tmp
+                            break
+                    if df_full is not None and (not df_full.empty) and ("config_id" in df_full.columns):
+                        profit_cands = ["equity.net_profit_ex_cashflows", "equity.net_profit", "net_profit_ex_cashflows", "net_profit", "profit"]
+                        dd_cands = ["performance.max_drawdown_equity", "performance.max_drawdown", "equity.max_drawdown", "equity.max_dd", "max_drawdown", "max_dd", "dd"]
+
+                        profit_use = profit_col if profit_col in df_full.columns else _pick_col(df_full, profit_cands)
+                        dd_use = dd_col if dd_col in df_full.columns else _pick_col(df_full, dd_cands)
+
+                        if profit_use and dd_use:
+                            _b2 = df_full[df_full["config_id"].astype(str) == str(_bid)].head(1)
+                            if not _b2.empty:
+                                bx = float(_drawdown_to_frac(pd.to_numeric(_b2[dd_use], errors="coerce")).iloc[0])
+                                by = float(pd.to_numeric(_b2[profit_use], errors="coerce").iloc[0])
+
 
                 if bx is not None and by is not None and math.isfinite(float(bx)) and math.isfinite(float(by)):
                     fig.add_trace(
@@ -7123,6 +7342,7 @@ if stage_pick == "batch":
     # Top candidates as cards (humans think in tradeoffs, not columns)
     # ---------------------------------------------------------------------
     st.write("#### Top candidates (cards)")
+    st.markdown("<div style='color: rgba(49,51,63,0.75); font-size: 0.92rem; margin-top: -6px;'>Each strip summarizes many runs. Each value is total return % for that scenario. Box = typical zone (middle 50%). Whiskers = bad→good range.</div>", unsafe_allow_html=True)
 
     rank_col = _pick_col(df_show, ["score.profit", profit_col] if profit_col else ["score.profit"])
     if rank_col is None:
@@ -7150,7 +7370,7 @@ if stage_pick == "batch":
             calmar_v = float(r.get(calmar_col, float("nan"))) if calmar_col else float("nan")
 
             with cols_cards[i % 3]:
-                with st.container(border=True):
+                with st.container():
                     st.write(f"**{label}**")
                     st.caption(f"{cfg_id} • {verdict}")
                     m1, m2, m3 = st.columns(3)
@@ -7253,35 +7473,30 @@ if stage_pick == "batch":
         eq_path = art_dir / "equity_curve.csv"
         can_replay = (run_dir / "configs_resolved.jsonl").exists()
         if not eq_path.exists():
-            if st.button("Generate replay artifacts (cached)", type="primary", disabled=(not can_replay), key="batch.replay.btn"):
-                progress_path = replay_dir / "progress.jsonl"
-                meta = {}
-                try:
-                    mp = run_dir / "batch_meta.json"
-                    if mp.exists():
-                        meta = _read_json(mp)
-                except Exception:
-                    meta = {}
-                starting_equity = float(meta.get("starting_equity", 10000.0) or 10000.0)
-                seed = int(meta.get("seed", 1) or 1)
 
-                cmd = [
-                    PY,
-                    str(REPO_ROOT / "tools" / "generate_replay_artifacts.py"),
-                    "--from-run",
-                    str(run_dir),
-                    "--config-id",
-                    str(pick),
-                    "--progress-file",
-                    str(progress_path),
-                    "--starting-equity",
-                    str(starting_equity),
-                    "--seed",
-                    str(seed),
-                ]
-                _run_cmd(cmd, cwd=REPO_ROOT, label="Replay: generate artifacts", progress_path=progress_path)
-                st.success("Replay artifacts generated.")
-                st.rerun()
+            if str(st.session_state.get("ui.replay.primary_controls_for", "")) == str(pick):
+
+                st.info("Replay artifacts are missing. Use the **Generate replay artifacts** button above in the Build sheet.")
+
+            else:
+
+                _render_replay_artifacts_controls(
+
+                    run_dir=run_dir,
+
+                    pick=str(pick),
+
+                    replay_dir=replay_dir,
+
+                    has_core_artifacts=False,
+
+                    can_replay=bool(can_replay),
+
+                    key_prefix="replay.fallback.batch",
+
+                    show_when_ready=False,
+
+                )
 
         if eq_path.exists():
             try:
@@ -8838,84 +9053,413 @@ if stage_pick == "wf":
 # Stage D: Grand verdict + deep dive
 # =============================================================================
 
-def _apply_grand_preset(preset: str) -> None:
-    """
-    Presets are *just defaults* for the question radios in Grand Verdict.
-    They exist to teach the "target profile" habit: pick pain limits first, then filter.
-    """
-    preset = (preset or "").strip().lower()
-    if preset in {"", "none"}:
-        return
+# --- Grand Verdict: scoring lens (profile-adjusted ranking) --------------------
+# Evidence (raw metrics) never changes. A "lens" only changes how we *rank* and
+# how strict our defaults are for the limit radios.
 
-    # Choice indexes correspond to the order inside each QuestionSpec.
-    PRESETS: Dict[str, Dict[str, Dict[str, int]]] = {
-        # Tight pain limits. Fewer survivors, more stability.
-        "conservative": {
+DEFAULT_GRAND_LENS: Dict[str, float] = {
+    # Component weights (must sum to 1.0 after normalization)
+    "wf_w": 0.60,
+    "rs_w": 0.30,
+    "bt_w": 0.10,
+    # Pain penalty coefficients
+    "dd_k": 0.50,      # applied to WF/RS drawdown (dd_p90)
+    "uw_k": 0.10,      # applied to underwater years (uw_days/365)
+    "bt_dd_k": 0.50,   # applied to Batch max drawdown
+    # Missing-evidence penalties (keeps unmeasured configs from floating to the top)
+    "wf_missing_pen": 0.25,
+    "rs_missing_pen": 0.10,
+}
+
+# "Casual → Quant" ladder: pick what you want your life to feel like.
+# Each profile sets (A) default limit radios and (B) a scoring lens for ranking.
+GRAND_PROFILE_SPECS: Dict[str, Dict[str, Any]] = {
+    # ---- Core product profiles ----
+    "steady_compounding": {
+        "label": "Steady compounding (recommended)",
+        "desc": "Balanced robustness. Wants decent worst-case returns and avoids nasty drawdowns without being overly strict.",
+        "limits": {
+            "batch": {"batch_drawdown": 1, "batch_profit": 0, "batch_fees": 1},
+            "rs": {"rs_worst_return": 1, "rs_drawdown": 1, "rs_underwater": 2, "rs_util": 0},
+            "wf": {"wf_typical": 0, "wf_worst_typical": 1, "wf_min": 1, "wf_dd": 1, "wf_consistency": 1, "wf_trading": 1},
+        },
+        "lens": {},
+    },
+    "low_drawdown": {
+        "label": "Low drawdown (sleep-at-night)",
+        "desc": "Strict pain limits. Prefers plans that don't go deep underwater and don't take huge hits.",
+        "limits": {
+            "batch": {"batch_drawdown": 0, "batch_profit": 0, "batch_fees": 0},
+            "rs": {"rs_worst_return": 1, "rs_drawdown": 0, "rs_underwater": 1, "rs_util": 1},
+            "wf": {"wf_typical": 0, "wf_worst_typical": 0, "wf_min": 0, "wf_dd": 0, "wf_consistency": 0, "wf_trading": 0},
+        },
+        "lens": {"wf_w": 0.70, "rs_w": 0.25, "bt_w": 0.05, "dd_k": 0.70, "uw_k": 0.15, "bt_dd_k": 0.70},
+    },
+    "bear_survivor": {
+        "label": "Survives bear markets",
+        "desc": "Prioritizes walk-forward robustness. Accepts longer recovery, but punishes drawdowns and weak windows.",
+        "limits": {
+            "batch": {"batch_drawdown": 1, "batch_profit": 0, "batch_fees": 1},
+            "rs": {"rs_worst_return": 1, "rs_drawdown": 1, "rs_underwater": 3, "rs_util": 2},
+            "wf": {"wf_typical": 0, "wf_worst_typical": 0, "wf_min": 1, "wf_dd": 1, "wf_consistency": 1, "wf_trading": 1},
+        },
+        "lens": {"wf_w": 0.75, "rs_w": 0.20, "bt_w": 0.05, "dd_k": 0.60, "uw_k": 0.05, "bt_dd_k": 0.60},
+    },
+    "vol_tolerant": {
+        "label": "I can handle volatility (aggressive)",
+        "desc": "Looser pain limits. Lets more strategies through and ranks more on upside/exploration.",
+        "limits": {
+            "batch": {"batch_drawdown": 2, "batch_profit": 0, "batch_fees": 2},
+            "rs": {"rs_worst_return": 2, "rs_drawdown": 2, "rs_underwater": 3, "rs_util": 3},
+            "wf": {"wf_typical": 0, "wf_worst_typical": 2, "wf_min": 2, "wf_dd": 2, "wf_consistency": 2, "wf_trading": 2},
+        },
+        "lens": {"wf_w": 0.50, "rs_w": 0.25, "bt_w": 0.25, "dd_k": 0.35, "uw_k": 0.05, "bt_dd_k": 0.35},
+    },
+
+    # ---- Legacy "tightness" presets (kept for familiarity; lens = default) ----
+    "conservative": {
+        "label": "Conservative (tight filters)",
+        "desc": "Strict limits, but uses the default ranking lens.",
+        "limits": {
             "batch": {"batch_drawdown": 0, "batch_profit": 0, "batch_fees": 0},
             "rs": {"rs_worst_return": 0, "rs_drawdown": 0, "rs_underwater": 0, "rs_util": 0},
             "wf": {"wf_typical": 0, "wf_worst_typical": 0, "wf_min": 0, "wf_dd": 0, "wf_consistency": 0, "wf_trading": 0},
         },
-        # "Reasonable adult" defaults. Lets exploration happen without being naive.
-        "balanced": {
+        "lens": {},
+    },
+    "balanced": {
+        "label": "Balanced (default filters)",
+        "desc": "Reasonable limits for exploration without being naive. Uses the default ranking lens.",
+        "limits": {
             "batch": {"batch_drawdown": 1, "batch_profit": 0, "batch_fees": 1},
             "rs": {"rs_worst_return": 1, "rs_drawdown": 1, "rs_underwater": 2, "rs_util": 1},
             "wf": {"wf_typical": 0, "wf_worst_typical": 1, "wf_min": 1, "wf_dd": 1, "wf_consistency": 1, "wf_trading": 1},
         },
-        # Loose filters. Useful early when you want to see "what exists", not only survivors.
-        "aggressive": {
+        "lens": {},
+    },
+    "aggressive": {
+        "label": "Explorer (loose filters)",
+        "desc": "Loose limits to see the landscape. Uses the default ranking lens (you can still sort by other metrics).",
+        "limits": {
             "batch": {"batch_drawdown": 2, "batch_profit": 0, "batch_fees": 2},
             "rs": {"rs_worst_return": 2, "rs_drawdown": 2, "rs_underwater": 3, "rs_util": 2},
             "wf": {"wf_typical": 0, "wf_worst_typical": 2, "wf_min": 2, "wf_dd": 2, "wf_consistency": 2, "wf_trading": 2},
         },
-    }
+        "lens": {},
+    },
+}
 
-    p = PRESETS.get(preset)
-    if not p:
+def _normalize_lens(lens: Dict[str, Any]) -> Dict[str, float]:
+    """Return a float-only, weight-normalized lens dict."""
+    out: Dict[str, float] = dict(DEFAULT_GRAND_LENS)
+    if isinstance(lens, dict):
+        for k, v in lens.items():
+            try:
+                out[k] = float(v)
+            except Exception:
+                pass
+
+    # Normalize weights to sum to 1 (fall back to defaults if broken).
+    wf_w = float(out.get("wf_w", DEFAULT_GRAND_LENS["wf_w"]))
+    rs_w = float(out.get("rs_w", DEFAULT_GRAND_LENS["rs_w"]))
+    bt_w = float(out.get("bt_w", DEFAULT_GRAND_LENS["bt_w"]))
+    s = wf_w + rs_w + bt_w
+    if not math.isfinite(s) or s <= 0:
+        wf_w, rs_w, bt_w = DEFAULT_GRAND_LENS["wf_w"], DEFAULT_GRAND_LENS["rs_w"], DEFAULT_GRAND_LENS["bt_w"]
+        s = wf_w + rs_w + bt_w
+    out["wf_w"] = wf_w / s
+    out["rs_w"] = rs_w / s
+    out["bt_w"] = bt_w / s
+
+    return out
+
+def _get_active_grand_lens(*, use_profile_lens: bool = True) -> Dict[str, float]:
+    """Active lens = default or profile-adjusted, depending on UI toggle."""
+    if not use_profile_lens:
+        return dict(DEFAULT_GRAND_LENS)
+    return _normalize_lens(st.session_state.get("grand.lens_v1") or {})
+
+
+def _apply_grand_preset(preset: str) -> None:
+    """Apply a Grand Verdict profile preset.
+
+    A profile sets two things:
+      1) Default answers for the limit radios (PASS/WARN/FAIL behavior)
+      2) A scoring lens used to rank candidates (profile-adjusted Stability)
+
+    It never reruns compute or changes raw evidence.
+    """
+    raw = (preset or "").strip()
+    if not raw:
         return
 
-    # Keys used by _question_ui
-    for qid, idx in p["batch"].items():
-        st.session_state[f"q.grand.batch.{qid}"] = int(idx)
-    for qid, idx in p["rs"].items():
-        st.session_state[f"q.grand.rs.{qid}"] = int(idx)
-    for qid, idx in p["wf"].items():
-        st.session_state[f"q.grand.wf.{qid}"] = int(idx)
+    s = raw.strip().lower()
+
+    # Allow passing either the internal key or the display label.
+    key = None
+    if s in GRAND_PROFILE_SPECS:
+        key = s
+    else:
+        # Match by label substring (robust to small UI label edits).
+        for k, spec in GRAND_PROFILE_SPECS.items():
+            try:
+                lab = str(spec.get("label", "")).strip().lower()
+            except Exception:
+                lab = ""
+            if lab and lab == s:
+                key = k
+                break
+        if key is None:
+            for k, spec in GRAND_PROFILE_SPECS.items():
+                try:
+                    lab = str(spec.get("label", "")).strip().lower()
+                except Exception:
+                    lab = ""
+                if lab and (s in lab or lab in s):
+                    key = k
+                    break
+
+    if key is None:
+        # Handle legacy names
+        if "steady" in s:
+            key = "steady_compounding"
+        elif "draw" in s or "sleep" in s:
+            key = "low_drawdown"
+        elif "bear" in s:
+            key = "bear_survivor"
+        elif "vol" in s or "aggress" in s:
+            key = "vol_tolerant"
+        elif "conserv" in s:
+            key = "conservative"
+        elif "balanc" in s:
+            key = "balanced"
+        elif "explor" in s:
+            key = "aggressive"
+
+    if key is None or key not in GRAND_PROFILE_SPECS:
+        return
+
+    spec = GRAND_PROFILE_SPECS.get(key) or {}
+    limits = spec.get("limits") or {}
+    lens_over = spec.get("lens") or {}
+
+    # Apply default limit radio indexes.
+    try:
+        for qid, idx in (limits.get("batch") or {}).items():
+            st.session_state[f"q.grand.batch.{qid}"] = int(idx)
+        for qid, idx in (limits.get("rs") or {}).items():
+            st.session_state[f"q.grand.rs.{qid}"] = int(idx)
+        for qid, idx in (limits.get("wf") or {}).items():
+            st.session_state[f"q.grand.wf.{qid}"] = int(idx)
+    except Exception:
+        pass
+
+    # Apply scoring lens (store as overrides; normalization happens at use time).
+    try:
+        merged = dict(DEFAULT_GRAND_LENS)
+        if isinstance(lens_over, dict):
+            merged.update({k: float(v) for k, v in lens_over.items() if k in DEFAULT_GRAND_LENS})
+        st.session_state["grand.lens_v1"] = merged
+        st.session_state["grand.lens_source"] = str(spec.get("label") or key)
+    except Exception:
+        pass
 
 
-def _grand_score_row(r: Dict[str, Any]) -> float:
+def _grand_score_row(r: Dict[str, Any], *, lens: Optional[Dict[str, Any]] = None) -> float:
+    """Profile-adjusted 'Stability' score used for ranking.
+
+    Evidence is constant; this only changes how we combine it (weights/penalties).
+    Defaults match the original score:
+      Score = 0.60*WF + 0.30*RS + 0.10*Batch − missing_penalties
     """
-    Worst-case-aware score. Higher is better.
-
-    Uses:
-      - WF return_p10 and dd_p90 (most important)
-      - RS twr_p10 and dd_p90 (second)
-      - Batch TWR return and drawdown (third)
-
-    Underwater days are converted to "years" to keep units sane.
-    """
-    wf_r10 = _to_float(r.get("return_p10", float("nan")))
-    wf_dd90 = _to_float(r.get("dd_p90", float("nan")))
-    wf_uw90 = _to_float(r.get("uw_days_p90", float("nan")))
-
-    rs_r10 = _to_float(r.get("twr_p10", float("nan")))
-    rs_dd90 = _to_float(r.get("dd_p90", float("nan")))  # RS uses dd_p90 too
-    rs_uw90 = _to_float(r.get("uw_p90_days", float("nan")))
-
-    b_r = _to_float(r.get("performance.twr_total_return", float("nan")))
-    b_dd = _to_float(r.get("performance.max_drawdown_equity", float("nan")))
+    r = r or {}
+    L = _normalize_lens(lens or {})
 
     def _nan0(x: float) -> float:
         return 0.0 if (x != x) else float(x)
 
-    wf = _nan0(wf_r10) - 0.50 * _nan0(wf_dd90) - 0.10 * (_nan0(wf_uw90) / 365.0)
-    rs = _nan0(rs_r10) - 0.50 * _nan0(rs_dd90) - 0.10 * (_nan0(rs_uw90) / 365.0)
-    bt = _nan0(b_r) - 0.50 * _nan0(b_dd)
+    # Walkforward
+    wf_r10 = _to_float(r.get("return_p10", float("nan")))
+    if wf_r10 != wf_r10:
+        wf_r10 = _to_float(r.get("return_p10.wf", float("nan")))
+    wf_dd90 = _to_float(r.get("dd_p90.wf", float("nan"))) if ("dd_p90.wf" in r) else _to_float(r.get("dd_p90", float("nan")))
+    wf_uw90 = _to_float(r.get("uw_days_p90.wf", float("nan"))) if ("uw_days_p90.wf" in r) else _to_float(r.get("uw_days_p90", float("nan")))
 
-    # Penalize missing measurements (unmeasured WF/RS shouldn't float to the top).
-    wf_pen = 0.25 if (wf_r10 != wf_r10 or wf_dd90 != wf_dd90) else 0.0
-    rs_pen = 0.10 if (rs_r10 != rs_r10 or rs_dd90 != rs_dd90) else 0.0
+    # Rolling Starts
+    rs_r10 = _to_float(r.get("twr_p10", float("nan")))
+    if rs_r10 != rs_r10:
+        rs_r10 = _to_float(r.get("twr_p10.rs", float("nan")))
+    rs_dd90 = _to_float(r.get("dd_p90", float("nan")))  # RS drawdown is dd_p90 pre-WF merge
+    rs_uw90 = _to_float(r.get("uw_p90_days", float("nan")))
+    if rs_uw90 != rs_uw90:
+        rs_uw90 = _to_float(r.get("uw_days_p90", float("nan")))
 
-    return 0.60 * wf + 0.30 * rs + 0.10 * bt - wf_pen - rs_pen
+    # Batch
+    b_r = _to_float(r.get("performance.twr_total_return", float("nan")))
+    b_dd = _to_float(r.get("performance.max_drawdown_equity", float("nan")))
+
+    dd_k = float(L.get("dd_k", DEFAULT_GRAND_LENS["dd_k"]))
+    uw_k = float(L.get("uw_k", DEFAULT_GRAND_LENS["uw_k"]))
+    bt_dd_k = float(L.get("bt_dd_k", DEFAULT_GRAND_LENS["bt_dd_k"]))
+
+    wf = _nan0(wf_r10) - dd_k * _nan0(wf_dd90) - uw_k * (_nan0(wf_uw90) / 365.0)
+    rs = _nan0(rs_r10) - dd_k * _nan0(rs_dd90) - uw_k * (_nan0(rs_uw90) / 365.0)
+    bt = _nan0(b_r) - bt_dd_k * _nan0(b_dd)
+
+    wf_pen = float(L.get("wf_missing_pen", DEFAULT_GRAND_LENS["wf_missing_pen"])) if (wf_r10 != wf_r10 or wf_dd90 != wf_dd90) else 0.0
+    rs_pen = float(L.get("rs_missing_pen", DEFAULT_GRAND_LENS["rs_missing_pen"])) if (rs_r10 != rs_r10 or rs_dd90 != rs_dd90) else 0.0
+
+    return float(L["wf_w"]) * wf + float(L["rs_w"]) * rs + float(L["bt_w"]) * bt - wf_pen - rs_pen
+
+
+
+def _stability_breakdown(row: Dict[str, Any], *, lens: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Return a breakdown dict for the profile-adjusted Stability score.
+
+    NOTE: Raw evidence is constant. This only varies weights/penalty coefficients.
+    """
+    row = row or {}
+    L = _normalize_lens(lens or {})
+
+    def _pick(cands: List[str]) -> Tuple[float, Optional[str]]:
+        for c in cands:
+            if c in row:
+                v = _to_float(row.get(c, float("nan")))
+                return v, c
+        return float("nan"), None
+
+    def _is_nan(x: float) -> bool:
+        return (x != x)
+
+    def _nan0(x: float) -> float:
+        return 0.0 if _is_nan(x) else float(x)
+
+    dd_k = float(L.get("dd_k", DEFAULT_GRAND_LENS["dd_k"]))
+    uw_k = float(L.get("uw_k", DEFAULT_GRAND_LENS["uw_k"]))
+    bt_dd_k = float(L.get("bt_dd_k", DEFAULT_GRAND_LENS["bt_dd_k"]))
+
+    # ---- Walkforward (WF) ----
+    wf_ret, wf_ret_col = _pick(["return_p10.wf", "return_p10", "wf.return_p10"])
+    wf_dd, wf_dd_col = _pick(["dd_p90.wf", "dd_p90", "wf.dd_p90"])
+    wf_uw, wf_uw_col = _pick(["uw_days_p90.wf", "uw_days_p90", "wf.uw_days_p90", "uw_p90_days.wf", "uw_p90_days"])
+
+    wf_raw = _nan0(wf_ret) - dd_k * _nan0(wf_dd) - uw_k * (_nan0(wf_uw) / 365.0)
+    wf_w = float(L["wf_w"])
+    wf_weighted = wf_w * wf_raw
+
+    # ---- Rolling Starts (RS) ----
+    rs_ret, rs_ret_col = _pick(["twr_p10.rs", "twr_p10", "rs.twr_p10", "return_p10.rs"])
+    rs_dd, rs_dd_col = _pick(["dd_p90.rs", "dd_p90", "rs.dd_p90"])
+    rs_uw, rs_uw_col = _pick(["uw_days_p90.rs", "uw_days_p90", "rs.uw_days_p90", "uw_p90_days.rs", "uw_p90_days", "rs.uw_p90_days"])
+
+    rs_raw = _nan0(rs_ret) - dd_k * _nan0(rs_dd) - uw_k * (_nan0(rs_uw) / 365.0)
+    rs_w = float(L["rs_w"])
+    rs_weighted = rs_w * rs_raw
+
+    # ---- Batch (single run) ----
+    bt_ret, bt_ret_col = _pick(["performance.twr_total_return", "twr_total_return", "performance.total_return"])
+    bt_dd, bt_dd_col = _pick(["performance.max_drawdown_equity", "max_drawdown_equity", "performance.max_drawdown", "performance.max_dd"])
+
+    bt_raw = _nan0(bt_ret) - bt_dd_k * _nan0(bt_dd)
+    bt_w = float(L["bt_w"])
+    bt_weighted = bt_w * bt_raw
+
+    penalties: List[Dict[str, Any]] = []
+    pen_total = 0.0
+
+    wf_missing = []
+    if _is_nan(wf_ret):
+        wf_missing.append("return_p10")
+    if _is_nan(wf_dd):
+        wf_missing.append("dd_p90")
+    if wf_missing:
+        amt = float(L.get("wf_missing_pen", DEFAULT_GRAND_LENS["wf_missing_pen"]))
+        penalties.append(
+            {
+                "component": "Walkforward",
+                "amount": amt,
+                "reason": "Missing required WF stats (return_p10 and/or dd_p90).",
+                "missing": wf_missing,
+            }
+        )
+        pen_total += amt
+
+    rs_missing = []
+    if _is_nan(rs_ret):
+        rs_missing.append("twr_p10")
+    if _is_nan(rs_dd):
+        rs_missing.append("dd_p90")
+    if rs_missing:
+        amt = float(L.get("rs_missing_pen", DEFAULT_GRAND_LENS["rs_missing_pen"]))
+        penalties.append(
+            {
+                "component": "Rolling Starts",
+                "amount": amt,
+                "reason": "Missing required RS stats (twr_p10 and/or dd_p90).",
+                "missing": rs_missing,
+            }
+        )
+        pen_total += amt
+
+    total = wf_weighted + rs_weighted + bt_weighted - pen_total
+
+    def _fmt(x: float) -> str:
+        try:
+            if not math.isfinite(float(x)):
+                return str(x)
+            # Keep short but readable
+            return f"{float(x):.2g}"
+        except Exception:
+            return str(x)
+
+    return {
+        "lens": {
+            "wf_w": wf_w,
+            "rs_w": rs_w,
+            "bt_w": bt_w,
+            "dd_k": dd_k,
+            "uw_k": uw_k,
+            "bt_dd_k": bt_dd_k,
+        },
+        "wf": {
+            "inputs": {
+                "return_p10": {"col": wf_ret_col, "value": wf_ret},
+                "dd_p90": {"col": wf_dd_col, "value": wf_dd},
+                "uw_days_p90": {"col": wf_uw_col, "value": wf_uw},
+            },
+            "formula_str": f"wf = r_p10 − {_fmt(dd_k)}*dd_p90 − {_fmt(uw_k)}*(uw_days/365)",
+            "raw": wf_raw,
+            "weight": wf_w,
+            "weighted": wf_weighted,
+            "missing": wf_missing,
+        },
+        "rs": {
+            "inputs": {
+                "twr_p10": {"col": rs_ret_col, "value": rs_ret},
+                "dd_p90": {"col": rs_dd_col, "value": rs_dd},
+                "uw_days_p90": {"col": rs_uw_col, "value": rs_uw},
+            },
+            "formula_str": f"rs = twr_p10 − {_fmt(dd_k)}*dd_p90 − {_fmt(uw_k)}*(uw_days/365)",
+            "raw": rs_raw,
+            "weight": rs_w,
+            "weighted": rs_weighted,
+            "missing": rs_missing,
+        },
+        "bt": {
+            "inputs": {
+                "total_return": {"col": bt_ret_col, "value": bt_ret},
+                "max_drawdown": {"col": bt_dd_col, "value": bt_dd},
+            },
+            "formula_str": f"bt = ret − {_fmt(bt_dd_k)}*dd",
+            "raw": bt_raw,
+            "weight": bt_w,
+            "weighted": bt_weighted,
+            "missing": [],
+        },
+        "penalties": penalties,
+        "penalty_total": pen_total,
+        "total": total,
+    }
 
 
 if stage_pick == "grand":
@@ -8968,14 +9512,42 @@ if stage_pick == "grand":
     # =========================
     with prefs_slot:
         with st.expander("Lens & filters", expanded=True):
-            st.caption("Set your limits and sorting. This only filters/labels candidates — it does not rerun compute.")
+            st.caption("Pick your profile and limits. This only filters/labels/ranks candidates — it does not rerun compute.")
 
             preset = st.selectbox(
-                "Target profile preset",
-                options=["Balanced", "Conservative", "Aggressive", "Custom"],
+                "Goal profile",
+                options=[
+                    GRAND_PROFILE_SPECS["steady_compounding"]["label"],
+                    GRAND_PROFILE_SPECS["low_drawdown"]["label"],
+                    GRAND_PROFILE_SPECS["bear_survivor"]["label"],
+                    GRAND_PROFILE_SPECS["vol_tolerant"]["label"],
+                    GRAND_PROFILE_SPECS["aggressive"]["label"],
+                    "Custom",
+                ],
                 index=0,
-                key="grand.profile_preset_v2",
-                help="Presets set sane defaults for the limit radios below. 'Custom' keeps your current choices.",
+                key="grand.profile_preset_v3",
+                help="Pick the outcome you want. Presets set default pain limits AND a ranking lens. 'Custom' keeps your current choices.",
+            )
+
+            # Explain the selected profile briefly (no math).
+            _spec = None
+            try:
+                _spec = next((sp for sp in GRAND_PROFILE_SPECS.values() if str(sp.get("label", "")) == str(preset)), None)
+            except Exception:
+                _spec = None
+            if _spec and _spec.get("desc"):
+                st.caption(str(_spec.get("desc")))
+
+            use_profile_lens = st.checkbox(
+                "Use profile lens for ranking",
+                value=bool(st.session_state.get("grand.use_profile_lens", True)),
+                key="grand.use_profile_lens",
+                help="ON = ranking uses the profile-adjusted Stability lens. OFF = uses the system/default Stability.",
+            )
+            _active_lens = _get_active_grand_lens(use_profile_lens=bool(use_profile_lens))
+            st.caption(
+                f"Ranking lens → WF {int(round(100*_active_lens['wf_w']))}% · RS {int(round(100*_active_lens['rs_w']))}% · Batch {int(round(100*_active_lens['bt_w']))}%"
+                f" | penalties: dd×{_active_lens['dd_k']:.2g}, uw×{_active_lens['uw_k']:.2g}"
             )
 
             c1, c2, c3 = st.columns([1, 1, 2])
@@ -9029,10 +9601,12 @@ if stage_pick == "grand":
 
                     st.session_state["grand.last_preset_applied"] = str(preset)
                     st.session_state["grand.last_preset_changes"] = list(changes)
+                    # Force a clean rerun so the radios below render with the new preset values
+                    st.rerun()
             with c2:
                 show_help = st.checkbox("Show explainer", value=False, key="grand.show_help")
             with c3:
-                st.caption("Presets only change filters. They never modify your data or rerun anything.")
+                st.caption("Presets only change filters + ranking lens. They never modify your data or rerun anything.")
 
 
             last_preset = st.session_state.get("grand.last_preset_applied")
@@ -9159,12 +9733,18 @@ if stage_pick == "grand":
     df2 = df[pd.Series(keep_mask, index=df.index)].copy()
 
     if not df2.empty:
-        df2["score.grand_robust"] = [_grand_score_row(r) for r in df2.to_dict(orient="records")]
+        _lens_rank = _get_active_grand_lens(use_profile_lens=bool(st.session_state.get("grand.use_profile_lens", True)))
+        df2["score.grand_robust"] = [_grand_score_row(r, lens=_lens_rank) for r in df2.to_dict(orient="records")]
         df2["score.grand_robust"] = pd.to_numeric(df2["score.grand_robust"], errors="coerce")
+
+        # Keep a system/default stability score for truth-anchoring/debugging.
+        df2["score.grand_system"] = [_grand_score_row(r, lens=DEFAULT_GRAND_LENS) for r in df2.to_dict(orient="records")]
+        df2["score.grand_system"] = pd.to_numeric(df2["score.grand_system"], errors="coerce")
 
     sort_opts: List[str] = []
     for c in [
         "score.grand_robust",
+        "score.grand_system",
         "score.calmar_equity",
         "robustness_score",
         "return_p10",
@@ -9362,6 +9942,12 @@ if stage_pick == "grand":
                 base["_ret"] = pd.to_numeric(base[ret_col], errors="coerce")
                 base = base.dropna(subset=["_dd", "_ret"])
 
+                if "config_id" in base.columns:
+                    base["_cid"] = base["config_id"].astype(str)
+                else:
+                    base["_cid"] = ""
+
+
                 hi = df_vis.copy()
                 if dd_col in hi.columns and ret_col in hi.columns:
                     hi["_dd"] = _drawdown_to_frac(pd.to_numeric(hi[dd_col], errors="coerce"))
@@ -9441,6 +10027,7 @@ if stage_pick == "grand":
                         mode="markers",
                         marker=dict(size=6, color="rgba(17,24,39,0.12)", symbol="circle"),
                         hoverinfo="skip",
+                        customdata=base[["_cid"]].to_numpy() if "_cid" in base.columns else None,
                         showlegend=False,
                     )
                 )
@@ -9568,20 +10155,63 @@ if stage_pick == "grand":
                                 bx = _drawdown_to_frac(pd.to_numeric(_b0[dd_col], errors="coerce")).iloc[0]
                                 by = pd.to_numeric(_b0[ret_col], errors="coerce").iloc[0]
 
-                        # Fallback: baseline may be filtered out of survivors; pull from full results
+                        # Fallback: baseline may be filtered out of survivors; pull from full/sweep tables.
                         if (bx is None or by is None or pd.isna(bx) or pd.isna(by)) and dd_col and ret_col:
-                            df_full = frames.get("full_all") or frames.get("sweep_all")
-                            if (
-                                df_full is not None
-                                and (not df_full.empty)
-                                and ("config_id" in df_full.columns)
-                                and (dd_col in df_full.columns)
-                                and (ret_col in df_full.columns)
-                            ):
+                            # Try broader tables in priority order
+                            df_full = None
+                            for _k in ["full_all", "sweep_all", "sweep_passed"]:
+                                _tmp = frames.get(_k)
+                                if _tmp is not None and hasattr(_tmp, "empty") and (not _tmp.empty):
+                                    df_full = _tmp
+                                    break
+                            if df_full is not None and (not df_full.empty) and ("config_id" in df_full.columns):
+                                # Prefer the chart's chosen columns; otherwise pick best available from df_full.
+                                dd_cands = ["performance.max_drawdown_equity", "performance.max_drawdown", "equity.max_drawdown", "equity.max_dd", "max_drawdown", "max_dd", "dd"]
+                                ret_cands = ["performance.twr_total_return", "performance.total_return", "performance.twr", "twr_total_return", "total_return",
+                                            "equity.net_profit_ex_cashflows", "equity.net_profit", "net_profit_ex_cashflows", "net_profit", "profit"]
+                                dd_use = dd_col if dd_col in df_full.columns else _pick_col(df_full, dd_cands)
+                                ret_use = ret_col if ret_col in df_full.columns else _pick_col(df_full, ret_cands)
+
                                 _b1 = df_full[df_full["config_id"].astype(str) == str(_bid)].head(1)
                                 if not _b1.empty:
-                                    bx = _drawdown_to_frac(pd.to_numeric(_b1[dd_col], errors="coerce")).iloc[0]
-                                    by = pd.to_numeric(_b1[ret_col], errors="coerce").iloc[0]
+                                    # Drawdown x
+                                    if dd_use and dd_use in _b1.columns:
+                                        bx = _drawdown_to_frac(pd.to_numeric(_b1[dd_use], errors="coerce")).iloc[0]
+
+                                    # Return y (keep axis semantics aligned to the chart as best we can)
+                                    chart_is_pct = True
+                                    try:
+                                        chart_is_pct = ("twr" in str(ret_col).lower()) or ("return" in str(ret_col).lower())
+                                    except Exception:
+                                        chart_is_pct = True
+
+                                    if chart_is_pct:
+                                        # Prefer a return-like column if present; otherwise compute from profit / starting_equity.
+                                        by = None
+                                        if ret_use and ret_use in _b1.columns and (("twr" in str(ret_use).lower()) or ("return" in str(ret_use).lower())):
+                                            by = pd.to_numeric(_b1[ret_use], errors="coerce").iloc[0]
+
+                                        if by is None or pd.isna(by):
+                                            # Profit fallback
+                                            pcol = _pick_col(df_full, ["equity.net_profit_ex_cashflows", "equity.net_profit", "net_profit_ex_cashflows", "net_profit", "profit"])
+                                            start_eq = None
+                                            try:
+                                                start_eq = float(meta.get("starting_equity") or 0)
+                                            except Exception:
+                                                start_eq = None
+                                            if pcol and (pcol in _b1.columns) and start_eq and start_eq > 0:
+                                                _p = pd.to_numeric(_b1[pcol], errors="coerce").iloc[0]
+                                                if pd.notna(_p):
+                                                    by = float(_p) / float(start_eq)
+                                    else:
+                                        # Currency-like axis; prefer profit columns.
+                                        by = None
+                                        if ret_use and ret_use in _b1.columns and (("twr" not in str(ret_use).lower()) and ("return" not in str(ret_use).lower())):
+                                            by = pd.to_numeric(_b1[ret_use], errors="coerce").iloc[0]
+                                        if by is None or pd.isna(by):
+                                            pcol = _pick_col(df_full, ["equity.net_profit_ex_cashflows", "equity.net_profit", "net_profit_ex_cashflows", "net_profit", "profit"])
+                                            if pcol and pcol in _b1.columns:
+                                                by = pd.to_numeric(_b1[pcol], errors="coerce").iloc[0]
 
                         if pd.notna(bx) and pd.notna(by) and math.isfinite(float(bx)) and math.isfinite(float(by)):
                             hover_ret = "%{y:.2%}" if not is_currency else "$%{y:,.0f}"
@@ -9604,9 +10234,155 @@ if stage_pick == "grand":
                             )
                 except Exception:
                     pass
-                _plotly(fig_rr)
+                # Interactive selection (click/box-select) for inspection
+                if "ui.rr_pick" not in st.session_state:
+                    st.session_state["ui.rr_pick"] = None
+                if "ui.rr_pick_x" not in st.session_state:
+                    st.session_state["ui.rr_pick_x"] = None
+                if "ui.rr_pick_y" not in st.session_state:
+                    st.session_state["ui.rr_pick_y"] = None
+                if "ui.rr_pick_cd" not in st.session_state:
+                    st.session_state["ui.rr_pick_cd"] = None
+
+                try:
+                    fig_rr.update_layout(clickmode="event+select")
+                except Exception:
+                    pass
+
+                _rr_event = None
+                try:
+                    _kwargs: Dict[str, Any] = {"config": PLOTLY_CONFIG, "key": "risk_return.map", "on_select": "rerun"}
+                    if _PLOTLY_HAS_WIDTH:
+                        _kwargs["width"] = "stretch"
+                    elif _PLOTLY_HAS_UCW:
+                        _kwargs["use_container_width"] = True
+                    _kwargs.setdefault("theme", "streamlit" if USE_STREAMLIT_PLOTLY_THEME else None)
+                    _rr_event = st.plotly_chart(fig_rr, **_kwargs)
+                except TypeError:
+                    # Older Streamlit: no event capture
+                    _plotly(fig_rr, key="risk_return.map")
+                except Exception:
+                    _plotly(fig_rr, key="risk_return.map")
+
+                # Capture selection -> store last-picked config id (no auto-open; user confirms via button)
+                try:
+                    _sel = getattr(_rr_event, "selection", None)
+                    if isinstance(_sel, dict):
+                        _pts = _sel.get("points") or []
+                        if _pts:
+                            _pt0 = _pts[0] or {}
+                            _cd = _pt0.get("customdata")
+                            _cid = None
+                            if isinstance(_cd, (list, tuple, np.ndarray)):
+                                _cid = _cd[0] if len(_cd) > 0 else None
+                            else:
+                                _cid = _cd
+                            if _cid:
+                                st.session_state["ui.rr_pick"] = str(_cid)
+                                st.session_state["ui.rr_pick_x"] = _pt0.get("x")
+                                st.session_state["ui.rr_pick_y"] = _pt0.get("y")
+                                st.session_state["ui.rr_pick_cd"] = _cd
+                except Exception:
+                    pass
+
+                # Mini evidence panel (under the map)
+                rr_pick = st.session_state.get("ui.rr_pick")
+                if rr_pick:
+                    with st.container():
+                        st.markdown(f"**Selected from map:** `{rr_pick}`")
+                        st.caption("Tip: click a point to select it, or use the box/lasso tools in the chart toolbar. Hover is view-only.")
+
+                        # Prefer details from customdata if available; otherwise look up row.
+                        cd = st.session_state.get("ui.rr_pick_cd")
+                        label = verdict = stability_pct = reason = None
+                        if isinstance(cd, (list, tuple, np.ndarray)) and len(cd) >= 5:
+                            label = str(cd[1]) if cd[1] is not None else ""
+                            verdict = str(cd[2]) if cd[2] is not None else ""
+                            stability_pct = str(cd[3]) if cd[3] is not None else ""
+                            reason = str(cd[4]) if cd[4] is not None else ""
+                        else:
+                            _row = _lookup_row_by_config_id(
+                                str(rr_pick),
+                                hi2 if "hi2" in locals() else None,
+                                hi if "hi" in locals() else None,
+                                df_vis if "df_vis" in locals() else None,
+                                df_show if "df_show" in locals() else None,
+                                df_all if "df_all" in locals() else None,
+                                df_req if "df_req" in locals() else None,
+                                df2 if "df2" in locals() else None,
+                                frames.get("full_all") if isinstance(frames, dict) else None,
+                                frames.get("sweep_all") if isinstance(frames, dict) else None,
+                                frames.get("sweep_passed") if isinstance(frames, dict) else None,
+                            )
+                            if _row is not None:
+                                _d0 = _row.to_dict()
+                                # Label
+                                _lcol = _pick_col(pd.DataFrame([_d0]), ["config.label", "label", "config_label"])
+                                if _lcol and _lcol in _d0:
+                                    label = str(_d0.get(_lcol) or "")
+                                # Verdict
+                                if "grand.verdict" in _d0:
+                                    verdict = str(_d0.get("grand.verdict") or "").upper()
+                                # Stability percentile (best-effort)
+                                try:
+                                    _sc = None
+                                    for _c in ["score.grand_robust", "robustness_score"]:
+                                        if _c in _d0:
+                                            _sc = _c
+                                            break
+                                    if _sc:
+                                        stability_pct = _fmt_num(_d0.get(_sc))
+                                except Exception:
+                                    pass
+                                # Reason snippet (best-effort; same logic as hover)
+                                try:
+                                    reason = _reason_snippet(_d0)
+                                except Exception:
+                                    reason = None
+
+                        # Exact x/y used in the plot
+                        x_dd = st.session_state.get("ui.rr_pick_x")
+                        y_ret = st.session_state.get("ui.rr_pick_y")
+
+                        c1, c2, c3, c4 = st.columns([0.24, 0.22, 0.22, 0.32])
+                        with c1:
+                            st.write("**Verdict**")
+                            st.write(verdict or "—")
+                            if label:
+                                st.caption(f"Label: {label}")
+                        with c2:
+                            st.metric("Max DD", ("—" if x_dd is None or pd.isna(x_dd) else f"{float(x_dd)*100:.2f}%"))
+                        with c3:
+                            if is_currency:
+                                st.metric("Return", ("—" if y_ret is None or pd.isna(y_ret) else f"${float(y_ret):,.0f}"))
+                            else:
+                                st.metric("Return", ("—" if y_ret is None or pd.isna(y_ret) else f"{float(y_ret)*100:.2f}%"))
+                        with c4:
+                            st.write("**Stability**")
+                            st.write(stability_pct or "—")
+                            if reason:
+                                st.caption(reason)
+
+                        bL, bR = st.columns([0.35, 0.65])
+                        with bL:
+                            if st.button("Open in Evidence ↓", key=f"rr.inspect.{rr_pick}", type="primary"):
+                                st.session_state["ui.evidence_override_pick"] = str(rr_pick)
+                                st.session_state["cockpit.pick"] = str(rr_pick)
+                                st.session_state["ui.open_evidence"] = True
+                                st.session_state["ui.jump_tab"] = "Batch scan"
+                                st.rerun()
+                        with bR:
+                            st.caption("Opens the Evidence drawer below for this config. You’ll need to scroll down to reach it.")
+
+                        if st.button("Clear selection", key="rr.clear"):
+                            st.session_state["ui.rr_pick"] = None
+                            st.session_state["ui.rr_pick_x"] = None
+                            st.session_state["ui.rr_pick_y"] = None
+                            st.session_state["ui.rr_pick_cd"] = None
+                            st.rerun()
 
                 # Stability distribution
+
                 score_col2 = "score.grand_robust" if "score.grand_robust" in df_req.columns else None
                 if score_col2:
                     s = pd.to_numeric(df_req[score_col2], errors="coerce").dropna()
@@ -9627,12 +10403,186 @@ if stage_pick == "grand":
                             cutoff = None
 
                         st.markdown("#### Stability Score: how repeatable is this plan?")
-                        st.markdown("Stability Score = **how consistently a plan behaves** across different start dates and time windows (**less fragile = higher**).")
-                        st.caption("Rewards: steady behavior across time, fewer deep drawdowns, fewer ugly windows.  Penalizes: start-date luck, big drawdowns, long underwater stretches, unstable windows.")
+                        st.markdown("Stability = **repeatability** across start dates & time windows (**less fragile = higher**).")
                         with st.expander("What is this score?", expanded=False):
                             st.markdown(
-                                "- **Batch:** filters + shortlist\n" + "- **Rolling Starts:** start-date sensitivity\n" + "- **Walkforward:** time-window stability\n\n" + "Think of it like a **crash-test rating** for strategies — not horsepower."
+                                "- Combines **Batch**, **Rolling Starts**, and **Walkforward** checks.\n"
+                                "- Higher is better: steadier behavior across time, fewer deep drawdowns, fewer ugly windows.\n"
+                                "- Think **crash-test rating** for strategies — not horsepower."
                             )
+
+                        with st.expander("How it’s calculated", expanded=False):
+                            # Layer A — what it is (one sentence)
+                            st.markdown(
+                                "Stability is a **weighted** score: **worst-case performance minus pain penalties**, across **Walkforward + Rolling Starts + Batch**."
+                            )
+
+                            # Layer B — recipe (weights + components)
+                            _lens_here = _get_active_grand_lens(use_profile_lens=bool(st.session_state.get("grand.use_profile_lens", True)))
+                            _wdf = pd.DataFrame(
+                                [
+                                    {"Component": "Walkforward", "Weight": f"{int(round(100*_lens_here['wf_w']))}%", "Uses": "P10 return; P90 drawdown + P90 underwater"},
+                                    {"Component": "Rolling Starts", "Weight": f"{int(round(100*_lens_here['rs_w']))}%", "Uses": "P10 return; P90 drawdown + P90 underwater"},
+                                    {"Component": "Batch", "Weight": f"{int(round(100*_lens_here['bt_w']))}%", "Uses": "Total return; Max drawdown"},
+                                ]
+                            )
+                            st.table(_wdf)
+                            st.caption(f"Penalties: drawdown ×{_lens_here['dd_k']:.2g}, underwater ×{_lens_here['uw_k']:.2g}, batch drawdown ×{_lens_here['bt_dd_k']:.2g}. Missing evidence penalties may apply.")
+
+
+                            # Layer C — your plan breakdown (dynamic)
+                            _baseline_id = st.session_state.get("baseline_config_id")
+                            _selected_id = st.session_state.get("cockpit.pick")
+
+                            _opts = ["Baseline"]
+                            if _selected_id and _baseline_id and (str(_selected_id) != str(_baseline_id)):
+                                _opts = ["Baseline", "Selected"]
+                                _which = st.radio(
+                                    "Show breakdown for",
+                                    options=_opts,
+                                    index=0,
+                                    horizontal=True,
+                                    key="ui.stability.breakdown.which",
+                                )
+                            elif _selected_id and (not _baseline_id):
+                                _opts = ["Selected"]
+                                _which = "Selected"
+                            else:
+                                _which = "Baseline"
+
+                            _target_id = _baseline_id if (_which == "Baseline") else _selected_id
+                            if not _target_id:
+                                st.caption("No baseline/selected config available yet.")
+                            else:
+                                _row_for = _lookup_row_by_config_id(
+                                    str(_target_id),
+                                    df2 if ("df2" in locals()) else None,
+                                    df_show if ("df_show" in locals()) else None,
+                                    df if ("df" in locals()) else None,
+                                    frames.get("full_all") if isinstance(frames, dict) else None,
+                                    frames.get("sweep_all") if isinstance(frames, dict) else None,
+                                )
+                                if _row_for is None:
+                                    st.warning("Couldn't locate that config_id in the current tables.")
+                                else:
+                                    _bd = _stability_breakdown(_row_for.to_dict(), lens=_get_active_grand_lens(use_profile_lens=bool(st.session_state.get('grand.use_profile_lens', True))))
+
+                                    def _f_pct(v: Any, d: int = 2) -> str:
+                                        try:
+                                            x = float(v)
+                                            if not math.isfinite(x):
+                                                return "n/a"
+                                            return _fmt_pct(x, digits=d)
+                                        except Exception:
+                                            return "n/a"
+
+                                    def _f_days(v: Any) -> str:
+                                        try:
+                                            x = float(v)
+                                            if not math.isfinite(x):
+                                                return "n/a"
+                                            yrs = x / 365.0
+                                            return f"{x:.0f} days ({yrs:.2f}y)"
+                                        except Exception:
+                                            return "n/a"
+
+                                    wf = _bd.get("wf", {})
+                                    rs = _bd.get("rs", {})
+                                    bt = _bd.get("bt", {})
+
+                                    wf_ret = wf.get("inputs", {}).get("return_p10", {}).get("value", float("nan"))
+                                    wf_dd = wf.get("inputs", {}).get("dd_p90", {}).get("value", float("nan"))
+                                    wf_uw = wf.get("inputs", {}).get("uw_days_p90", {}).get("value", float("nan"))
+
+                                    rs_ret = rs.get("inputs", {}).get("twr_p10", {}).get("value", float("nan"))
+                                    rs_dd = rs.get("inputs", {}).get("dd_p90", {}).get("value", float("nan"))
+                                    rs_uw = rs.get("inputs", {}).get("uw_days_p90", {}).get("value", float("nan"))
+
+                                    bt_ret = bt.get("inputs", {}).get("total_return", {}).get("value", float("nan"))
+                                    bt_dd = bt.get("inputs", {}).get("max_drawdown", {}).get("value", float("nan"))
+
+                                    _bd_rows = [
+                                        {
+                                            "Component": "Walkforward",
+                                            "Weight": f"{int(round(100*float(wf.get('weight',0.0) or 0.0)))}%",
+                                            "Return (P10)": _f_pct(wf_ret),
+                                            "Drawdown (P90)": _f_pct(wf_dd),
+                                            "Underwater (P90)": _f_days(wf_uw),
+                                            "Component score": _fmt_num(wf.get("raw", float("nan"))),
+                                            "Weighted": _fmt_num(wf.get("weighted", float("nan"))),
+                                        },
+                                        {
+                                            "Component": "Rolling Starts",
+                                            "Weight": f"{int(round(100*float(rs.get('weight',0.0) or 0.0)))}%",
+                                            "Return (P10)": _f_pct(rs_ret),
+                                            "Drawdown (P90)": _f_pct(rs_dd),
+                                            "Underwater (P90)": _f_days(rs_uw),
+                                            "Component score": _fmt_num(rs.get("raw", float("nan"))),
+                                            "Weighted": _fmt_num(rs.get("weighted", float("nan"))),
+                                        },
+                                        {
+                                            "Component": "Batch",
+                                            "Weight": f"{int(round(100*float(bt.get('weight',0.0) or 0.0)))}%",
+                                            "Return (total)": _f_pct(bt_ret),
+                                            "Drawdown (max)": _f_pct(bt_dd),
+                                            "Underwater (P90)": "—",
+                                            "Component score": _fmt_num(bt.get("raw", float("nan"))),
+                                            "Weighted": _fmt_num(bt.get("weighted", float("nan"))),
+                                        },
+                                    ]
+                                    st.markdown("**Your plan breakdown**")
+                                    st.dataframe(pd.DataFrame(_bd_rows), use_container_width=True, hide_index=True)
+
+                                    # Per-component formula lines (short, code-style)
+                                    st.caption("Per-component formulas (short):")
+                                    st.code(
+                                        f"""{wf.get('formula_str','wf = …')}
+{rs.get('formula_str','rs = …')}
+{bt.get('formula_str','bt = …')}""",
+                                        language="text",
+                                    )
+
+                                    # Final arithmetic line
+                                    pen_total = float(_bd.get("penalty_total", 0.0) or 0.0)
+                                    st.code(
+                                        f"""Score = {float(wf.get('weight',0.0)):.2f}*WF + {float(rs.get('weight',0.0)):.2f}*RS + {float(bt.get('weight',0.0)):.2f}*Batch − penalties
+      = {float(wf.get('weight',0.0)):.2f}*{float(wf.get('raw', 0.0)):.4f} + {float(rs.get('weight',0.0)):.2f}*{float(rs.get('raw', 0.0)):.4f} + {float(bt.get('weight',0.0)):.2f}*{float(bt.get('raw', 0.0)):.4f} − {pen_total:.4f}
+      = {float(_bd.get('total', 0.0)):.4f}""",
+                                        language="text",
+                                    )
+
+                                    # Missing-data penalties
+                                    _pens = _bd.get("penalties", []) or []
+                                    if _pens:
+                                        st.caption("Penalties applied (missing evidence):")
+                                        for p in _pens:
+                                            st.write(f"- **{p.get('component','?')}**: −{_fmt_num(p.get('amount', 0.0))} ({p.get('reason','')})")
+                                    else:
+                                        st.caption("No missing-data penalties applied.")
+
+                                    # Optional: raw fields toggle
+                                    _show_raw = st.checkbox("Show raw fields", value=False, key="ui.stability.breakdown.show_raw")
+                                    if _show_raw:
+                                        def _raw_line(label: str, item: Dict[str, Any]) -> str:
+                                            c = item.get("col")
+                                            v = item.get("value")
+                                            return f"{label}: {c} = {v}"
+
+                                        raw_lines = []
+                                        for k, comp in [("WF", wf), ("RS", rs), ("Batch", bt)]:
+                                            inp = comp.get("inputs", {}) or {}
+                                            for kk, it in inp.items():
+                                                raw_lines.append(_raw_line(f"{k}.{kk}", it if isinstance(it, dict) else {}))
+                                        st.code("\n".join([l for l in raw_lines if l]), language="text")
+
+                                    # Optional: action path
+                                    st.caption("To increase Stability, you usually need:")
+                                    st.markdown(
+                                        "- higher **P10 returns** across windows\n"
+                                        "- lower **P90 drawdowns**\n"
+                                        "- shorter **underwater time**"
+                                    )
+
                         # Focus the view on where the survivor population actually sits (avoid cutoff stretching the axis).
                         try:
                             x_p2 = float(np.nanpercentile(_arr, 5))
@@ -9646,6 +10596,7 @@ if stage_pick == "grand":
                         x0 = x_p2 - x_pad
                         x1 = x_p995 + x_pad
                         cutoff_in_range = (cutoff is not None and math.isfinite(float(cutoff)) and (float(cutoff) >= x0) and (float(cutoff) <= x1))
+                        cutoff_relevant = bool(cutoff_in_range)
 
 
                         # Baseline score (user's original config)
@@ -9679,7 +10630,7 @@ if stage_pick == "grand":
                                                 baseline_score = float(_v2)
                                         if baseline_score is None or (not math.isfinite(float(baseline_score))):
                                             try:
-                                                baseline_score = float(_grand_score_row(_row_any.to_dict()))
+                                                baseline_score = float(_grand_score_row(_row_any.to_dict(), lens=_get_active_grand_lens(use_profile_lens=bool(st.session_state.get('grand.use_profile_lens', True)))))
                                             except Exception:
                                                 baseline_score = None
                         except Exception:
@@ -9694,65 +10645,94 @@ if stage_pick == "grand":
                         if baseline_score is not None and math.isfinite(float(baseline_score)):
                             baseline_marker_x = float(min(max(float(baseline_score), float(x0)), float(x1)))
                             baseline_offscale = not baseline_in_range
-                        # Summary notes (kept short for readability)
-                        st.caption(f"N={n:,} survivors after filters.")
-                        if baseline_score is not None and math.isfinite(float(baseline_score)):
-                            _note = f"Your strategy (baseline): {_fmt_num(baseline_score, digits=3)}"
-                            if not baseline_in_req:
-                                _note += " (fails current requirements)"
-                            if not baseline_in_range:
-                                _note += " (off-scale)"
-                            st.caption(_note)
-                        _zoom_note = "View zoom: P5–P99."
+                        baseline_pct = float('nan')
+                        baseline_pct_ok = False
+                        baseline_zone = ''
+                        try:
+                            if baseline_score is not None and math.isfinite(float(baseline_score)):
+                                baseline_pct = _pct_rank(_arr, float(baseline_score))
+                            baseline_pct_ok = bool(baseline_pct is not None and math.isfinite(float(baseline_pct)))
+                            baseline_zone = _stability_zone_label(float(baseline_pct)) if baseline_pct_ok else ''
+                        except Exception:
+                            baseline_pct = float('nan')
+                            baseline_pct_ok = False
+                            baseline_zone = ''
+                        # Baseline gap vs typical (in standard deviations; interpretable distance)
+                        baseline_z = None
+                        try:
+                            _std0 = float(np.nanstd(_arr))
+                            if baseline_score is not None and math.isfinite(float(baseline_score)) and math.isfinite(_std0) and _std0 > 0:
+                                baseline_z = (float(baseline_score) - float(med)) / _std0
+                        except Exception:
+                            baseline_z = None
+
+                        # Summary (keep it tight)
+                        tail_note = ""
                         try:
                             _minv = float(np.nanmin(_arr))
                             if math.isfinite(_minv) and (_minv < x0):
-                                _zoom_note += f" Rare low tail exists (min {_fmt_num(_minv, digits=3)} off-scale)."
+                                tail_note = f" · Tail off-scale (min {_fmt_num(_minv, digits=3)})"
                         except Exception:
-                            pass
-                        if n < 50:
-                            _zoom_note += " Small N → percentiles can be chunky."
-                        st.caption(_zoom_note)
-                        
-                        sc1, sc2, sc3, sc4 = st.columns(4)
-                        sc1.metric("Typical survivor", _fmt_num(med, digits=3))
-                        sc1.caption("Median (P50)")
-                        sc2.metric("Strong threshold", _fmt_num(p80, digits=3))
-                        sc2.caption("P80 (top 20%)")
-                        sc3.metric("Elite threshold", _fmt_num(p90, digits=3) if (p90 is not None and math.isfinite(float(p90))) else "—")
-                        sc3.caption("P90 (top 10%)")
-                        if cutoff is not None and math.isfinite(float(cutoff)):
-                            sc4.metric("Visibility cutoff (UI)", _fmt_num(cutoff, digits=3))
-                            sc4.caption(f"Lowest visible • gap vs typical: {(cutoff - med):+.3f}" + (" (off-scale)" if (cutoff is not None and math.isfinite(float(cutoff)) and (not cutoff_in_range)) else ""))
-                        else:
-                            sc4.metric("Visibility cutoff (UI)", "—")
-                            sc4.caption("Lowest visible")
-                        
-                        # Plain-English verdict: how distinct is the strong tail from typical?
+                            tail_note = ""
+                        st.caption(f"N={n:,} · View: P5–P99{tail_note}")
+                        # Panel A: 'You vs survivors' percentile bar (fast comprehension)
+                        if baseline_pct_ok:
+                            st.markdown("##### Your position vs survivors")
+                            delta_to_strong = max(0.0, 80.0 - float(baseline_pct))
+                            _line = f"**You:** P{float(baseline_pct):.0f}"
+                            if baseline_zone:
+                                _line += f" ({baseline_zone})"
+                            if baseline_z is not None and math.isfinite(float(baseline_z)):
+                                _line += f" · vs typical: {float(baseline_z):+.2f}σ"
+                            if not baseline_in_req:
+                                _line += " · **filtered out**"
+                            if baseline_offscale:
+                                _line += " · off-scale"
+                            if delta_to_strong > 0:
+                                _line += f" · Need **+{delta_to_strong:.0f}** to reach Strong"
+                            else:
+                                _line += " · **Elite**" if float(baseline_pct) >= 90.0 else " · **Strong**"
+                            st.markdown(_line)
+                            fig_pct = _stability_percentile_bar_fig(float(baseline_pct))
+                            if fig_pct is not None:
+                                _plotly(fig_pct, key="stability_pct_bar")
+                        with st.expander("Show breakpoint values (engine units)", expanded=False):
+                            st.caption("These are the Stability *index* values at P50/P80/P90 for this run. Use percentiles above to interpret.")
+                            if cutoff_relevant and (cutoff is not None and math.isfinite(float(cutoff))):
+                                sc1, sc2, sc3, sc4 = st.columns(4)
+                                sc1.metric("Typical (P50)", _fmt_num(med, digits=3))
+                                sc2.metric("Strong (P80)", _fmt_num(p80, digits=3))
+                                sc3.metric("Elite (P90)", _fmt_num(p90, digits=3) if (p90 is not None and math.isfinite(float(p90))) else "—")
+                                sc4.metric("Cutoff", _fmt_num(cutoff, digits=3))
+                            else:
+                                sc1, sc2, sc3 = st.columns(3)
+                                sc1.metric("Typical (P50)", _fmt_num(med, digits=3))
+                                sc2.metric("Strong (P80)", _fmt_num(p80, digits=3))
+                                sc3.metric("Elite (P90)", _fmt_num(p90, digits=3) if (p90 is not None and math.isfinite(float(p90))) else "—")
+
+                        # Quick verdict (compact)
                         try:
                             _span = float(x_p995 - x_p2) if (math.isfinite(float(x_p995)) and math.isfinite(float(x_p2)) and (x_p995 > x_p2)) else float(x1 - x0)
                             _sep = float(p80 - med)
                             _ratio = (abs(_sep) / _span) if (_span and math.isfinite(_span) and _span > 0) else 0.0
                             if _ratio < 0.08:
-                                _verdict = "Separation is small: strong configs aren’t much different from typical."
+                                _sep_lbl = 'small'
                             elif _ratio < 0.18:
-                                _verdict = "Separation is moderate: strong configs are meaningfully better than typical."
+                                _sep_lbl = 'moderate'
                             else:
-                                _verdict = "Separation is large: strong configs clearly stand out from typical."
+                                _sep_lbl = 'large'
                         except Exception:
-                            _verdict = "This shows where survivors land on Stability (higher = more repeatable)."
-                        
-                        _cut_note = ""
-                        if cutoff is not None and math.isfinite(float(cutoff)):
-                            if not cutoff_in_range:
-                                _cut_note = " Your shortlist cutoff is very low (off-scale) — the visible shortlist is permissive."
+                            _sep_lbl = '—'
+                        _cut_lbl = ''
+                        if cutoff_relevant and (cutoff is not None and math.isfinite(float(cutoff))):
+                            if float(cutoff) >= float(p80):
+                                _cut_lbl = 'selective (strong+)'
                             else:
-                                if float(cutoff) >= float(p80):
-                                    _cut_note = " Your shortlist cutoff sits in the strong zone — the visible shortlist is selective."
-                                else:
-                                    _cut_note = " Your shortlist cutoff is below the strong zone — the visible shortlist is permissive."
-                        st.markdown(f"**Verdict:** {_verdict}{_cut_note}")
-                        
+                                _cut_lbl = 'permissive'
+                        _vline = f"Separation: **{_sep_lbl}**"
+                        if _cut_lbl:
+                            _vline += f" · Cutoff: {_cut_lbl}"
+                        st.caption(_vline)
                         # Density curve + simple zones (cleaner than a histogram)
                         try:
                             _arr_f = _arr[np.isfinite(_arr)]
@@ -9783,6 +10763,18 @@ if stage_pick == "grand":
                             u = (xs[:, None] - _arr_f[None, :]) / h
                             ys = np.exp(-0.5 * (u ** 2)).sum(axis=1) / (n_eff * h * math.sqrt(2.0 * math.pi))
                             y_max = float(np.nanmax(ys)) if len(ys) else 1.0
+
+                            # Percentile tick marks (top axis) for interpretability
+                            pct_tick_vals: List[float] = []
+                            pct_tick_text: List[str] = []
+                            try:
+                                for _p, _lbl in [(10, "P10"), (50, "P50"), (80, "P80"), (90, "P90")]:
+                                    _vv = float(np.nanpercentile(_arr_f, _p))
+                                    if math.isfinite(_vv) and (float(x0) <= _vv <= float(x1)):
+                                        pct_tick_vals.append(float(_vv))
+                                        pct_tick_text.append(_lbl)
+                            except Exception:
+                                pct_tick_vals, pct_tick_text = [], []
                         
                             fig_den = go.Figure()
                             fig_den.add_trace(
@@ -9839,19 +10831,73 @@ if stage_pick == "grand":
                             if cutoff_in_range:
                                 _add_marker_line(float(cutoff), "Cutoff", "dashdot", WARN_COLOR, "Visibility cutoff (UI)", y_annot=1.02)
                             if baseline_marker_x is not None and math.isfinite(float(baseline_marker_x)):
-                                _add_marker_line(
-                                    float(baseline_marker_x),
-                                    "You" if not baseline_offscale else "You (off)",
-                                    "dash",
-                                    "#111827",
-                                    "Your strategy (baseline)",
-                                    y_annot=1.20,
-                                )
+                                try:
+                                    _x_you = float(baseline_marker_x)
+                                    _you_text = ("You"
+                                                 + (f" (P{float(baseline_pct):.0f})" if baseline_pct_ok else "")
+                                                 + (f" · {float(baseline_z):+.2f}σ" if (baseline_z is not None and math.isfinite(float(baseline_z))) else "")
+                                                 + (" · filtered out" if (not baseline_in_req) else "")
+                                                 + (" · off-scale" if baseline_offscale else "")
+                                                 )
+                                    # Strong emphasis: draw last + thicker line + label bubble anchored to the line.
+                                    fig_den.add_vline(
+                                        x=_x_you,
+                                        line_width=4,
+                                        line_dash="solid",
+                                        line_color="#111827",
+                                    )
+                                    fig_den.add_annotation(
+                                        x=_x_you, xref="x",
+                                        y=1.20, yref="paper",
+                                        text=_you_text,
+                                        showarrow=False,
+                                        xanchor="center",
+                                        yanchor="bottom",
+                                        font=dict(size=11, color="rgba(255,255,255,0.98)"),
+                                        bgcolor="rgba(17,24,39,0.92)",
+                                        bordercolor="rgba(255,255,255,0.95)",
+                                        borderwidth=1,
+                                        borderpad=4,
+                                    )
+                                except Exception:
+                                    _add_marker_line(
+                                        float(baseline_marker_x),
+                                        "You" if not baseline_offscale else "You (off)",
+                                        "solid",
+                                        "#111827",
+                                        "You",
+                                        y_annot=1.20,
+                                    )
+
                             _style_fig(fig_den, title=None)
                             fig_den.update_layout(margin=dict(l=20, r=20, t=110, b=20))
-                            fig_den.update_xaxes(title="Stability Score (higher = more repeatable)")
                             fig_den.update_yaxes(title=None, showticklabels=False, showgrid=False, zeroline=False)
-                            fig_den.update_xaxes(range=[float(x0), float(x1)])
+
+                            # Bottom axis: raw Stability index (engine units). Keep ticks sparse + rounded.
+                            fig_den.update_layout(
+                                xaxis=dict(
+                                    title="Stability index (higher = more repeatable)",
+                                    range=[float(x0), float(x1)],
+                                    nticks=4,
+                                    tickformat=".3f",
+                                    ticks="outside",
+                                )
+                            )
+                            # Top axis: percentile landmarks for fast interpretation (P10/P50/P80/P90)
+                            if isinstance(pct_tick_vals, list) and len(pct_tick_vals) > 0:
+                                fig_den.update_layout(
+                                    xaxis2=dict(
+                                        overlaying="x",
+                                        side="top",
+                                        tickmode="array",
+                                        tickvals=pct_tick_vals,
+                                        ticktext=pct_tick_text,
+                                        showgrid=False,
+                                        zeroline=False,
+                                        ticks="outside",
+                                        tickfont=dict(size=10, color="#6b7280"),
+                                    )
+                                )
                         
                         
                             st.markdown("##### Where survivors land on Stability")
@@ -9865,7 +10911,7 @@ if stage_pick == "grand":
                             )
                             _style_fig(fig_hist, title=None)
                             fig_hist.update_layout(margin=dict(l=20, r=20, t=120, b=20))
-                            fig_hist.update_xaxes(title="Stability Score (higher = more repeatable)", range=[float(x0), float(x1)])
+                            fig_hist.update_xaxes(title="Stability index (higher = more repeatable)", range=[float(x0), float(x1)], nticks=6, tickformat=".3f")
                             fig_hist.update_yaxes(title="Count")
                             _plotly(fig_hist)
                 # Common issues bar (clean labels + full detail in hover/table)
@@ -10473,7 +11519,7 @@ if stage_pick == "grand":
             checks_ratio = (checks_passed / checks_total) if checks_total else 0.0
 
             with cards_cols[i % 2]:
-                with st.container(border=True):
+                with st.container():
                     # Header
                     hL, hR = st.columns([0.78, 0.22])
                     with hL:
@@ -10517,7 +11563,6 @@ if stage_pick == "grand":
                             st.metric("Max drawdown", _fmt_pct(batch_dd))
 
                         st.caption("Robustness distributions")
-                        st.caption("Each strip summarizes many runs. Each value is total return % for that scenario. Box = typical zone (middle 50%). Whiskers = bad→good range.")
                         dL, dR = st.columns(2, gap="small")
 
                         with dL:
@@ -10613,9 +11658,18 @@ if stage_pick == "grand":
 
     st.divider()
 
+    # Allow inspection of a config selected elsewhere (e.g., Risk/return map) even if it is not in the current shortlist.
+    if "ui.evidence_override_pick" not in st.session_state:
+        st.session_state["ui.evidence_override_pick"] = None
+    _override_pick = st.session_state.get("ui.evidence_override_pick")
+
+    _pick_opts = df_show["config_id"].astype(str).tolist()[:5000]
+    if _override_pick and str(_override_pick) not in set(_pick_opts):
+        _pick_opts = [str(_override_pick)] + _pick_opts
+
     pick = st.selectbox(
         "Select a strategy to inspect",
-        options=df_show["config_id"].astype(str).tolist()[:5000],
+        options=_pick_opts,
         index=0,
         key="cockpit.pick",
     )
@@ -10677,7 +11731,7 @@ if stage_pick == "grand":
 
 
             # Selected strategy summary (quick read before diving into tabs)
-            with st.container(border=True):
+            with st.container():
 
                 dd_col_s = _pick_col(df2, ["performance.max_drawdown_equity", "performance.max_drawdown", "equity.max_drawdown", "dd_p90"])
                 ret_col_s = _pick_col(df2, ["performance.twr_total_return", "equity.net_profit_ex_cashflows", "equity.net_profit", "return_p50"])
@@ -10763,7 +11817,7 @@ if stage_pick == "grand":
                 st.markdown("##### Robustness checks")
                 st.caption("Run remaining robustness checks for this run’s survivor set. Checks lock per run.")
 
-                with st.container(border=True):
+                with st.container():
                     # Detect whether each robustness stage has already run for this run.
                     rs_done = False
                     wf_done = False
@@ -10936,12 +11990,37 @@ if stage_pick == "grand":
                 replay_script = REPO_ROOT / "tools" / "generate_replay_artifacts.py"
                 can_replay = (run_dir / "configs_resolved.jsonl").exists() and replay_script.exists()
 
-                if not eq_path.exists():
-                    st.info("Replay artifacts for this candidate haven't been generated yet. Generate them to unlock the price + event timeline and detailed receipts.")
-                    if st.button("Generate replay artifacts", key=f"replay.gen.{pick}", disabled=(not can_replay)):
-                        cmd = [PY, str(replay_script), "--from-run", str(run_dir), "--config-id", str(pick)]
-                        _run_cmd(cmd, cwd=REPO_ROOT, label="Replay: generate artifacts")
-                        st.rerun()
+                # Replay artifacts controls (single, canonical)
+
+
+                st.session_state["ui.replay.primary_controls_for"] = str(pick)
+
+
+                _render_replay_artifacts_controls(
+
+
+                    run_dir=run_dir,
+
+
+                    pick=str(pick),
+
+
+                    replay_dir=replay_dir,
+
+
+                    has_core_artifacts=bool(eq_path.exists()),
+
+
+                    can_replay=bool(can_replay),
+
+
+                    key_prefix="replay.primary",
+
+
+                    show_when_ready=True,
+
+
+                )
 
                 if eq_path.exists():
 
@@ -11521,17 +12600,31 @@ if stage_pick == "grand":
                                         _add_ev("EXIT", "triangle-down", "Exit")
                                     else:
                                         st.caption("No events to overlay for this candidate (0 fills or missing event tape).")
-                                        replay_script = REPO_ROOT / "tools" / "generate_replay_artifacts.py"
-                                        can_replay = (run_dir / "configs_resolved.jsonl").exists() and replay_script.exists()
-                                        if st.button("Regenerate replay artifacts (refresh cache)", key=f"replay.regen.empty.{pick}", disabled=(not can_replay)):
-                                            try:
-                                                if replay_dir.exists():
-                                                    shutil.rmtree(replay_dir)
-                                            except Exception:
-                                                pass
-                                            cmd = [PY, str(replay_script), "--from-run", str(run_dir), "--config-id", str(pick)]
-                                            _run_cmd(cmd, cwd=REPO_ROOT, label="Replay: regenerate artifacts")
-                                            st.rerun()
+                                        st.caption("Artifacts look incomplete? Use the **Replay artifacts** control in the Build sheet above (toggle **Refresh cache**).")
+
+                                        if str(st.session_state.get("ui.replay.primary_controls_for", "")) != str(pick):
+
+                                            replay_script = REPO_ROOT / "tools" / "generate_replay_artifacts.py"
+
+                                            can_replay = (run_dir / "configs_resolved.jsonl").exists() and replay_script.exists()
+
+                                            _render_replay_artifacts_controls(
+
+                                                run_dir=run_dir,
+
+                                                pick=str(pick),
+
+                                                replay_dir=replay_dir,
+
+                                                has_core_artifacts=True,
+
+                                                can_replay=bool(can_replay),
+
+                                                key_prefix="replay.fallback.events",
+
+                                                show_when_ready=True,
+
+                                            )
                                     fig_ev.update_layout(height=430, margin=dict(l=10, r=10, t=10, b=10), xaxis_title="Date", yaxis_title="Price",
                                                         legend=dict(orientation="h", yanchor="bottom", y=1.10, xanchor="left", x=0, font=dict(size=12)))
                                     _plotly(fig_ev, key=f"batch_ev_timeline_{pick}")
@@ -11547,17 +12640,31 @@ if stage_pick == "grand":
                             st.caption("No events.csv found for this config yet (replay artifacts need regeneration).")
                     
                             # Allow regeneration even if cached artifacts exist (needed when new artifact types are added).
-                            replay_script = REPO_ROOT / "tools" / "generate_replay_artifacts.py"
-                            can_replay = (run_dir / "configs_resolved.jsonl").exists() and replay_script.exists()
-                            if st.button("Regenerate replay artifacts (refresh cache)", key=f"replay.regen.{pick}", disabled=(not can_replay)):
-                                try:
-                                    if replay_dir.exists():
-                                        shutil.rmtree(replay_dir)
-                                except Exception:
-                                    pass
-                                cmd = [PY, str(replay_script), "--from-run", str(run_dir), "--config-id", str(pick)]
-                                _run_cmd(cmd, cwd=REPO_ROOT, label="Replay: regenerate artifacts")
-                                st.rerun()
+                            st.caption("events.csv is missing for this config. If you need it, use the **Replay artifacts** control in the Build sheet above (toggle **Refresh cache**).")
+
+                            if str(st.session_state.get("ui.replay.primary_controls_for", "")) != str(pick):
+
+                                replay_script = REPO_ROOT / "tools" / "generate_replay_artifacts.py"
+
+                                can_replay = (run_dir / "configs_resolved.jsonl").exists() and replay_script.exists()
+
+                                _render_replay_artifacts_controls(
+
+                                    run_dir=run_dir,
+
+                                    pick=str(pick),
+
+                                    replay_dir=replay_dir,
+
+                                    has_core_artifacts=True,
+
+                                    can_replay=bool(can_replay),
+
+                                    key_prefix="replay.fallback.events_csv",
+
+                                    show_when_ready=True,
+
+                                )
                     
                     
                     
@@ -11895,7 +13002,7 @@ if stage_pick == "grand":
                                         if len(r) == 0:
                                             st.info("Rolling-starts return column is empty after cleaning.")
                                         else:
-                                            with st.container(border=True):
+                                            with st.container():
                                                 _k = hashlib.sha1(pick_eff.encode("utf-8")).hexdigest()[:10]
                                                 tol = st.slider(
                                                     "Disappoint cutoff (return)",
@@ -12006,7 +13113,7 @@ if stage_pick == "grand":
                                         d["window_return"] = pd.to_numeric(d[ret_col], errors="coerce")
                                         d = d.dropna(subset=["window_idx", "window_return"])
                                         d["window_idx"] = d["window_idx"].astype(int)
-                                        with st.container(border=True):
+                                        with st.container():
                                             rvals = d["window_return"].astype(float)
                                             p50 = float(np.nanpercentile(rvals, 50))
                                             neg_rate = float((rvals < 0.0).mean())

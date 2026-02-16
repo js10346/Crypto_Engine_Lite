@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -80,6 +81,14 @@ def main() -> int:
 
     args = ap.parse_args()
     run_dir = Path(args.from_run).resolve()
+
+    baseline_id = None
+    meta_path = run_dir / "batch_meta.json"
+    if meta_path.exists():
+        try:
+            baseline_id = json.loads(meta_path.read_text(encoding="utf-8")).get("baseline_config_id")
+        except Exception:
+            baseline_id = None
     src = run_dir / "results_full.csv"
     if not src.exists():
         raise FileNotFoundError(f"Missing results_full.csv: {src}")
@@ -122,6 +131,11 @@ def main() -> int:
     df[score_col] = pd.to_numeric(df[score_col], errors="coerce")
     df = df.sort_values(score_col, ascending=False)
 
+    # Baseline marker
+    if baseline_id and "config.id" in df.columns:
+        b = str(baseline_id)
+        df["is_baseline"] = df["config.id"].astype(str) == b
+
     # Pareto front flag: maximize profit, minimize drawdown
     df["pareto.profit_vs_dd"] = pareto_front(
         df,
@@ -139,6 +153,11 @@ def main() -> int:
 
     # Convenience shortlist (ids)
     ids = top["config.id"].astype(str).tolist() if "config.id" in top.columns else []
+    if baseline_id:
+        b = str(baseline_id)
+        ids = [b] + [x for x in ids if str(x) != b]
+    # Deduplicate while preserving order
+    ids = list(dict.fromkeys([str(x) for x in ids if str(x).strip()]))
     (out_dir / "top_ids.txt").write_text("\n".join(ids) + "\n", encoding="utf-8")
 
     print(f"Wrote: {out_dir / 'ranked.csv'}")

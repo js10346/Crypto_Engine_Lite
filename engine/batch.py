@@ -1534,6 +1534,13 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     baseline_config_id = _find_baseline_config_id(parsed_configs)
 
+    # Pinned configs: always evaluate & carry through (even if gates reject them).
+    # Today we pin the user's baseline config (marked in configs_resolved.jsonl and echoed in batch_meta.json).
+    id_to_cfg = {x["config_id"]: x for x in parsed_configs}
+    pinned_ids: List[str] = []
+    if baseline_config_id and str(baseline_config_id) in id_to_cfg:
+        pinned_ids = [str(baseline_config_id)]
+
     if len(parsed_configs) == 0:
         print(f"\nNo configs parsed successfully. Output: {out_dir}")
         if errors:
@@ -1644,6 +1651,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             row["gates.passed"] = bool(passed)
             row["gates.reject_reason"] = str(reason)
 
+            # Baseline/pinned annotations (used by UI + downstream tests)
+            row["config.is_baseline"] = bool(baseline_config_id and str(x["config_id"]) == str(baseline_config_id))
+            row["config.is_pinned"] = bool(str(x["config_id"]) in set(pinned_ids))
+
             rows_sweep.append(row)
 
             sweep_done += 1
@@ -1743,6 +1754,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                     )
                     row["gates.passed"] = bool(passed)
                     row["gates.reject_reason"] = str(reason)
+
+                    # Baseline/pinned annotations (used by UI + downstream tests)
+                    _cid = str(row.get("config.id") or row.get("config_id") or "")
+                    row["config.is_baseline"] = bool(baseline_config_id and _cid == str(baseline_config_id))
+                    row["config.is_pinned"] = bool(_cid in set(pinned_ids))
+
                     rows_sweep.append(row)
 
                     sweep_done += 1
@@ -1796,29 +1813,65 @@ def main(argv: Optional[List[str]] = None) -> int:
     df_pass_sweep = df_sweep[df_sweep["gates.passed"].astype(bool)].copy()
     df_pass_sweep.to_csv(out_dir / "results_passed.csv", index=False)
 
-    # If nothing passed gates, stop gracefully (common for DCA if min-trades defaults are high).
-    if df_pass_sweep.empty:
-        _write_csv(out_dir / "results_full.csv", [])
-        _write_csv(out_dir / "results_full_passed.csv", [])
-        meta = {
-            "data": args.data,
-            "grid": args.grid,
-            "template": args.template,
-            "market_mode": str(args.market_mode),
-            "seed": int(args.seed),
-            "starting_equity": float(args.starting_equity),
-            "configs_total": int(len(parsed_configs)),
-            "errors_total": int(len(errors)),
-            "baseline_config_id": str(baseline_config_id) if baseline_config_id else None,
-            "note": "No configs passed gates. Try --min-trades 0 for DCA sweeps.",
-            "out_dir": str(out_dir),
-        }
-        (out_dir / "batch_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-        progress.write({"stage": "batch", "phase": "done", "done": int(sweep_done), "total": int(sweep_total), "out_dir": str(out_dir)})
-        print(f"\nBatch complete (no passing configs). Output: {out_dir}")
-        return 0
+    # If nothing passed gates, either stop gracefully (default) or continue with pinned baseline.
+    note_no_pass = False
+    rerun_n = int(max(args.top_k, args.rerun_n))  # used for meta even if we only rerun pinned baseline
 
-    # Choose which configs to rerun fully
+    candidates: List[Dict[str, Any]] = []
+    candidate_ids: List[str] = []
+
+    if df_pass_sweep.empty:
+        if not pinned_ids:
+            _write_csv(out_dir / "results_full.csv", [])
+            _write_csv(out_dir / "results_full_passed.csv", [])
+            meta = {
+                "data": args.data,
+                "grid": args.grid,
+                "template": args.template,
+                "market_mode": str(args.market_mode),
+                "seed": int(args.seed),
+                "starting_equity": float(args.starting_equity),
+                "configs_total": int(len(parsed_configs)),
+                "errors_total": int(len(errors)),
+                "baseline_config_id": str(baseline_config_id) if baseline_config_id else None,
+                "note": "No configs passed gates. Try --min-trades 0 for DCA sweeps.",
+                "out_dir": str(out_dir),
+            }
+            (out_dir / "batch_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            progress.write({"stage": "batch", "phase": "done", "done": int(sweep_done), "total": int(sweep_total), "out_dir": str(out_dir)})
+            print(f"\nBatch complete (no passing configs). Output: {out_dir}")
+            return 0
+
+        # We still want baseline metrics available for UI markers / test-suite runs.
+        note_no_pass = True
+        print("\nNo configs passed gates; continuing with pinned baseline for full rerun metrics.")
+        candidate_ids = list(dict.fromkeys([cid for cid in pinned_ids if cid in id_to_cfg]))
+        candidates = [id_to_cfg[cid] for cid in candidate_ids if cid in id_to_cfg]
+
+    else:
+        # Choose which configs to rerun fully
+        sweep_sort_key = args.sweep_sort_by
+        if sweep_sort_key not in df_pass_sweep.columns:
+            sweep_sort_key = "equity.total_return"
+
+        df_candidates = df_pass_sweep.sort_values(
+            sweep_sort_key,
+            ascending=(not args.sweep_sort_desc),
+        ).head(rerun_n)
+
+        candidate_ids = [str(x) for x in df_candidates["config.id"].tolist()]
+
+        # Ensure pinned baseline included even if it failed gates in the sweep
+        for pid in pinned_ids:
+            if pid and pid not in candidate_ids and pid in id_to_cfg:
+                candidate_ids.append(pid)
+
+        # Deduplicate (preserve order)
+        candidate_ids = list(dict.fromkeys(candidate_ids))
+
+        candidates = [id_to_cfg[cid] for cid in candidate_ids if cid in id_to_cfg]
+
+    # Full rerun for candidates (for correct final sorting, plus artifacts)
     rerun_n = int(max(args.top_k, args.rerun_n))
     sweep_sort_key = args.sweep_sort_by
     if sweep_sort_key not in df_pass_sweep.columns:
@@ -1890,6 +1943,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
             row["gates.passed"] = bool(passed)
             row["gates.reject_reason"] = str(reason)
+
+            # Baseline/pinned annotations
+            row["config.is_baseline"] = bool(baseline_config_id and str(x["config_id"]) == str(baseline_config_id))
+            row["config.is_pinned"] = bool(str(x["config_id"]) in set(pinned_ids))
+
             rows_full.append(row)
 
             rerun_done += 1
@@ -1986,6 +2044,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                     )
                     row["gates.passed"] = bool(passed)
                     row["gates.reject_reason"] = str(reason)
+
+                    # Baseline/pinned annotations
+                    _cid = str(row.get("config.id") or row.get("config_id") or "")
+                    row["config.is_baseline"] = bool(baseline_config_id and _cid == str(baseline_config_id))
+                    row["config.is_pinned"] = bool(_cid in set(pinned_ids))
+
                     rows_full.append(row)
 
                     rerun_done += 1
@@ -2034,7 +2098,19 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     _write_csv(out_dir / "results_full.csv", rows_full)
     df_full = pd.DataFrame(rows_full)
-    df_full_pass = df_full[df_full["gates.passed"].astype(bool)].copy()
+
+    # Persist baseline metrics (so UI can always anchor a baseline marker even if it fails gates)
+    if baseline_config_id and (not df_full.empty) and ("config.id" in df_full.columns):
+        try:
+            _b = df_full[df_full["config.id"].astype(str) == str(baseline_config_id)]
+            if len(_b) > 0:
+                baseline_row = _b.iloc[0].to_dict()
+                (out_dir / "baseline_metrics.json").write_text(
+                    json.dumps(baseline_row, indent=2, default=str),
+                    encoding="utf-8",
+                )
+        except Exception:
+            pass
     if df_full.empty or "gates.passed" not in df_full.columns:
         df_full_pass = pd.DataFrame([])
     else:
@@ -2112,7 +2188,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         "market_mode": str(args.market_mode),
         "configs_total": int(len(parsed_configs)),
         "errors_total": int(len(errors)),
-            "baseline_config_id": str(baseline_config_id) if baseline_config_id else None,
+        "baseline_config_id": str(baseline_config_id) if baseline_config_id else None,
+        "note": ("No configs passed gates; pinned baseline was still rerun for UI/test anchoring." if note_no_pass else None),
         "fast_sweep": bool(args.fast_sweep),
         "engine_supports_fast_flags": supports,
         "sweep_sort_by": args.sweep_sort_by,

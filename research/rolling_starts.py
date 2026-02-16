@@ -390,6 +390,19 @@ def main() -> int:
         for x in ids_path.read_text(encoding="utf-8").splitlines()
         if x.strip()
     ][: int(args.top_n)]
+
+    # Always include the user's baseline config (even if it failed gates / wasn't shortlisted).
+    baseline_id = None
+    try:
+        meta = json.loads((run_dir / "batch_meta.json").read_text(encoding="utf-8"))
+        baseline_id = meta.get("baseline_config_id")
+    except Exception:
+        baseline_id = None
+
+    if baseline_id:
+        b = str(baseline_id)
+        config_ids = [b] + [cid for cid in config_ids if str(cid) != b]
+        config_ids = config_ids[: int(args.top_n)]
     if not config_ids:
         raise ValueError("No config IDs provided")
 
@@ -451,6 +464,7 @@ def main() -> int:
 
     meta_now = {
         "template": str(args.template),
+        "baseline_config_id": (str(baseline_id) if baseline_id else None),
         "seed": int(args.seed),
         "starting_equity": float(args.starting_equity),
         "start_step": int(start_step),
@@ -721,6 +735,17 @@ def main() -> int:
                 pass
 
     df_sum = _summarize_from_detail(df_all_detail) if not df_all_detail.empty else pd.DataFrame([])
+
+    # Mark baseline rows for UI overlays
+    if baseline_id:
+        b = str(baseline_id)
+        try:
+            if (not df_all_detail.empty) and ("config_id" in df_all_detail.columns):
+                df_all_detail["is_baseline"] = df_all_detail["config_id"].astype(str) == b
+            if (not df_sum.empty) and ("config_id" in df_sum.columns):
+                df_sum["is_baseline"] = df_sum["config_id"].astype(str) == b
+        except Exception:
+            pass
 
     df_all_detail.to_csv(detail_path, index=False)
     df_sum.to_csv(summary_path, index=False)
