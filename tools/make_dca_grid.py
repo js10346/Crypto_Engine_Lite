@@ -377,6 +377,8 @@ def _normalize_base_params(base: Dict[str, Any]) -> Dict[str, Any]:
         "deposit_amount_usd": _as_float(params_in.get("deposit_amount_usd"), 50.0),
         "buy_freq": _as_str(params_in.get("buy_freq"), "weekly").lower(),
         "buy_amount_usd": _as_float(params_in.get("buy_amount_usd"), 50.0),
+        "buy_mode": _as_str(params_in.get("buy_mode"), "scheduled").lower(),
+        "max_buys_per_gate": _as_int(params_in.get("max_buys_per_gate"), 0),
 
         # Entry logic (preferred) + legacy fallback
         "entry_logic": entry_logic_in,
@@ -403,6 +405,16 @@ def _normalize_base_params(base: Dict[str, Any]) -> Dict[str, Any]:
     if p["deposit_freq"] in {"none", "off", "0", ""}:
         p["deposit_freq"] = "none"
         p["deposit_amount_usd"] = 0.0
+
+
+    bm = str(p.get("buy_mode", "scheduled") or "scheduled").strip().lower()
+    if bm not in {"scheduled", "signal"}:
+        bm = "scheduled"
+    p["buy_mode"] = bm
+    try:
+        p["max_buys_per_gate"] = max(0, int(p.get("max_buys_per_gate", 0) or 0))
+    except Exception:
+        p["max_buys_per_gate"] = 0
 
     allowed_filters = {
         "none",

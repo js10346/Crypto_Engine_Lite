@@ -53,6 +53,11 @@ DEFAULT_CONFIG = StrategyConfig(
         "buy_freq": "weekly",  # daily|weekly|monthly
         "buy_amount_usd": 50.0,
 
+        # Buy trigger mode
+        "buy_mode": "scheduled",  # scheduled | signal
+        "max_buys_per_gate": 0,   # 0 = unlimited (signal mode only)
+
+
         # Legacy single-filter (kept for backward compatibility)
         "buy_filter": "none",  # none|below_ema|rsi_below|macd_bull|bb_z_below|adx_above|donch_pos_below
         "ema_len": 200,
@@ -242,6 +247,11 @@ class DCASwingStrategy:
 
         # Scheduling counter
         self.bar_i = 0
+
+        # Signal-mode buy pacing state
+        self._last_buy_bar_i: Optional[int] = None
+        self._gate_prev_ok: bool = False
+        self._gate_session_buys: int = 0
 
         # Reserve bookkeeping: apply reserve when we see the TP sell fill in ctx.last_exec
         self._awaiting_reserve = False
@@ -488,24 +498,69 @@ class DCASwingStrategy:
         # ---------
         # Buy logic (DCA)
         # ---------
-        will_buy = False
-        if (not will_sell) and self._buy_due():
-            entry_logic = _normalize_entry_logic(self._p("entry_logic", None))
-            if entry_logic is not None:
-                ok = _entry_logic_ok(ctx, entry_logic)
+        buy_mode = str(self._p("buy_mode", "scheduled") or "scheduled").strip().lower()
+        if buy_mode not in {"scheduled", "signal"}:
+            buy_mode = "scheduled"
+
+        # Gate evaluation (shared across modes)
+        entry_logic = _normalize_entry_logic(self._p("entry_logic", None))
+        if entry_logic is not None:
+            gate_ok = _entry_logic_ok(ctx, entry_logic)
+        else:
+            gate_ok = self._buy_filter_ok(ctx, price)
+
+        # Track "signal windows" (a window starts when the gate flips False -> True)
+        if gate_ok and (not self._gate_prev_ok):
+            self._gate_session_buys = 0
+
+        # Signal-mode pacing
+        cooldown_days = _freq_to_days(str(self._p("buy_freq", "weekly")))
+        cooldown_ok = True
+        cooldown_remaining = 0
+        if buy_mode == "signal":
+            if cooldown_days <= 0:
+                cooldown_ok = False
+                cooldown_remaining = 0
+            elif self._last_buy_bar_i is None:
+                cooldown_ok = True
+                cooldown_remaining = 0
             else:
-                ok = self._buy_filter_ok(ctx, price)
+                since = int(self.bar_i) - int(self._last_buy_bar_i)
+                cooldown_ok = since >= int(cooldown_days)
+                cooldown_remaining = max(0, int(cooldown_days) - int(since))
 
-            if ok:
-                buy_amt = float(self._p("buy_amount_usd", 0.0) or 0.0)
-                if math.isfinite(buy_amt) and buy_amt > 0:
-                    buy_usd = min(buy_amt, deployable_cash, remaining_cap_usd)
-                    if buy_usd > 1e-9:
-                        add_qty = buy_usd / price
-                        target_qty = pos_qty + add_qty
-                        will_buy = True
+        max_buys_per_gate = int(self._p("max_buys_per_gate", 0) or 0)
+        max_ok = (max_buys_per_gate <= 0) or (int(self._gate_session_buys) < int(max_buys_per_gate))
 
-        # If nothing to do (no deposit, no buy, no sell), HOLD.
+        will_buy = False
+        if not will_sell:
+            if buy_mode == "scheduled":
+                if self._buy_due() and gate_ok:
+                    buy_amt = float(self._p("buy_amount_usd", 0.0) or 0.0)
+                    if math.isfinite(buy_amt) and buy_amt > 0:
+                        buy_usd = min(buy_amt, deployable_cash, remaining_cap_usd)
+                        if buy_usd > 1e-9:
+                            add_qty = buy_usd / price
+                            target_qty = pos_qty + add_qty
+                            will_buy = True
+                            self._last_buy_bar_i = int(self.bar_i)
+            else:
+                # Signal-driven: whenever the gate is true, buy on cooldown (and optional per-window cap)
+                if gate_ok and cooldown_ok and max_ok:
+                    buy_amt = float(self._p("buy_amount_usd", 0.0) or 0.0)
+                    if math.isfinite(buy_amt) and buy_amt > 0 and cooldown_days > 0:
+                        buy_usd = min(buy_amt, deployable_cash, remaining_cap_usd)
+                        if buy_usd > 1e-9:
+                            add_qty = buy_usd / price
+                            target_qty = pos_qty + add_qty
+                            will_buy = True
+                            self._last_buy_bar_i = int(self.bar_i)
+                            self._gate_session_buys = int(self._gate_session_buys) + 1
+
+        # Update gate memory (for next bar)
+        self._gate_prev_ok = bool(gate_ok)
+
+# If nothing to do (no deposit, no buy, no sell), HOLD.
         if abs(cash_delta) < 1e-12 and (not will_buy) and (not will_sell):
             self.bar_i += 1
             self._prev_pos_qty = float(pos_qty)
@@ -540,6 +595,14 @@ class DCASwingStrategy:
         meta = {
             "strategy": str(self.cfg.strategy_name),
             "reserved_cash": float(self.reserved_cash),
+            "buy_mode": str(buy_mode),
+            "gate_ok": bool(gate_ok),
+            "cooldown_days": int(cooldown_days) if buy_mode == "signal" else 0,
+            "cooldown_ok": bool(cooldown_ok) if buy_mode == "signal" else bool(self._buy_due()),
+            "cooldown_remaining": int(cooldown_remaining) if buy_mode == "signal" else 0,
+            "gate_session_buys": int(self._gate_session_buys) if buy_mode == "signal" else 0,
+            "max_buys_per_gate": int(max_buys_per_gate),
+            "last_buy_bar_i": int(self._last_buy_bar_i) if self._last_buy_bar_i is not None else None,
             "deposit_due": bool(self._deposit_due()),
             "buy_due": bool(self._buy_due()),
             "tp_hit": bool(tp_hit),

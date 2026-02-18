@@ -26,6 +26,17 @@ import streamlit as st
 import streamlit.components.v1 as components
 com = components
 
+import html as _html
+
+
+def _escape_html(x: object) -> str:
+    """HTML-escape text for safe embedding in unsafe_allow_html blocks."""
+    try:
+        return _html.escape("" if x is None else str(x), quote=True)
+    except Exception:
+        return "" if x is None else str(x)
+
+
 # Optional: used for Build-step “reality check” stats (TA filters)
 try:
     from engine.features import add_features as _add_features
@@ -695,7 +706,6 @@ st.markdown(
 .js-plotly-plot .legendtitletext { display: none !important; }
 .js-plotly-plot .legendtitle { display: none !important; }
 
-.sticky-preview { position: sticky; top: 5.25rem; max-height: calc(100vh - 6.5rem); overflow: auto; padding-bottom: 12px; }
 
 /* Summary strip (slider → summary strip → charts) */
 .ff-summary-strip { display:flex; flex-wrap:wrap; gap:10px; align-items:flex-end; margin: 6px 0 6px 0; }
@@ -759,6 +769,93 @@ st.markdown(
 .ff-callout .label { font-size:0.78rem; opacity:0.72; margin-bottom:2px; }
 .ff-callout .value { font-weight:750; }
 
+/* Workflow (build sheet) */
+.ff-workflow { display:flex; flex-direction:column; gap:10px; margin-top:6px; }
+.ff-step { display:flex; gap:10px; align-items:flex-start; border:1px solid rgba(49,51,63,0.14);
+          border-radius:14px; padding:10px 10px; background: rgba(255,255,255,0.55); }
+.ff-step .n { width:26px; height:26px; border-radius:999px; display:flex; align-items:center; justify-content:center;
+             font-weight:800; font-size:0.85rem; background: rgba(52,152,219,0.18); color: rgba(17,24,39,0.90); margin-top:2px; flex: 0 0 auto; }
+.ff-step .t { font-weight:800; }
+.ff-step .d { font-size:0.90rem; color: rgba(49,51,63,0.82); margin-top:2px; line-height:1.25; }
+.ff-step .meta { margin-top:4px; }
+
+
+/* ===== Skill Build UI (game-style) ===== */
+.ff-skill-row { display:flex; flex-wrap:wrap; gap:12px; align-items:stretch; margin: 8px 0 6px 0; }
+.ff-skill-card { border:1px solid rgba(49,51,63,0.18); border-radius:18px; padding:10px 12px;
+                 background: rgba(255,255,255,0.55); box-shadow: 0 1px 10px rgba(0,0,0,0.04);
+                 min-height: 86px; }
+.ff-skill-card .t { font-weight:800; font-size:0.95rem; line-height:1.05; }
+.ff-skill-card .s { font-size:0.80rem; opacity:0.78; margin-top:6px; line-height:1.2; }
+.ff-skill-card .k { font-size:0.74rem; opacity:0.70; margin-top:2px; }
+.ff-skill-card.off { opacity:0.55; }
+.ff-skill-card.active { border-color: rgba(52,152,219,0.85); box-shadow: 0 0 0 3px rgba(52,152,219,0.18); }
+.ff-skill-card.warn { border-color: rgba(241,196,15,0.85); box-shadow: 0 0 0 3px rgba(241,196,15,0.16); }
+
+.ff-skill-econ { background: linear-gradient(135deg, rgba(46,204,113,0.20), rgba(46,204,113,0.04)); }
+.ff-skill-trigger { background: linear-gradient(135deg, rgba(155,89,182,0.20), rgba(52,152,219,0.06)); }
+.ff-skill-gate { background: linear-gradient(135deg, rgba(52,152,219,0.20), rgba(26,188,156,0.05)); }
+.ff-skill-alloc { background: linear-gradient(135deg, rgba(241,196,15,0.22), rgba(241,196,15,0.05)); }
+.ff-skill-risk { background: linear-gradient(135deg, rgba(231,76,60,0.18), rgba(231,76,60,0.04)); }
+
+.ff-build-summary { margin-top: 6px; margin-bottom: 6px; }
+.ff-build-summary code { font-size: 0.85rem; }
+
+.ff-flow { border:1px solid rgba(49,51,63,0.12); border-radius:18px; padding:10px 12px; background: rgba(255,255,255,0.52); }
+.ff-flow .hdr { display:flex; justify-content:space-between; align-items:flex-end; gap:10px; flex-wrap:wrap; }
+.ff-flow .hdr .title { font-weight:850; }
+.ff-flow .hdr .sub { font-size:0.80rem; opacity:0.78; }
+.ff-flow-steps { margin-top: 10px; display:flex; flex-direction:column; gap:10px; }
+.ff-flow-step { display:flex; gap:10px; align-items:flex-start; }
+.ff-flow-dot { width:10px; height:10px; border-radius:50%; margin-top:6px; flex:0 0 auto; background: rgba(49,51,63,0.45); }
+.ff-flow-node { flex:1 1 auto; padding:8px 10px; border-radius:16px; border:1px solid rgba(49,51,63,0.16);
+               background: rgba(255,255,255,0.55); }
+.ff-flow-node .t { font-weight:800; }
+.ff-flow-node .d { font-size:0.86rem; opacity:0.80; margin-top:2px; line-height:1.25; }
+
+.ff-module { border:1px solid rgba(49,51,63,0.14); border-radius:18px; padding:10px 12px; background: rgba(255,255,255,0.44); margin-bottom:12px; }
+.ff-module.active { border-color: rgba(52,152,219,0.70); box-shadow: 0 0 0 3px rgba(52,152,219,0.12); }
+.ff-module .mod-hdr { display:flex; justify-content:space-between; align-items:flex-end; gap:10px; flex-wrap:wrap; }
+.ff-module .mod-hdr .left { font-weight:850; }
+.ff-module .mod-hdr .right { font-weight:750; }
+.ff-mini { font-size:0.80rem; opacity:0.78; }
+
+
+
+/* ===== Gate logic tree (visual) ===== */
+.ff-gate-tree-wrap { border:1px solid rgba(49,51,63,0.14); border-radius:14px; padding:10px 12px; background: rgba(255,255,255,0.55); margin-top: 8px; }
+.ff-gate-meta { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:10px; }
+.ff-gate-meta .ff-gate-chip { display:inline-flex; align-items:center; gap:6px; padding:4px 10px; border-radius:999px; border:1px solid rgba(49,51,63,0.18);
+                              font-size:0.82rem; background: rgba(149,165,166,0.10); white-space:nowrap; }
+.ff-gate-chip.on { background: rgba(46, 204, 113, 0.18); }
+.ff-gate-chip.off { background: rgba(231, 76, 60, 0.14); }
+.ff-gate-chip.info { background: rgba(52, 152, 219, 0.14); }
+.ff-gate-chip.warn { background: rgba(241, 196, 15, 0.18); }
+
+.ff-gate-tree { display:flex; gap:10px; flex-wrap:wrap; align-items:stretch; }
+.ff-gate-join { display:flex; align-items:center; justify-content:center; font-weight:850; opacity:0.55; padding:0 4px; }
+.ff-gate-box { flex: 1 1 260px; min-width: 240px; border:1px solid rgba(49,51,63,0.14); border-radius:14px; padding:10px; background: rgba(149,165,166,0.08); }
+.ff-gate-box .hdr { display:flex; justify-content:space-between; gap:10px; align-items:baseline; margin-bottom:6px; }
+.ff-gate-box .hdr .t { font-weight:800; }
+.ff-gate-box .hdr .k { font-size:0.82rem; opacity:0.70; }
+.ff-gate-box .sub { font-size:0.82rem; opacity:0.75; margin-bottom:8px; }
+.ff-gate-conds { display:flex; flex-wrap:wrap; gap:6px; }
+.ff-gate-cond { display:inline-block; padding:3px 8px; border-radius:999px; border:1px solid rgba(49,51,63,0.16);
+                font-size:0.78rem; background: rgba(255,255,255,0.55); }
+.ff-gate-cond.dim { opacity:0.72; }
+
+.ff-gate-box.regime { background: rgba(46, 204, 113, 0.10); }
+.ff-gate-box.triggers { background: rgba(155, 89, 182, 0.10); }
+.ff-gate-box.result { background: rgba(52, 152, 219, 0.10); }
+.ff-gate-box.result.on { background: rgba(46, 204, 113, 0.14); }
+.ff-gate-box.result.off { background: rgba(231, 76, 60, 0.12); }
+
+.ff-clause-grid { display:flex; flex-direction:column; gap:8px; }
+.ff-clause { border:1px dashed rgba(49,51,63,0.22); border-radius:12px; padding:8px; background: rgba(255,255,255,0.45); }
+.ff-clause.on { border-color: rgba(46, 204, 113, 0.70); box-shadow: 0 0 0 2px rgba(46, 204, 113, 0.14) inset; }
+.ff-clause .ct { font-weight:800; font-size:0.82rem; margin-bottom:6px; display:flex; justify-content:space-between; gap:10px; }
+.ff-clause .ct .mode { font-size:0.78rem; opacity:0.70; font-weight:650; }
+.ff-gate-foot { font-size:0.80rem; opacity:0.74; margin-top:8px; }
 </style>
 """,
     unsafe_allow_html=True,
@@ -907,6 +1004,33 @@ def _ff_kvlist_html(items: List[Tuple[str, List[str]]]) -> str:
     parts.append("</div>")
     return "".join(parts)
 
+
+
+def _ff_workflow_html(steps: List[Dict[str, Any]]) -> str:
+    """Compact workflow list with numbered steps (uses existing chip styles)."""
+    import html as _html
+    if not steps:
+        return ""
+    parts = ["<div class='ff-workflow'>"]
+    for i, s in enumerate(steps, 1):
+        title = str(s.get("title") or "").strip()
+        desc = str(s.get("desc") or "").strip()
+        chips = s.get("chips") or []
+        chips_html = _ff_chip_row_html([str(x) for x in chips if str(x).strip()])
+        parts.append(
+            "<div class='ff-step'>"
+            f"<div class='n'>{i}</div>"
+            "<div style='flex:1'>"
+            f"<div class='t'>{_html.escape(title)}</div>"
+            f"<div class='d'>{_html.escape(desc)}</div>"
+            f"<div class='meta'>{chips_html}</div>"
+            "</div>"
+            "</div>"
+        )
+    parts.append("</div>")
+    return "".join(parts)
+
+
 def _ff_readouts_html(items: List[Tuple[str, str, float]]) -> str:
     import html as _html
     parts = ["<div class='ff-readouts'>"]
@@ -1018,6 +1142,9 @@ def _blank_dca_plan_blueprint() -> Dict[str, Any]:
         "deposit_amount_usd": 50.0,
         "buy_freq": "weekly",
         "buy_amount_usd": 50.0,
+        "buy_mode": "scheduled",  # scheduled | signal
+        "max_buys_per_gate": 0,       # 0 = unlimited (signal mode only)
+
 
         # Entry gating
         "entry_mode": "simple",          # simple | builder
@@ -1150,6 +1277,17 @@ def _apply_dca_plan_blueprint(bp: Dict[str, Any]) -> Tuple[bool, str]:
 
     st.session_state["new.deposit_freq"] = dep_freq
     st.session_state["new.buy_freq"] = buy_freq
+
+    # Buy mode (scheduled vs signal-driven)
+    bm = str(_pick("buy_mode", "buy_trigger_mode", default="scheduled") or "scheduled").strip().lower()
+    if bm not in {"scheduled", "signal"}:
+        bm = "scheduled"
+    st.session_state["new.buy_mode"] = bm
+    try:
+        st.session_state["new.max_buys_per_gate"] = int(float(_pick("max_buys_per_gate", default=0) or 0))
+    except Exception:
+        st.session_state["new.max_buys_per_gate"] = 0
+
 
     try:
         # Normalize legacy / friendly inputs (keep imports resilient).
@@ -1285,6 +1423,11 @@ Schedules
 - deposit_amount_usd: number (>= 0)
 - buy_freq: "none" | "daily" | "weekly" | "monthly"
 - buy_amount_usd: number (>= 0)
+- buy_mode: "scheduled" | "signal"
+- max_buys_per_gate: integer (0 = unlimited; signal mode only)
+  Notes:
+  - scheduled: buy attempts happen only on the buy schedule; the gate can veto.
+  - signal: gate decides when we are in "accumulate mode"; while gate is true, buys can fire on any bar but are spaced by buy_freq (cooldown).
 
 Entry gate
 - entry_mode: "simple" | "builder"
@@ -1385,6 +1528,8 @@ def _collect_dca_plan_state():
             "deposit_amount_usd": _to_float(g("new.deposit_amount", bp.get("deposit_amount_usd", 50.0)), bp.get("deposit_amount_usd", 50.0)),
             "buy_freq": g("new.buy_freq", bp.get("buy_freq", "weekly")),
             "buy_amount_usd": _to_float(g("new.buy_amount", bp.get("buy_amount_usd", 50.0)), bp.get("buy_amount_usd", 50.0)),
+            "buy_mode": g("new.buy_mode", bp.get("buy_mode", "scheduled")),
+            "max_buys_per_gate": _to_int(g("new.max_buys_per_gate", bp.get("max_buys_per_gate", 0)), bp.get("max_buys_per_gate", 0)),
             "entry_mode": entry_mode,
             "buy_filter": g("new.buy_filter", bp.get("buy_filter", "none")),
             "ema_len": _to_int(g("new.ema_len", bp.get("ema_len", 200)), bp.get("ema_len", 200)),
@@ -1481,6 +1626,8 @@ def _apply_dca_plan_blueprint(bp: dict) -> None:
     ss["new.deposit_amount"] = _to_float(bp.get("deposit_amount_usd", ss.get("new.deposit_amount", 50.0)), ss.get("new.deposit_amount", 50.0))
     ss["new.buy_freq"] = bp.get("buy_freq", ss.get("new.buy_freq", "weekly"))
     ss["new.buy_amount"] = _to_float(bp.get("buy_amount_usd", ss.get("new.buy_amount", 50.0)), ss.get("new.buy_amount", 50.0))
+    ss["new.buy_mode"] = str(bp.get("buy_mode", ss.get("new.buy_mode", "scheduled")) or "scheduled").lower().strip()
+    ss["new.max_buys_per_gate"] = _to_int(bp.get("max_buys_per_gate", ss.get("new.max_buys_per_gate", 0)), ss.get("new.max_buys_per_gate", 0))
 
     # Entry mode: store the UI label (the radio uses labels)
     entry_mode = str(bp.get("entry_mode", "simple")).lower().strip()
@@ -3858,6 +4005,748 @@ def _human_entry_logic(entry_logic: Dict[str, Any]) -> str:
 
     return " · ".join([p for p in parts if p.strip()])
 
+# =============================================================================
+# Entry gate UX helpers (plain-English + sanity widgets)
+# =============================================================================
+
+def _entry_logic_required_columns(entry_logic: Dict[str, Any]) -> List[str]:
+    """Return required df_feat columns for this entry_logic (best-effort)."""
+    need: set[str] = set()
+
+    def _add(name: Any) -> None:
+        nm = str(name or "").strip()
+        if not nm:
+            return
+        if nm.lower() in {"open", "high", "low", "close", "volume", "vol"}:
+            return
+        need.add(nm)
+
+    if not isinstance(entry_logic, dict):
+        return []
+
+    for c in (entry_logic.get("regime") or []):
+        if isinstance(c, dict):
+            _add(c.get("indicator") or c.get("feature") or c.get("lhs"))
+            _add(c.get("ref_indicator") or c.get("rhs") or c.get("rhs_indicator"))
+    for cl in (entry_logic.get("clauses") or []):
+        for c in (cl or []):
+            if isinstance(c, dict):
+                _add(c.get("indicator") or c.get("feature") or c.get("lhs"))
+                _add(c.get("ref_indicator") or c.get("rhs") or c.get("rhs_indicator"))
+
+    return sorted(list(need))
+
+
+def _cond_signature(cond: Dict[str, Any]) -> Optional[Tuple[str, str, str, Any]]:
+    if not isinstance(cond, dict):
+        return None
+    ind = str(cond.get("indicator") or cond.get("feature") or cond.get("lhs") or "").strip()
+    op = str(cond.get("operator") or cond.get("op") or "").strip()
+    ref = str(cond.get("ref_indicator") or cond.get("rhs") or cond.get("rhs_indicator") or "").strip()
+    thr = cond.get("threshold", cond.get("value", 0.0))
+    if not ind or not op:
+        return None
+    try:
+        thr_v = float(thr)
+        # stable-ish signature
+        thr_v = round(thr_v, 6)
+        thr_key: Any = thr_v
+    except Exception:
+        thr_key = str(thr)
+    return (ind, op, ref, thr_key)
+
+
+def _find_duplicate_conditions(conds: List[Dict[str, Any]]) -> List[str]:
+    """Return human-readable duplicate condition strings within a list."""
+    seen: Dict[Tuple[str, str, str, Any], Tuple[int, str]] = {}
+    dups: List[str] = []
+    for c in (conds or []):
+        sig = _cond_signature(c)
+        if sig is None:
+            continue
+        txt = _human_condition(c) or "condition"
+        if sig not in seen:
+            seen[sig] = (1, txt)
+        else:
+            cnt, txt0 = seen[sig]
+            seen[sig] = (cnt + 1, txt0)
+    for sig, (cnt, txt0) in seen.items():
+        if cnt > 1:
+            dups.append(f"{txt0} (×{cnt})")
+    return dups
+
+
+def _plain_condition(cond: Dict[str, Any]) -> str:
+    """Translate a condition into a more human phrase (best-effort)."""
+    if not isinstance(cond, dict):
+        return ""
+    ind = str(cond.get("indicator") or cond.get("feature") or cond.get("lhs") or "").strip()
+    op = str(cond.get("operator") or cond.get("op") or "").strip()
+    thr = cond.get("threshold", cond.get("value", 0.0))
+    ref = str(cond.get("ref_indicator") or cond.get("rhs") or cond.get("rhs_indicator") or "").strip()
+
+    def _fmt_thr(x: Any) -> str:
+        try:
+            v = float(x)
+            if abs(v - round(v)) < 1e-9:
+                return str(int(round(v)))
+            # common compact formatting
+            if abs(v) >= 10:
+                return f"{v:.0f}"
+            if abs(v) >= 1:
+                return f"{v:.2f}"
+            return f"{v:.3f}"
+        except Exception:
+            return str(x)
+
+    # Special cases we actually offer in the UI
+    if ind.lower() == "close" and ref.startswith("ema_") and op in {"<", "<=", ">", ">="}:
+        try:
+            ema_len = int(ref.split("_")[1])
+        except Exception:
+            ema_len = ref.replace("ema_", "")
+        direction = "below" if op in {"<", "<="} else "above"
+        return f"Price is {direction} EMA{ema_len}"
+
+    if ind == "rsi_14" and op in {"<", "<="}:
+        return f"RSI(14) is oversold (≤ {_fmt_thr(thr)})"
+    if ind == "rsi_14" and op in {">", ">="}:
+        return f"RSI(14) is strong (≥ {_fmt_thr(thr)})"
+
+    if ind == "bb_z_20" and op in {"<", "<="}:
+        return f"Price is stretched low (BB z-score ≤ {_fmt_thr(thr)})"
+    if ind == "bb_z_20" and op in {">", ">="}:
+        return f"Price is stretched high (BB z-score ≥ {_fmt_thr(thr)})"
+
+    if ind.startswith("macd_hist") and op in {">", ">="}:
+        return f"Momentum is bullish (MACD hist ≥ {_fmt_thr(thr)})"
+    if ind.startswith("macd_hist") and op in {"<", "<="}:
+        return f"Momentum is bearish (MACD hist ≤ {_fmt_thr(thr)})"
+
+    if ind == "adx_14" and op in {">", ">="}:
+        return f"Trend strength is high (ADX ≥ {_fmt_thr(thr)})"
+    if ind == "adx_14" and op in {"<", "<="}:
+        return f"Trend strength is low (ADX ≤ {_fmt_thr(thr)})"
+
+    if ind == "donch_pos_20" and op in {"<", "<="}:
+        return f"Price is near range low (Donchian pos ≤ {_fmt_thr(thr)})"
+    if ind == "donch_pos_20" and op in {">", ">="}:
+        return f"Price is near range high (Donchian pos ≥ {_fmt_thr(thr)})"
+
+    # Fallback
+    return _human_condition(cond) or "condition"
+
+
+def _entry_logic_plain_english(entry_logic: Dict[str, Any]) -> str:
+    """Return a short, plain-English explanation of the gate."""
+    if not isinstance(entry_logic, dict):
+        return ""
+
+    reg = [c for c in (entry_logic.get("regime") or []) if isinstance(c, dict)]
+    clauses = [cl for cl in (entry_logic.get("clauses") or []) if isinstance(cl, list) and len([c for c in cl if isinstance(c, dict)]) > 0]
+
+    parts: List[str] = []
+    if reg:
+        reg_txt = " and ".join([_plain_condition(c) for c in reg])
+        parts.append(f"Regime: only trade when {reg_txt}.")
+    else:
+        parts.append("Regime: none (always allowed).")
+
+    if not clauses:
+        parts.append("Triggers: none (buys are allowed whenever the regime is true).")  # consistent with engine semantics
+    else:
+        clause_bits = []
+        for i, cl in enumerate(clauses):
+            name = chr(65 + i)
+            ct = [c for c in cl if isinstance(c, dict)]
+            clause_txt = " and ".join([_plain_condition(c) for c in ct])
+            clause_bits.append(f"Clause {name}: {clause_txt}")
+        parts.append("Triggers: the buy window opens when ANY clause is true (OR). ")
+        parts.extend([f"- {x}" for x in clause_bits])
+
+    return "\n".join(parts).strip()
+
+
+def _gate_strip_html(bits: List[bool]) -> str:
+    """Render a tiny truth strip (left→right = older→newer)."""
+    import html as _html
+    if not bits:
+        return ""
+    sqs = []
+    for b in bits:
+        col = "rgba(46, 204, 113, 0.65)" if bool(b) else "rgba(49,51,63,0.18)"
+        sqs.append(f"<span style='display:inline-block;width:9px;height:9px;border-radius:3px;margin-right:2px;background:{col};'></span>")
+    return "<div style='display:flex; align-items:center; gap:8px; flex-wrap:wrap;'>" + "<span>" + "".join(sqs) + "</span></div>"
+
+def _gate_logic_tree_html(entry_logic: Dict[str, Any], snap: Optional[Dict[str, Any]] = None) -> str:
+    """
+    Lightweight visual "tree" for the gate: Regime (AND) + Trigger clauses (OR-of-AND).
+
+    This is intentionally non-graphical (no SVG). It's a structured card layout that makes
+    the logic readable at a glance.
+    """
+    snap = snap or {}
+    regime = [c for c in (entry_logic.get("regime") or []) if isinstance(c, dict)]
+    clauses_raw = entry_logic.get("clauses") or []
+    clauses: List[List[Dict[str, Any]]] = []
+    for cl in clauses_raw:
+        if isinstance(cl, list):
+            clauses.append([c for c in cl if isinstance(c, dict)])
+
+    gate_now = snap.get("gate_now", None)
+    blocker = str(snap.get("blocker_now") or "")
+    cov = snap.get("coverage_pct", None)
+    bits = snap.get("bits") or []
+
+    # Which clause(s) are currently triggering (best-effort parse of snapshot text).
+    triggered: set[str] = set()
+    try:
+        m = re.search(r"Gate is true\s*\(clause\s*([A-Z,\s]+)\)", blocker)
+        if m:
+            for tok in m.group(1).replace(",", " ").split():
+                if len(tok) == 1 and tok.isalpha():
+                    triggered.add(tok.upper())
+        if not triggered:
+            m2 = re.search(r"Triggered\s*\(clause\s*([A-Z])\)", blocker)
+            if m2:
+                triggered.add(m2.group(1).upper())
+    except Exception:
+        triggered = set()
+
+    def chip(text: str, cls: str = "") -> str:
+        return f"<span class='ff-gate-chip {cls}'>{_escape_html(text)}</span>"
+
+    def cond_chip(text: str) -> str:
+        return f"<span class='ff-gate-cond'>{_escape_html(text)}</span>"
+
+    meta_bits: List[str] = []
+    if gate_now is True:
+        meta_bits.append(chip("Now: TRUE", "on"))
+    elif gate_now is False:
+        meta_bits.append(chip("Now: FALSE", "off"))
+    else:
+        meta_bits.append(chip("Now: —", "info"))
+
+    if isinstance(cov, (int, float)) and math.isfinite(float(cov)):
+        meta_bits.append(chip(f"Coverage: {float(cov):.1f}%", "info"))
+
+    # Regime box
+    if regime:
+        reg_items = "".join([cond_chip(_plain_condition(c)) for c in regime])
+        reg_sub = "All must be true (AND)"
+    else:
+        reg_items = cond_chip("No regime conditions (always in regime)")
+        reg_sub = "Always-on regime"
+
+    reg_box = (
+        "<div class='ff-gate-box regime'>"
+        "<div class='hdr'><div class='t'>Regime</div><div class='k'>AND</div></div>"
+        f"<div class='sub'>{_escape_html(reg_sub)}</div>"
+        f"<div class='ff-gate-conds'>{reg_items}</div>"
+        "</div>"
+    )
+
+    # Triggers box (clauses)
+    if clauses:
+        clause_boxes = []
+        for i, cl in enumerate(clauses):
+            letter = chr(ord("A") + i)
+            on = "on" if letter in triggered else ""
+            if cl:
+                items = "".join([cond_chip(_plain_condition(c)) for c in cl])
+            else:
+                items = cond_chip("Empty clause (will never trigger)")
+            clause_boxes.append(
+                "<div class='ff-clause {on}'>"
+                "<div class='ct'><span>Clause {letter}</span><span class='mode'>AND</span></div>"
+                "<div class='ff-gate-conds'>{items}</div>"
+                "</div>".format(on=on, letter=letter, items=items)
+            )
+        trig_box_body = "<div class='ff-clause-grid'>" + "".join(clause_boxes) + "</div>"
+        trig_sub = "Any clause can trigger (OR). Inside a clause, all conditions must be true (AND)."
+    else:
+        trig_box_body = "<div class='ff-gate-conds'>" + cond_chip("No trigger clauses (gate depends only on regime)") + "</div>"
+        trig_sub = "No triggers configured"
+
+    trig_box = (
+        "<div class='ff-gate-box triggers'>"
+        "<div class='hdr'><div class='t'>Triggers</div><div class='k'>OR</div></div>"
+        f"<div class='sub'>{_escape_html(trig_sub)}</div>"
+        f"{trig_box_body}"
+        "</div>"
+    )
+
+    # Result
+    res_cls = "on" if gate_now is True else ("off" if gate_now is False else "")
+    res_text = "TRUE" if gate_now is True else ("FALSE" if gate_now is False else "—")
+    why = blocker.strip()
+    why_line = f"<div class='sub'>{_escape_html(why)}</div>" if why else "<div class='sub'>—</div>"
+    res_box = (
+        f"<div class='ff-gate-box result {res_cls}'>"
+        "<div class='hdr'><div class='t'>Gate</div><div class='k'>Now</div></div>"
+        f"<div class='sub'>Now: <b>{_escape_html(res_text)}</b></div>"
+        f"{why_line}"
+        "</div>"
+    )
+
+    foot = (
+        "<div class='ff-gate-foot'>"
+        "<b>Rule:</b> Buy allowed when <b>(Regime is true)</b> AND <b>(any Trigger clause is true)</b>. "
+        "This is a mechanics preview, not a performance estimate."
+        "</div>"
+    )
+    # Coverage snapshots (Early / Middle / Late), 30 bars each (sanity check, not performance)
+    snapshots_html = ""
+    try:
+        snaps = snap.get("snapshots") or []
+        if snaps:
+            rows = []
+            for s in snaps:
+                nm = str(s.get("name") or "")
+                bits_s = s.get("bits") or []
+                tn = int(s.get("true") or 0)
+                nn = int(s.get("n") or 0)
+                pct = s.get("pct")
+                stat = f"{tn}/{nn}"
+                try:
+                    if isinstance(pct, (int, float)) and math.isfinite(float(pct)):
+                        stat = f"{tn}/{nn} ({float(pct):.0f}%)"
+                except Exception:
+                    pass
+                strip = _gate_strip_html([bool(b) for b in bits_s]) if bits_s else ""
+                rows.append(
+                    "<div style='display:flex; align-items:center; gap:8px; margin:4px 0;'>"
+                    f"<div style='width:52px; font-size:0.74rem; opacity:0.65;'>{_escape_html(nm)}</div>"
+                    + strip
+                    + f"<div style='width:88px; text-align:right; font-size:0.74rem; opacity:0.65; white-space:nowrap; font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;'>{_escape_html(stat)}</div>"
+                    + "</div>"
+                )
+            title = "<div style='font-size:0.74rem; opacity:0.60; margin-top:6px; margin-bottom:2px;'><b>How often the gate opens (train)</b> — Early / Mid / Late</div><div style='font-size:0.70rem; opacity:0.55; margin-bottom:4px;'>30-bar windows (frequency only).</div>"
+            snapshots_html = "<div class='ff-gate-snapshots'>" + title + "<div>" + "".join(rows) + "</div></div>"
+    except Exception:
+        snapshots_html = ""
+
+
+
+    return (
+        "<div class='ff-gate-tree-wrap'>"
+        "<div class='ff-gate-meta'>" + "".join(meta_bits) + "</div>"
+        + snapshots_html
+        + "<div class='ff-gate-tree'>"
+        f"{reg_box}<div class='ff-gate-join'>AND</div>{trig_box}<div class='ff-gate-join'>→</div>{res_box}"
+        "</div>"
+        f"{foot}"
+        "</div>"
+    )
+
+
+
+def _entry_logic_snapshot(
+    df_feat: Optional[pd.DataFrame],
+    entry_logic: Dict[str, Any],
+    *,
+    train_frac: float = 0.70,
+    lookback: int = 30,
+) -> Dict[str, Any]:
+    """Compute a non-performance sanity snapshot for the gate (train slice only)."""
+    out: Dict[str, Any] = {
+        "ok": False,
+        "missing": [],
+        "gate_now": None,
+        "blocker_now": "",
+        "bits": [],
+        "true_count": 0,
+        "lookback": 0,
+        "coverage_pct": None,
+        "snapshots": [],
+        "note": "",
+    }
+
+    if df_feat is None or df_feat.empty:
+        out["note"] = "No dataset loaded."
+        return out
+
+    try:
+        n = int(len(df_feat))
+        n_train = int(max(1, round(n * float(train_frac))))
+        df_cov = df_feat.iloc[:n_train].copy()
+    except Exception:
+        out["note"] = "Could not slice dataset."
+        return out
+
+    missing = [c for c in _entry_logic_required_columns(entry_logic) if c not in df_cov.columns]
+    if missing:
+        out["missing"] = missing
+        out["note"] = "Missing required fields for gate diagnostics."
+        return out
+
+    masks = _entry_logic_masks(df_cov, entry_logic)
+    if masks is None:
+        out["note"] = "Could not compute gate masks (invalid condition or missing columns)."
+        return out
+
+    r_mask, e_mask, c_mask = masks
+    try:
+        out["coverage_pct"] = float(c_mask.mean() * 100.0)
+    except Exception:
+        pass
+
+    # Gate now (last bar in train slice)
+    try:
+        gate_now = bool(c_mask.iloc[-1])
+        out["gate_now"] = gate_now
+
+        if not gate_now:
+            # Regime blocker?
+            reg = [c for c in (entry_logic.get("regime") or []) if isinstance(c, dict)]
+            for c in reg:
+                cm = _cond_mask(df_cov, c)
+                if cm is None:
+                    continue
+                if not bool(cm.iloc[-1]):
+                    out["blocker_now"] = f"Blocked by regime: {_plain_condition(c)}"
+                    break
+            if not out["blocker_now"]:
+                out["blocker_now"] = "Blocked by triggers: no clause is satisfied"
+        else:
+            # Which clause(s) are true right now?
+            try:
+                cls = entry_logic.get("clauses") or []
+                trigs: List[str] = []
+                for i, cl in enumerate(cls):
+                    if not cl:
+                        continue
+                    cm_all = pd.Series(True, index=df_cov.index)
+                    ok = True
+                    for c in (cl or []):
+                        if not isinstance(c, dict):
+                            continue
+                        cm = _cond_mask(df_cov, c)
+                        if cm is None:
+                            ok = False
+                            break
+                        cm_all &= cm
+                    if ok and bool(cm_all.iloc[-1]):
+                        trigs.append(chr(65 + i))
+                if trigs:
+                    out["blocker_now"] = "Gate is true (clause " + ", ".join(trigs) + ")"
+                else:
+                    out["blocker_now"] = "Gate is true"
+            except Exception:
+                out["blocker_now"] = "Gate is true"
+    except Exception:
+        pass
+
+    # Last-N strip (train slice)
+    try:
+        lb = int(max(1, lookback))
+        tail = c_mask.iloc[-lb:]
+        bits = [bool(x) for x in tail.values.tolist()]
+        out["bits"] = bits
+        out["true_count"] = int(sum(bits))
+        out["lookback"] = int(len(bits))
+    except Exception:
+        pass
+
+
+    # Early / middle / late snapshots (train slice). Sanity check: "how often is the gate true" across time.
+    # This is NOT a performance estimate.
+    try:
+        w_snap = int(max(1, lookback))
+        w_snap = int(min(w_snap, len(c_mask)))
+        if w_snap >= 5:
+            c_arr = np.asarray(c_mask.values, dtype=bool)
+            n_tr = int(len(c_arr))
+
+            # Early = last w bars of the first third (avoids indicator warmup bias at the very beginning)
+            third_end = int(max(w_snap, n_tr // 3))
+            third_end = int(min(n_tr, third_end))
+            early = c_arr[int(max(0, third_end - w_snap)) : third_end]
+
+            # Middle = centered window
+            mid_center = n_tr // 2
+            mid_start = int(max(0, min(n_tr - w_snap, mid_center - (w_snap // 2))))
+            middle = c_arr[mid_start : mid_start + w_snap]
+
+            # Late = last w bars
+            late = c_arr[-w_snap:]
+
+            def _mk(name: str, arr: np.ndarray) -> Dict[str, Any]:
+                n0 = int(len(arr))
+                t0 = int(arr.sum())
+                pct0 = float((t0 / float(n0)) * 100.0) if n0 > 0 else None
+                return {"name": name, "n": n0, "true": t0, "pct": pct0, "bits": [bool(x) for x in arr.tolist()]}
+
+            out["snapshots"] = [_mk("Early", early), _mk("Mid", middle), _mk("Late", late)]
+    except Exception:
+        pass
+
+    out["ok"] = True
+    return out
+
+
+
+
+def _cond_from_state(prefix: str, ss: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    # Reconstruct a builder condition from st.session_state (no UI).
+    try:
+        cond_type = str(ss.get(f"{prefix}.type", "— (disabled)") or "— (disabled)")
+    except Exception:
+        cond_type = "— (disabled)"
+    if not cond_type or cond_type.startswith("—"):
+        return None
+
+    def _op(default: str) -> str:
+        v = ss.get(f"{prefix}.op", default)
+        return str(v or default)
+
+    def _thr(default: float) -> float:
+        try:
+            return float(ss.get(f"{prefix}.thr", default))
+        except Exception:
+            return float(default)
+
+    if cond_type == "price_vs_ema":
+        op = _op("<=")
+        try:
+            ln = int(ss.get(f"{prefix}.ema_len", 200))
+        except Exception:
+            ln = 200
+        return {"indicator": "close", "operator": op, "ref_indicator": f"ema_{ln}", "threshold": 0.0}
+
+    if cond_type == "rsi_14":
+        return {"indicator": "rsi_14", "operator": _op("<="), "threshold": _thr(40.0)}
+
+    if cond_type == "bb_z_20":
+        return {"indicator": "bb_z_20", "operator": _op("<="), "threshold": _thr(-1.0)}
+
+    if cond_type == "macd_hist_12_26_9":
+        op = _op(">=")
+        return {"indicator": "macd_hist_12_26_9", "operator": op, "threshold": _thr(0.0)}
+
+    if cond_type == "adx_14":
+        op = _op(">=")
+        return {"indicator": "adx_14", "operator": op, "threshold": _thr(20.0)}
+
+    if cond_type == "donch_pos_20":
+        return {"indicator": "donch_pos_20", "operator": _op("<="), "threshold": _thr(0.20)}
+
+    return None
+
+
+def _entry_logic_from_builder_state(ss: Dict[str, Any]) -> Dict[str, Any]:
+    # Best-effort reconstruction of entry_logic from the builder's session_state keys.
+    reg_conds: List[Dict[str, Any]] = []
+    clauses: List[List[Dict[str, Any]]] = []
+
+    reg_ids = list(ss.get("new.logic.regime_ids") or [])
+    for rid in reg_ids:
+        c = _cond_from_state(f"new.regime.{rid}", ss)
+        if c:
+            reg_conds.append(c)
+
+    clause_ids = list(ss.get("new.logic.clause_ids") or [])
+    for cid in clause_ids:
+        cond_ids = list(ss.get(f"new.logic.clause.{cid}.cond_ids") or [])
+        cl: List[Dict[str, Any]] = []
+        for cond_id in cond_ids:
+            c = _cond_from_state(f"new.clause.{cid}.{cond_id}", ss)
+            if c:
+                cl.append(c)
+        if cl:
+            clauses.append(cl)
+
+    return {"regime": reg_conds, "clauses": clauses}
+
+
+def _render_skill_build_header(slot, *, df_feat: Optional[pd.DataFrame]) -> None:
+    # Game-style 'skill build' header: cards + flow + stepper. Mechanics-only (no perf claims).
+    ss = st.session_state
+    ss.setdefault("build.active_module", "funding")
+    ss.setdefault("build.active_modifier", "")
+
+    # Pull current UI values (best-effort defaults)
+    deposit_freq = str(ss.get("new.deposit_freq", "none") or "none").lower()
+    deposit_amt = float(ss.get("new.deposit_amount", 0.0) or 0.0)
+
+    buy_mode = str(ss.get("new.buy_mode", "scheduled") or "scheduled").strip().lower()
+    buy_freq = str(ss.get("new.buy_freq", "weekly") or "weekly").strip().lower()
+    buy_amt = float(ss.get("new.buy_amount", 0.0) or 0.0)
+    max_buys_per_gate = int(float(ss.get("new.max_buys_per_gate", 0) or 0))
+
+    entry_mode = str(ss.get("new.entry_mode", "Simple (one filter)") or "Simple (one filter)")
+    buy_filter = str(ss.get("new.buy_filter", "none") or "none").strip().lower()
+
+    max_alloc_pct = float(ss.get("new.max_alloc_pct", 1.0) or 1.0)
+
+    sl_ui = float(ss.get("new.sl_pct_ui", 0.0) or 0.0)
+    tp_ui = float(ss.get("new.tp_pct_ui", 0.0) or 0.0)
+    trail_ui = float(ss.get("new.trail_pct_ui", 0.0) or 0.0)
+    max_hold = int(ss.get("new.max_hold_bars", 0) or 0)
+
+    # Effective entry_logic for diagnostics
+    if str(entry_mode).startswith("Simple"):
+        eff_logic = _simple_filter_to_entry_logic(buy_filter)
+    else:
+        eff_logic = _entry_logic_from_builder_state(ss)
+
+    snap = _entry_logic_snapshot(df_feat, eff_logic, train_frac=0.70, lookback=30) if df_feat is not None else {"ok": False}
+    cov = snap.get("coverage_pct") if isinstance(snap, dict) else None
+    gate_now = snap.get("gate_now") if isinstance(snap, dict) else None
+    blocker_now = str(snap.get("blocker_now") or "") if isinstance(snap, dict) else ""
+
+    band = ""
+    try:
+        if cov is not None and float(cov) == float(cov):
+            _c = float(cov)
+            if _c < 5:
+                band = "Rare"
+            elif _c < 40:
+                band = "Moderate"
+            elif _c < 90:
+                band = "Frequent"
+            else:
+                band = "Always-on"
+    except Exception:
+        band = ""
+
+    # Labels
+    fund_label = "Off" if (deposit_freq == "none" or deposit_amt <= 0) else f"{deposit_freq} · ${int(round(deposit_amt))}"
+    if buy_amt <= 0:
+        buy_label = "Off"
+    else:
+        core = f"{buy_freq} · ${int(round(buy_amt))}"
+        if buy_mode == "signal":
+            core = f"≤ {core}"
+            if max_buys_per_gate > 0:
+                core = f"{core} · max {max_buys_per_gate}"
+        buy_label = core
+
+    FILTER_LABELS = {
+        "none": "Always buy",
+        "below_ema": "Below EMA",
+        "rsi_below": "RSI low",
+        "bb_z_below": "BB stretch",
+        "macd_bull": "MACD bullish",
+        "adx_above": "ADX strong",
+        "donch_pos_below": "Donch bottom",
+    }
+    if str(entry_mode).startswith("Simple"):
+        gate_label = FILTER_LABELS.get(buy_filter, str(buy_filter))
+    else:
+        r_n = len((eff_logic or {}).get("regime") or [])
+        c_n = len((eff_logic or {}).get("clauses") or [])
+        gate_label = (f"{r_n} regime · {c_n} clause" + ("s" if c_n != 1 else "")) if (r_n or c_n) else "Always buy"
+
+    cov_label = ""
+    try:
+        if cov is not None and float(cov) == float(cov):
+            cov_label = f"{float(cov):.1f}% ({band})"
+    except Exception:
+        cov_label = ""
+
+    alloc_label = "No cap" if max_alloc_pct >= 0.999 else f"Max {int(round(max_alloc_pct*100))}%"
+
+    sl_label = "Off" if sl_ui <= 0 else f"{sl_ui:.1f}%"
+    tp_label = "Off" if tp_ui <= 0 else f"{tp_ui:.1f}%"
+    tr_label = "Off" if trail_ui <= 0 else f"{trail_ui:.1f}%"
+    tm_label = "Off" if max_hold <= 0 else f"{max_hold} bars"
+
+    # Warnings (purely mechanical)
+    warn_gate = False
+    warn_text = ""
+    try:
+        always_gate = bool(str(entry_mode).startswith("Simple") and buy_filter in {"none", ""}) or (
+            (not str(entry_mode).startswith("Simple"))
+            and len((eff_logic or {}).get("regime") or []) == 0
+            and len((eff_logic or {}).get("clauses") or []) == 0
+        )
+        if buy_mode == "signal" and always_gate and buy_amt > 0 and max_buys_per_gate == 0:
+            warn_gate = True
+            warn_text = "Behaves like continuous DCA (gate always true + unlimited buys/window)."
+    except Exception:
+        pass
+
+    active_module = str(ss.get("build.active_module") or "funding")
+    active_mod = str(ss.get("build.active_modifier") or "")
+
+    with slot.container():
+        st.markdown("### Strategy build")
+        st.caption("Game-style loadout view (read-only). Mechanics-only (not advice).")
+
+        cards = [
+            ("Funding", fund_label, "Adds cash to the pile.", "econ", "funding", ""),
+            ("Buy trigger", buy_label, "When buys can attempt.", "trigger", "buys", ""),
+            ("Gate", (gate_label + (f" · {cov_label}" if cov_label else "")), "Permission to buy.", "gate", "entry", ""),
+            ("Allocation cap", alloc_label, "Max exposure.", "alloc", "allocation", ""),
+            ("Stop loss", sl_label, "Cuts losses.", "risk", "risk", "stop_loss"),
+            ("Take profit", tp_label, "Harvests gains.", "risk", "risk", "take_profit"),
+            ("Trailing", tr_label, "Protects peak.", "risk", "risk", "trailing"),
+            ("Time stop", tm_label, "Exits after time.", "risk", "risk", "time_stop"),
+        ]
+
+        for r in range(2):
+            cols = st.columns(4, gap="small")
+            for j in range(4):
+                i = r * 4 + j
+                t, s, k, style, mod, sub = cards[i]
+                is_active = False  # header is read-only
+                cls = f"ff-skill-card ff-skill-{style}"
+                if str(s).strip().lower() in {"off", "no cap"} and not is_active:
+                    cls += " off"
+                if t == "Gate" and warn_gate:
+                    cls += " warn"
+                cols[j].markdown(
+                    f"<div class='{cls}'>"
+                    f"<div class='t'>{_escape_html(str(t))}</div>"
+                    f"<div class='s'>{_escape_html(str(s))}</div>"
+                    f"<div class='k'>{_escape_html(str(k))}</div>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
+        if warn_text:
+            st.warning(warn_text)
+
+        gate_now_txt = "Unknown"
+        if gate_now is True:
+            gate_now_txt = "TRUE"
+        elif gate_now is False:
+            gate_now_txt = "FALSE"
+
+        exits = []
+        if sl_ui > 0:
+            exits.append(f"SL {sl_ui:.1f}%")
+        if tp_ui > 0:
+            exits.append(f"TP {tp_ui:.1f}%")
+        if trail_ui > 0:
+            exits.append(f"Trail {trail_ui:.1f}%")
+        if max_hold > 0:
+            exits.append(f"Time {max_hold}b")
+
+        pieces = []
+        pieces.append(f"Mode: {'Gate-driven' if buy_mode == 'signal' else 'Scheduled'}")
+        pieces.append(f"Buy: {buy_label}")
+        if cov_label:
+            pieces.append(f"Gate coverage: {cov_label}")
+        pieces.append(f"Cap: {alloc_label}")
+        pieces.append("Exits: " + (", ".join(exits) if exits else "Off"))
+        pieces.append(f"Gate now: {gate_now_txt}")
+
+        st.markdown(
+            "<div class='ff-build-summary'>"
+            + " ".join([f"<span class='ff-summary-chip'>{_escape_html(p)}</span>" for p in pieces])
+            + "</div>",
+            unsafe_allow_html=True,
+        )
+
+        # Gate logic (visual): shown whenever the Logic Builder is selected.
+        if not str(entry_mode).startswith("Simple"):
+            st.markdown("##### Gate logic (visual)")
+            st.markdown(_gate_logic_tree_html(eff_logic, snap), unsafe_allow_html=True)
+
+    
+
 
 
 def build_dca_baseline_params() -> Dict[str, Any]:
@@ -3877,12 +4766,15 @@ def build_dca_baseline_params() -> Dict[str, Any]:
         except Exception:
             df_feat = None
 
+    # Skill build header (cards + flow)
+    _render_skill_build_header(header_slot, df_feat=df_feat)
+
     build_atr_med = None
 
     # -------------------------
-    # Loadout (left) + preview (right)
+    # Loadout (single-column)
     # -------------------------
-    colL, colR = st.columns([0.62, 0.38], gap="large")
+    colL = st.container()
 
     # Defaults for legacy knobs (used in simple mode and as defaults in the builder)
     buy_filter = "none"
@@ -3959,6 +4851,7 @@ def build_dca_baseline_params() -> Dict[str, Any]:
         # -------------------------
         # Funding module
         # -------------------------
+        st.markdown("<div class='ff-module ff-module-econ " + ("active" if active_module == "funding" else "") + "'>", unsafe_allow_html=True)
         with st.container():
             top_a, top_b = st.columns([0.62, 0.38])
             with top_a:
@@ -3986,21 +4879,42 @@ def build_dca_baseline_params() -> Dict[str, Any]:
 
             fund_label = "Off" if (str(deposit_freq).lower() == "none" or float(deposit_amount) <= 0) else f"{deposit_freq} · ${int(round(float(deposit_amount)))}"
             fund_sum.markdown(f"<div style='text-align:right; font-weight:700'>{fund_label}</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
         # -------------------------
         # Buy cadence module
         # -------------------------
+        st.markdown("<div class='ff-module ff-module-trigger " + ("active" if active_module == "buys" else "") + "'>", unsafe_allow_html=True)
         with st.container():
             top_a, top_b = st.columns([0.62, 0.38])
             with top_a:
                 st.markdown("**Buy cadence**")
-                st.caption("Scheduled buys (subject to allocation + entry gate).")
+                _bm = str(st.session_state.get("new.buy_mode", "scheduled") or "scheduled").strip().lower()
+                if _bm == "signal":
+                    st.caption("Buys are driven by the entry gate; this sets the spacing between buys.")
+                else:
+                    st.caption("Buys attempt on a schedule (subject to allocation + entry gate).")
             with top_b:
                 buy_sum = st.empty()
 
             with st.expander("Configure", expanded=(active_module == "buys")):
+                buy_mode = st.radio(
+                    "Buy trigger",
+                    options=["scheduled", "signal"],
+                    format_func=lambda x: "Buy on schedule" if x == "scheduled" else "Buy while gate is true",
+                    horizontal=True,
+                    key="new.buy_mode",
+                )
+
+                if str(buy_mode).strip().lower() == "signal":
+                    freq_label = "Max buy frequency (cooldown)"
+                    st.caption("While the gate is true, buys can happen on any day — but not more often than this.")
+                else:
+                    freq_label = "Buy frequency"
+                    st.caption("The strategy only attempts buys on this schedule; the gate can veto the attempt.")
+
                 buy_freq = st.selectbox(
-                    "Buy frequency",
+                    freq_label,
                     options=["daily", "weekly", "monthly"],
                     index=1,
                     key="new.buy_freq",
@@ -4013,17 +4927,44 @@ def build_dca_baseline_params() -> Dict[str, Any]:
                     key="new.buy_amount",
                 )
 
-            buy_label = f"{buy_freq} · ${int(round(float(buy_amount)))}" if float(buy_amount) > 0 else "Off"
+                if str(buy_mode).strip().lower() == "signal":
+                    st.number_input(
+                        "Max buys per signal window (0 = unlimited)",
+                        min_value=0,
+                        value=int(st.session_state.get("new.max_buys_per_gate", 0) or 0),
+                        step=1,
+                        key="new.max_buys_per_gate",
+                    )
+
+            # Canonical values (used later to build params + summary)
+            buy_mode = str(st.session_state.get("new.buy_mode", "scheduled") or "scheduled").strip().lower()
+            max_buys_per_gate = int(float(st.session_state.get("new.max_buys_per_gate", 0) or 0))
+
+            if float(buy_amount) <= 0:
+                buy_label = "Off"
+            else:
+                core = f"{buy_freq} · ${int(round(float(buy_amount)))}"
+                if buy_mode == "signal":
+                    core = f"≤ {core}"
+                    if max_buys_per_gate > 0:
+                        core = f"{core} · max {max_buys_per_gate}"
+                buy_label = core
+
             buy_sum.markdown(f"<div style='text-align:right; font-weight:700'>{buy_label}</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
         # -------------------------
-        # Entry gate module
+# Entry gate module
         # -------------------------
+        st.markdown("<div class='ff-module ff-module-gate " + ("active" if active_module == "entry" else "") + "'>", unsafe_allow_html=True)
         with st.container():
             top_a, top_b = st.columns([0.62, 0.38])
             with top_a:
                 st.markdown("**Entry gate**")
-                st.caption("Controls whether scheduled buys are allowed to fire. Mechanics only (not recommendations).")
+                if str(buy_mode).strip().lower() == "signal":
+                    st.caption("Controls when we are in accumulate mode. While true, buys may fire (spaced by your max frequency). Mechanics only (not recommendations).")
+                else:
+                    st.caption("Controls whether scheduled buy attempts are allowed to fire. Mechanics only (not recommendations).")
             with top_b:
                 gate_sum = st.empty()
 
@@ -4187,55 +5128,412 @@ def build_dca_baseline_params() -> Dict[str, Any]:
                 else:
                     st.caption("Builder: define a small set of gates (regime) and a few entry trigger clauses (any-of). Caps keep this auditable.")
 
+                    # Progressive builder state (show only what exists)
+                    if "new.logic.uid" not in st.session_state:
+                        st.session_state["new.logic.uid"] = 0
+                    if "new.logic.regime_ids" not in st.session_state:
+                        st.session_state["new.logic.regime_ids"] = []
+                    if "new.logic.clause_ids" not in st.session_state:
+                        st.session_state["new.logic.clause_ids"] = []
+
+                    def _new_uid() -> int:
+                        st.session_state["new.logic.uid"] = int(st.session_state.get("new.logic.uid", 0) or 0) + 1
+                        return int(st.session_state["new.logic.uid"])
+
+                    def _clear_keys_with_prefix(prefix: str) -> None:
+                        # Best-effort cleanup so removed items don't reappear when re-added.
+                        try:
+                            ks = [k for k in st.session_state.keys() if str(k).startswith(prefix)]
+                            for k in ks:
+                                del st.session_state[k]
+                        except Exception:
+                            pass
+
+                    shape_slot = st.empty()
+                    preview_slot = st.empty()
+                    plain_slot = st.empty()
+                    now_slot = st.empty()
+                    strip_slot = st.empty()
+                    snapshots_slot = st.empty()
+
                     reg_conds: List[Dict[str, Any]] = []
-                    with st.expander("Regime gates (0–2, AND)", expanded=True):
-                        c1 = _cond_ui("new.regime1")
-                        if c1:
-                            reg_conds.append(c1)
-                        c2 = _cond_ui("new.regime2")
-                        if c2:
-                            reg_conds.append(c2)
+                    reg_ids: List[int] = list(st.session_state.get("new.logic.regime_ids") or [])
+
+                    st.markdown("##### Regime gates (AND)")
+                    cols_r = st.columns([0.70, 0.30])
+                    with cols_r[0]:
+                        st.caption("All regime conditions must be true. Optional.")
+                    with cols_r[1]:
+                        if len(reg_ids) < 2:
+                            if st.button("+ Add regime condition", key="new.logic.add_regime"):
+                                reg_ids.append(_new_uid())
+                                st.session_state["new.logic.regime_ids"] = reg_ids
+                                st.rerun()
+
+                    if not reg_ids:
+                        st.caption("No regime filters (always in regime).")
+                    else:
+                        for i, rid in enumerate(list(reg_ids)):
+                            st.markdown(f"**Regime condition {i+1}**")
+                            ccols = st.columns([0.92, 0.08])
+                            with ccols[0]:
+                                c = _cond_ui(f"new.regime.{rid}")
+                            with ccols[1]:
+                                if st.button("✕", key=f"new.logic.rm_regime.{rid}"):
+                                    reg_ids = [x for x in reg_ids if x != rid]
+                                    st.session_state["new.logic.regime_ids"] = reg_ids
+                                    _clear_keys_with_prefix(f"new.regime.{rid}")
+                                    st.rerun()
+                            if c:
+                                reg_conds.append(c)
+
+                    st.divider()
+
+                    st.markdown("##### Trigger clauses (OR of AND)")
+                    cols_c = st.columns([0.70, 0.30])
+                    with cols_c[0]:
+                        st.caption("Any clause can trigger. Inside a clause, all conditions must be true.")
+                    with cols_c[1]:
+                        if len(st.session_state.get("new.logic.clause_ids") or []) < 3:
+                            if st.button("+ Add trigger clause", key="new.logic.add_clause"):
+                                cid = _new_uid()
+                                clause_ids = list(st.session_state.get("new.logic.clause_ids") or [])
+                                clause_ids.append(cid)
+                                st.session_state["new.logic.clause_ids"] = clause_ids
+                                st.session_state[f"new.logic.clause.{cid}.cond_ids"] = []
+                                st.rerun()
 
                     clauses: List[List[Dict[str, Any]]] = []
-                    with st.expander("Trigger clauses (1–3 clauses, OR-of-AND)", expanded=True):
-                        for i in range(1, 4):
-                            with st.container():
-                                st.markdown(f"**Clause {i}** (1–3 conditions, AND)")
-                                cl: List[Dict[str, Any]] = []
-                                c1 = _cond_ui(f"new.cl{i}.c1")
-                                if c1:
-                                    cl.append(c1)
-                                c2 = _cond_ui(f"new.cl{i}.c2")
-                                if c2:
-                                    cl.append(c2)
-                                c3 = _cond_ui(f"new.cl{i}.c3")
-                                if c3:
-                                    cl.append(c3)
-                                if cl:
-                                    clauses.append(cl)
+                    clause_ids: List[int] = list(st.session_state.get("new.logic.clause_ids") or [])
+
+                    if not clause_ids:
+                        st.caption("No trigger clauses yet. Add at least one clause + condition to make this gate do something.")
+                    else:
+                        for ci, cid in enumerate(list(clause_ids)):
+                            clause_name = chr(65 + ci)  # A/B/C
+                            hdr = st.columns([0.78, 0.22])
+                            with hdr[0]:
+                                st.markdown(f"**Clause {clause_name} (AND)**")
+                            with hdr[1]:
+                                if st.button("Remove clause", key=f"new.logic.rm_clause.{cid}"):
+                                    clause_ids = [x for x in clause_ids if x != cid]
+                                    st.session_state["new.logic.clause_ids"] = clause_ids
+                                    _clear_keys_with_prefix(f"new.clause.{cid}")
+                                    if f"new.logic.clause.{cid}.cond_ids" in st.session_state:
+                                        del st.session_state[f"new.logic.clause.{cid}.cond_ids"]
+                                    st.rerun()
+
+                            cond_ids_key = f"new.logic.clause.{cid}.cond_ids"
+                            cond_ids: List[int] = list(st.session_state.get(cond_ids_key) or [])
+
+                            cl: List[Dict[str, Any]] = []
+                            if not cond_ids:
+                                st.caption("No conditions yet.")
+                            for j, cond_id in enumerate(list(cond_ids)):
+                                st.markdown(f"Condition {j+1}")
+                                row = st.columns([0.92, 0.08])
+                                with row[0]:
+                                    c = _cond_ui(f"new.clause.{cid}.{cond_id}")
+                                with row[1]:
+                                    if st.button("✕", key=f"new.logic.rm_cond.{cid}.{cond_id}"):
+                                        cond_ids = [x for x in cond_ids if x != cond_id]
+                                        st.session_state[cond_ids_key] = cond_ids
+                                        _clear_keys_with_prefix(f"new.clause.{cid}.{cond_id}")
+                                        st.rerun()
+                                if c:
+                                    cl.append(c)
+
+                            # Duplicate condition check (within this clause)
+                            try:
+                                dups = _find_duplicate_conditions(cl)
+                                if dups:
+                                    st.warning("Duplicate conditions in this clause (redundant): " + "; ".join(dups))
+                            except Exception:
+                                pass
+
+                            if len(cond_ids) < 3:
+                                if st.button("+ Add condition", key=f"new.logic.add_cond.{cid}"):
+                                    cond_ids.append(_new_uid())
+                                    st.session_state[cond_ids_key] = cond_ids
+                                    st.rerun()
+
+                            if cl:
+                                clauses.append(cl)
+
+                            if ci < (len(clause_ids) - 1):
+                                st.markdown("<div style='text-align:center; font-weight:800; opacity:0.65; margin: 6px 0;'>OR</div>", unsafe_allow_html=True)
                                 st.divider()
 
                     if not clauses:
                         st.warning("No trigger clause is enabled yet. Add at least one condition to at least one clause.")
+
                     entry_logic = {"regime": reg_conds, "clauses": clauses}
 
-                    if df_feat is not None and not df_feat.empty and clauses:
+                    # Live formula (shape) + human preview
+                    try:
+                        r_n = len(entry_logic.get("regime") or [])
+                        c_n = len(entry_logic.get("clauses") or [])
+                        if c_n == 0 and r_n == 0:
+                            rule = "Buy always allowed (no filters)."
+                        elif c_n == 0:
+                            rule = "Buy allowed when Regime is true."
+                        elif r_n == 0:
+                            rule = "Buy allowed when any Trigger clause is true."
+                        else:
+                            rule = "Buy allowed when Regime is true AND any Trigger clause is true."
+                        shape_slot.markdown(f"**Rule:** {rule}")
+                        human = _human_entry_logic(entry_logic)
+                        if human:
+                            preview_slot.caption(f"Current gate (preview): {human}")
+                    except Exception:
+                        pass
+
+
+                    # Plain-English explanation + gate-now sanity (train slice; not performance)
+                    try:
+                        pe = _entry_logic_plain_english(entry_logic)
+                        if pe:
+                            plain_slot.markdown("**This gate means:**\n" + pe)
+                    except Exception:
+                        pass
+
+                    try:
+                        snap = _entry_logic_snapshot(df_feat, entry_logic, train_frac=0.70, lookback=30)
+                        miss = snap.get("missing") or []
+                        if miss:
+                            now_slot.markdown(
+                                "<div style='font-size:0.86rem; opacity:0.78;'>"
+                                "<b>Now (train latest):</b> (can’t evaluate) — missing: "
+                                + ", ".join([str(x) for x in miss])
+                                + "</div>",
+                                unsafe_allow_html=True,
+                            )
+                        else:
+                            g = snap.get("gate_now", None)
+                            if g is None:
+                                now_slot.markdown("<div style='font-size:0.86rem; opacity:0.78;'><b>Gate now:</b> (can’t evaluate)</div>", unsafe_allow_html=True)
+                            else:
+                                g = bool(g)
+                                bg = "rgba(46, 204, 113, 0.16)" if g else "rgba(231, 76, 60, 0.14)"
+                                txt = "TRUE" if g else "FALSE"
+                                blocker = str(snap.get("blocker_now") or "").strip()
+                                sub = ""
+                                if blocker:
+                                    bl = blocker.strip()
+                                    m_tr = re.search(r"\(clause\s*([A-Z,\s]+)\)", bl, flags=re.I)
+                                    if g and m_tr:
+                                        toks = [t for t in re.split(r"[\s,]+", m_tr.group(1).upper().strip()) if t]
+                                        letters = [t for t in toks if (len(t) == 1 and t.isalpha())]
+                                        if letters:
+                                            if len(letters) == 1:
+                                                sub = f" — Triggered by Clause {letters[0]}"
+                                            else:
+                                                sub = " — Triggered by " + ", ".join([f"Clause {x}" for x in letters])
+                                    elif bl.lower() != "gate is true":
+                                        sub = " — " + bl
+                                now_slot.markdown(
+                                    f"<span style='display:inline-block; padding:4px 10px; border-radius:999px; border:1px solid rgba(49,51,63,0.18); background:{bg}; font-size:0.82rem; font-weight:650;'>Now (train latest): {txt}</span>"
+                                    f"<span style='font-size:0.82rem; opacity:0.70; margin-left:8px;'>{sub}</span>",
+                                    unsafe_allow_html=True,
+                                )
+
+                                                # Removed: "Last N bars" strip. We now show Early/Middle/Late snapshots instead.
                         try:
-                            pcts = _entry_logic_true_pcts(df_feat, entry_logic)
-                            atr_med = None
-                            if "atr_pct" in df_feat.columns:
-                                atr_med = float(np.nanmedian(pd.to_numeric(df_feat["atr_pct"], errors="coerce")))
-                            build_atr_med = atr_med
-                            if pcts is not None:
-                                r, e, c = pcts
-                                msg = f"On this dataset: regime true ~{r:.0f}% · triggers true ~{e:.0f}% · combined ~{c:.0f}%"
-                                if atr_med is not None and math.isfinite(atr_med):
-                                    msg += f" · median daily ATR ≈ {atr_med:.1f}%"
-                                st.caption(msg + ".")
-                                if c < 2:
-                                    st.info("FYI: combined entry gating triggers on <2% of days here. That often leads to very low trade counts and high variability.")
+                            strip_slot.empty()
                         except Exception:
                             pass
+
+# Coverage snapshots (train slice): Early / Middle / Late (sanity check across time; not performance)
+                        try:
+                            snaps = snap.get("snapshots") or []
+                            if snaps:
+                                rows = []
+                                for s in snaps:
+                                    nm = str(s.get("name") or "")
+                                    bits_s = s.get("bits") or []
+                                    tn = int(s.get("true") or 0)
+                                    nn = int(s.get("n") or 0)
+                                    pct = s.get("pct")
+                                    stat = f"{tn}/{nn}"
+                                    try:
+                                        if isinstance(pct, (int, float)) and math.isfinite(float(pct)):
+                                            stat = f"{tn}/{nn} ({float(pct):.0f}%)"
+                                    except Exception:
+                                        pass
+                                    strip = _gate_strip_html([bool(b) for b in bits_s]) if bits_s else ""
+                                    rows.append(
+                                        "<div style='display:flex; align-items:center; gap:10px; margin:6px 0;'>"
+                                        f"<div style='width:52px; font-size:0.78rem; opacity:0.70;'>{_escape_html(nm)}</div>"
+                                        + strip
+                                        + f"<div style='width:96px; text-align:right; font-size:0.78rem; opacity:0.70; white-space:nowrap; font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;'>{_escape_html(stat)}</div>"
+                                        + "</div>"
+                                    )
+                                title = "<div style='font-size:0.78rem; opacity:0.70; margin-top:8px; margin-bottom:2px;'><b>How often the gate opens (train)</b> — Early / Mid / Late</div>"
+                                note = "<div style='font-size:0.74rem; opacity:0.60; margin-bottom:4px;'>30-bar windows (frequency only).</div>"
+                                snapshots_slot.markdown(title + note + "<div>" + "".join(rows) + "</div>", unsafe_allow_html=True)
+                            else:
+                                try:
+                                    snapshots_slot.empty()
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+
+
+
+                    except Exception:
+                        pass
+
+                    # Gate coverage diagnostics (sanity check, not performance)
+                    with st.expander("Gate coverage (sanity check)", expanded=False):
+                        st.caption("Sanity check: how often the gate is true on the train slice (first 70%). Not a performance estimate.")
+                        st.caption("Too rare → low trade counts & high variability. Too frequent → behaves like no gate.")
+                        if df_feat is None or df_feat.empty:
+                            st.info("No dataset loaded, so coverage can’t be computed here.")
+                        else:
+                            try:
+                                df_cov = df_feat
+                                n = int(len(df_cov))
+                                n_train = int(max(1, round(n * 0.70)))
+                                df_cov = df_cov.iloc[:n_train].copy()
+
+                                # Keep ATR median for other UI parts
+                                if "atr_pct" in df_cov.columns:
+                                    try:
+                                        build_atr_med = float(np.nanmedian(pd.to_numeric(df_cov["atr_pct"], errors="coerce")))
+                                    except Exception:
+                                        pass
+
+                                # Required column check (best-effort)
+                                need = set()
+                                def _add_need(name: Any) -> None:
+                                    nm = str(name or "").strip()
+                                    if not nm:
+                                        return
+                                    if nm.lower() in {"open", "high", "low", "close", "volume", "vol"}:
+                                        return
+                                    need.add(nm)
+
+                                for c in (entry_logic.get("regime") or []):
+                                    if isinstance(c, dict):
+                                        _add_need(c.get("indicator") or c.get("feature") or c.get("lhs"))
+                                        _add_need(c.get("ref_indicator") or c.get("rhs") or c.get("rhs_indicator"))
+                                for cl in (entry_logic.get("clauses") or []):
+                                    for c in (cl or []):
+                                        if isinstance(c, dict):
+                                            _add_need(c.get("indicator") or c.get("feature") or c.get("lhs"))
+                                            _add_need(c.get("ref_indicator") or c.get("rhs") or c.get("rhs_indicator"))
+
+                                missing = sorted([c for c in need if c not in df_cov.columns])
+                                if missing:
+                                    st.warning("Missing required fields for coverage: " + ", ".join(missing))
+                                else:
+                                    masks = _entry_logic_masks(df_cov, entry_logic)
+                                    if masks is None:
+                                        st.warning("Could not compute gate masks (missing columns or invalid condition).")
+                                    else:
+                                        r_mask, e_mask, c_mask = masks
+                                        cov = float(c_mask.mean() * 100.0)
+
+                                        # Bands (sanity)
+                                        if cov < 5:
+                                            band = "Rare"
+                                        elif cov < 40:
+                                            band = "Moderate"
+                                        elif cov < 90:
+                                            band = "Frequent"
+                                        else:
+                                            band = "Always-on"
+
+                                        st.metric("Gate coverage", f"{cov:.1f}% ({band})")
+                                                                                # Coverage snapshots (sanity check across time; not performance)
+                                        try:
+                                            w = int(min(30, len(c_mask)))
+                                            if w >= 5:
+                                                c_arr = np.asarray(c_mask.values, dtype=bool)
+                                                n_tr = int(len(c_arr))
+                                                mid_center = n_tr // 2
+                                                mid_start = int(max(0, min(n_tr - w, mid_center - (w // 2))))
+                                                                                                # Early = last w bars of the first third (avoids warmup bias)
+                                                third_end = int(max(w, n_tr // 3))
+                                                third_end = int(min(n_tr, third_end))
+                                                early = c_arr[int(max(0, third_end - w)) : third_end]
+
+                                                snaps = [
+                                                    ("Early", early),
+                                                    ("Mid", c_arr[mid_start:mid_start + w]),
+                                                    ("Late", c_arr[-w:]),
+                                                ]
+
+                                                st.markdown("**How often the gate opens (train)**")
+                                                st.caption("30-bar windows (frequency only). Early = end of 1st third; Mid = center; Late = end.")
+                                                s_cols = st.columns(3)
+                                                for col, (nm, arr) in zip(s_cols, snaps):
+                                                    tn = int(arr.sum())
+                                                    pct = (tn / float(w)) * 100.0
+                                                    strip_html = _gate_strip_html([bool(x) for x in arr])
+                                                    col.markdown(
+                                                        f"<div style='border:1px solid rgba(49,51,63,0.10); border-radius:12px; padding:10px 10px 8px 10px; background:rgba(255,255,255,0.45);'>"
+                                                        f"<div style='font-weight:650; font-size:0.86rem; margin-bottom:6px;'>{nm}</div>"
+                                                        f"{strip_html}"
+                                                        f"<div style='font-size:0.78rem; opacity:0.72; margin-top:6px;'>{tn}/{w} bars true ({pct:.1f}%)</div>"
+                                                        f"</div>",
+                                                        unsafe_allow_html=True,
+                                                    )
+                                            else:
+                                                st.caption("Not enough bars in the train slice for coverage snapshots.")
+                                        except Exception:
+                                            pass
+
+                                        if cov < 2:
+                                            st.warning("Very rare gate (<2%): expect low trade counts and high variability.")
+                                        if cov > 95:
+                                            st.info("Gate is almost always true (>95%): this behaves like 'no gate' most of the time.")
+
+                                        cols = st.columns(2)
+
+                                        with cols[0]:
+                                            st.markdown("**Regime blockers (most often false)**")
+                                            reg = entry_logic.get("regime") or []
+                                            if not reg:
+                                                st.caption("No regime filters.")
+                                            else:
+                                                rows = []
+                                                for c in reg:
+                                                    cm = _cond_mask(df_cov, c)
+                                                    if cm is None:
+                                                        continue
+                                                    fail = float((1.0 - float(cm.mean())) * 100.0)
+                                                    rows.append((fail, _human_condition(c)))
+                                                rows = sorted(rows, reverse=True)[:5]
+                                                if rows:
+                                                    for fail, label in rows:
+                                                        st.write(f"- {label} — false {fail:.0f}%")
+                                                else:
+                                                    st.caption("Could not compute blockers (missing data).")
+
+                                        with cols[1]:
+                                            st.markdown("**Clause coverage (how often each clause is true)**")
+                                            cls = entry_logic.get("clauses") or []
+                                            if not cls:
+                                                st.caption("No clauses (always allowed).")
+                                            else:
+                                                for i, cl in enumerate(cls):
+                                                    cm_all = pd.Series(True, index=df_cov.index)
+                                                    ok = True
+                                                    for c in (cl or []):
+                                                        cm = _cond_mask(df_cov, c)
+                                                        if cm is None:
+                                                            ok = False
+                                                            break
+                                                        cm_all &= cm
+                                                    if not ok:
+                                                        st.write(f"- Clause {chr(65+i)}: (missing data)")
+                                                    else:
+                                                        pct = float(cm_all.mean() * 100.0)
+                                                        st.write(f"- Clause {chr(65+i)}: {pct:.1f}% true")
+                            except Exception:
+                                st.warning("Coverage diagnostics failed (unexpected input).")
 
             # Entry gate summary (right-aligned)
             if str(entry_mode).startswith("Simple"):
@@ -4256,10 +5554,12 @@ def build_dca_baseline_params() -> Dict[str, Any]:
                     r_n, c_n = 0, 0
                 gate_lbl = f"Builder ({r_n}R/{c_n}C)"
             gate_sum.markdown(f"<div style='text-align:right; font-weight:700'>{gate_lbl}</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
         # -------------------------
         # Allocation module
         # -------------------------
+        st.markdown("<div class='ff-module ff-module-alloc " + ("active" if active_module == "allocation" else "") + "'>", unsafe_allow_html=True)
         with st.container():
             top_a, top_b = st.columns([0.62, 0.38])
             with top_a:
@@ -4281,10 +5581,12 @@ def build_dca_baseline_params() -> Dict[str, Any]:
                 )
 
             alloc_sum.markdown(f"<div style='text-align:right; font-weight:700'>{_fmt_pct(float(max_alloc_pct), digits=0)}</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
         # -------------------------
         # Risk controls module
         # -------------------------
+        st.markdown("<div class='ff-module ff-module-risk " + ("active" if active_module == "risk" else "") + "'>", unsafe_allow_html=True)
         with st.container():
             top_a, top_b = st.columns([0.62, 0.38])
             with top_a:
@@ -4349,12 +5651,15 @@ def build_dca_baseline_params() -> Dict[str, Any]:
                 exits.append(f"Trail {trail_pct*100:.1f}%")
             risk_label = ", ".join(exits) if exits else "None"
             risk_sum.markdown(f"<div style='text-align:right; font-weight:700'>{risk_label}</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
     # Params (schema unchanged)
     params = {
         "deposit_freq": deposit_freq,
         "deposit_amount_usd": float(deposit_amount),
         "buy_freq": buy_freq,
         "buy_amount_usd": float(buy_amount),
+        "buy_mode": str(buy_mode),
+        "max_buys_per_gate": int(max_buys_per_gate),
         "buy_filter": buy_filter,  # legacy (still used by grid/back-compat)
         "ema_len": int(ema_len),
         "rsi_thr": float(rsi_thr),
@@ -4374,7 +5679,12 @@ def build_dca_baseline_params() -> Dict[str, Any]:
 
     # Human-readable build summary
     parts: List[str] = []
-    parts.append(f"Deposit {deposit_freq} ${int(round(params['deposit_amount_usd']))} and buy {params['buy_freq']} ${int(round(params['buy_amount_usd']))}.")
+    if str(buy_mode).strip().lower() == "signal":
+        _mb = int(max_buys_per_gate or 0)
+        _lim = f" (max {_mb} buys per signal window)" if _mb > 0 else ""
+        parts.append(f"Deposit {deposit_freq} ${int(round(params['deposit_amount_usd']))} and buy ≤{params['buy_freq']} ${int(round(params['buy_amount_usd']))} while the gate is true{_lim}.")
+    else:
+        parts.append(f"Deposit {deposit_freq} ${int(round(params['deposit_amount_usd']))} and buy {params['buy_freq']} ${int(round(params['buy_amount_usd']))} on schedule.")
     if entry_mode.startswith("Simple"):
         if buy_filter == "below_ema":
             parts.append(f"Only buy if close ≤ EMA({params['ema_len']}).")
@@ -4507,185 +5817,6 @@ def build_dca_baseline_params() -> Dict[str, Any]:
                         file_name="build_summary.txt",
                         mime="text/plain",
                     )
-
-    with colR:
-        st.markdown('<div class="sticky-preview">', unsafe_allow_html=True)
-        with st.container():
-            st.markdown("**Preview**")
-            st.caption("Live mechanics summary (no performance claims).")
-            st.markdown("**Build checklist**")
-
-            def _chk(ok: bool, label: str) -> str:
-                return f"- {'✅' if ok else '⬜'} {label}"
-
-            funding_ok = (deposit_freq != "none") and (float(deposit_amount or 0.0) > 0)
-            buys_ok = (buy_freq != "none") and (float(buy_amount or 0.0) > 0)
-
-            entry_ok = False
-            try:
-                if buy_filter != "none":
-                    entry_ok = True
-                elif entry_mode.startswith("Logic builder"):
-                    # Built logic dict contains enabled conditions/clauses
-                    entry_ok = bool(entry_logic.get("regime")) or bool(entry_logic.get("clauses"))
-            except Exception:
-                pass
-
-            alloc_ok = True  # always present (cap is a core mechanic)
-            sl_ok = float(sl_pct or 0.0) > 0.0
-            tp_ok = float(tp_pct or 0.0) > 0.0
-            time_ok = int(max_hold_bars or 0) > 0
-            trail_ok = float(trail_pct or 0.0) > 0.0
-
-            checklist_lines = [
-                _chk(funding_ok, f"Funding schedule ({deposit_freq} · ${deposit_amount:.0f})" if funding_ok else "Funding schedule"),
-                _chk(buys_ok, f"Buy schedule ({buy_freq} · ${buy_amount:.0f})" if buys_ok else "Buy schedule"),
-                _chk(entry_ok, "Entry gate"),
-                _chk(alloc_ok, f"Allocation cap ({max_alloc_pct*100:.0f}%)"),
-                _chk(sl_ok, f"Stop loss ({sl_pct:.2f}%)" if sl_ok else "Stop loss"),
-                _chk(tp_ok, f"Take profit ({tp_pct:.2f}%)" if tp_ok else "Take profit"),
-                _chk(time_ok, f"Time stop ({max_hold_bars} bars)" if time_ok else "Time stop"),
-                _chk(trail_ok, f"Trailing stop ({trail_pct:.2f}%)" if trail_ok else "Trailing stop"),
-            ]
-            st.markdown("\n".join(checklist_lines))
-            st.markdown("---")
-
-                        # --- Event flow (mechanics only; no simulation) ---
-            st.markdown("**How this build executes (event flow)**")
-            st.caption(
-                "Mechanics-only flow derived from your current knobs (spot only, no leverage). "
-                "This is not a performance estimate."
-            )
-
-            def _cond_to_text(cond: Optional[Dict[str, Any]]) -> str:
-                if not isinstance(cond, dict):
-                    return ""
-                ind = str(cond.get("indicator", "")).strip()
-                op = str(cond.get("operator", "")).strip()
-                ref = str(cond.get("ref_indicator", "")).strip()
-                thr = cond.get("threshold", None)
-                if ref:
-                    # e.g. close <= ema_200
-                    return f"{ind} {op} {ref}".strip()
-                if thr is not None and ind and op:
-                    try:
-                        thr_f = float(thr)
-                        # tighter formatting for common indicators
-                        if abs(thr_f) >= 10:
-                            thr_s = f"{thr_f:.0f}"
-                        elif abs(thr_f) >= 1:
-                            thr_s = f"{thr_f:.2f}"
-                        else:
-                            thr_s = f"{thr_f:.3f}"
-                    except Exception:
-                        thr_s = str(thr)
-                    return f"{ind} {op} {thr_s}".strip()
-                return ind or "condition"
-
-            def _gate_detail_html() -> str:
-                # entry_mode / buy_filter / entry_logic are in-scope from the baseline builder
-                try:
-                    if not entry_ok:
-                        return "no gate (always executes on schedule)"
-                    # Simple mode
-                    if str(entry_mode).startswith("Simple"):
-                        lbl = FILTER_LABELS.get(str(buy_filter), str(buy_filter))
-                        # Keep it neutral / mechanical
-                        if str(buy_filter) == "none":
-                            return "no gate (always executes on schedule)"
-                        return f"{lbl}"
-                    # Builder mode
-                    if isinstance(entry_logic, dict):
-                                                import html as _html
-                                                def _clean(_s: str) -> str:
-                                                    return " ".join(str(_s).split())
-                                                def _short(_s: str, n: int = 90) -> str:
-                                                    _s = _clean(_s)
-                                                    if len(_s) <= n:
-                                                        return _html.escape(_s)
-                                                    # Tooltip contains the full (escaped) expression
-                                                    return f"<span title='{_html.escape(_s, quote=True)}'>{_html.escape(_s[:max(0, n-1)])}…</span>"
-
-                                                reg = entry_logic.get("regime") or []
-                                                clauses = entry_logic.get("clauses") or []
-                                                reg_txt_full = " AND ".join([_cond_to_text(c) for c in reg if c]) or "none"
-
-                                                clause_txts = []
-                                                for cl in clauses:
-                                                    if not cl:
-                                                        continue
-                                                    clause_txts.append("(" + " AND ".join([_cond_to_text(c) for c in cl if c]) + ")")
-                                                trig_txt_full = " OR ".join(clause_txts) if clause_txts else "none"
-
-                                                # If user picked builder mode but hasn't set conditions, make that explicit.
-                                                if reg_txt_full == "none" and trig_txt_full == "none":
-                                                    return "gate enabled (no conditions set)"
-
-                                                reg_txt = _short(reg_txt_full, 85)
-                                                trig_txt = _short(trig_txt_full, 85)
-                                                return f"<b>Regime</b>: {reg_txt}<br/><b>Triggers</b>: {trig_txt}"
-                except Exception:
-                    pass
-                return "enabled"
-
-            def _flow_node(label: str, *, active: bool = True, detail_html: str = "", tone: str = "on") -> str:
-                cls = "node"
-                if not active:
-                    cls += " off"
-                elif tone == "warn":
-                    cls += " warn"
-                title = f"<div class='label'>{label}</div>"
-                detail = f"<div class='detail'>{detail_html}</div>" if detail_html else ""
-                return f"<div class='{cls}'>{title}{detail}</div>"
-
-            # Compact, responsive vertical flow (clean + intuitive in the sticky panel)
-            css = """
-<style>
-.flow-vert {display:flex; flex-direction:column; gap:8px; margin-top:8px; padding-bottom:8px;}
-.node{border:1px solid rgba(17,24,39,0.15); border-radius:12px; padding:10px 12px; background:#f9fafb; margin-bottom:2px}
-.node .label{font-weight:700; font-size:13px; color:#111827}
-.node .detail{font-size:12px; color:#4b5563; margin-top:2px; line-height:1.25; white-space:normal; overflow-wrap:anywhere}
-.node.off{opacity:0.55}
-.node.warn{border-color: rgba(245,158,11,0.55); background: rgba(245,158,11,0.08)}
-.arrow-down{display:flex; justify-content:center; color:#9ca3af; font-size:16px; line-height:1}
-</style>
-"""
-
-            # Details
-            cash_detail = f"{deposit_freq} · ${deposit_amount:.0f}" if funding_ok else "off"
-            buys_detail = f"{buy_freq} · ${buy_amount:.0f}" if buys_ok else "off"
-            gate_detail = _gate_detail_html()
-            alloc_detail = f"≤ {max_alloc_pct*100:.0f}% invested"
-
-            exec_detail = "always (scheduled)" if (buys_ok and not entry_ok) else ("only if gate passes" if buys_ok else "no buys")
-            pos_detail = "holds between buys"
-            exit_parts = []
-            if sl_ok:
-                exit_parts.append(f"SL {_fmt_pct(sl_pct)}")
-            if tp_ok:
-                exit_parts.append(f"TP {_fmt_pct(tp_pct)}")
-            if time_ok:
-                exit_parts.append(f"Time {int(max_hold_bars)} bars")
-            if trail_ok:
-                exit_parts.append(f"Trail {_fmt_pct(trail_pct)}")
-            exits_detail = " · ".join(exit_parts) if exit_parts else "none"
-            sell_detail = "only via exits"
-
-            nodes = [
-                _flow_node("Cash-in schedule", active=funding_ok, detail_html=cash_detail, tone="on"),
-                _flow_node("Buy schedule", active=buys_ok, detail_html=buys_detail, tone="on"),
-                _flow_node("Signal gate", active=True, detail_html=gate_detail, tone=("warn" if entry_ok else "on")),
-                _flow_node("Allocation cap", active=True, detail_html=alloc_detail, tone="on"),
-                _flow_node("Buy executes", active=buys_ok, detail_html=exec_detail, tone=("warn" if entry_ok else "on")),
-                _flow_node("Position state", active=True, detail_html=pos_detail, tone="on"),
-                _flow_node("Exit rules", active=True, detail_html=exits_detail, tone=("warn" if exits_detail != "none" else "on")),
-                _flow_node("Sell / reduce", active=True, detail_html=sell_detail, tone="on"),
-            ]
-
-            html = css + "<div class='flow-vert'>" + "<div class='arrow-down'>↓</div>".join(nodes) + "</div>"
-            st.markdown(html, unsafe_allow_html=True)
-
-        st.markdown("</div>", unsafe_allow_html=True)
     return params
 
 
@@ -12114,6 +13245,9 @@ if stage_pick == "grand":
                     buy_freq = str(_p("buy_freq", "weekly") or "weekly")
                     buy_amt = float(_p("buy_amount_usd", 0.0) or 0.0)
 
+                    buy_mode = str(_p("buy_mode", "scheduled") or "scheduled").strip().lower()
+                    max_buys_per_gate = int(_p("max_buys_per_gate", 0) or 0)
+
                     buy_filter = str(_p("buy_filter", "none") or "none")
                     entry_logic = params.get("entry_logic") if isinstance(params.get("entry_logic"), dict) else None
                     n_clauses = len((entry_logic or {}).get("clauses") or []) if entry_logic else 0
@@ -12126,6 +13260,7 @@ if stage_pick == "grand":
 
                     tp_pct = float(_p("tp_pct", 0.0) or 0.0)
                     tp_sell_fraction = float(_p("tp_sell_fraction", 0.0) or 0.0)
+                    reserve_frac_of_proceeds = float(_p("reserve_frac_of_proceeds", _p("reserve_frac", 0.0)) or 0.0)
 
                     # --- Core stats from selected row (already in artifacts) ---
                     batch_ret = rr_sel.get("performance.twr_total_return", np.nan)
@@ -12272,34 +13407,158 @@ if stage_pick == "grand":
                         # Three-panel layout: config | characteristics | diagnostics
                         c1, c2, c3 = st.columns([0.38, 0.34, 0.28])
 
+
                         with c1:
-                            st.markdown("**Mechanics (inputs)**")
+                            st.markdown("**Strategy workflow**")
+
+                            # On/off helpers (explicit is better than implied)
                             dep_off = (str(deposit_freq).strip().lower() in {"none", "off", "0", ""} or float(deposit_amt) <= 0.0)
                             buy_off = (str(buy_freq).strip().lower() in {"none", "off", "0", ""} or float(buy_amt) <= 0.0)
 
-                            dep_vals = ["off"] if dep_off else [str(deposit_freq), f"${float(deposit_amt):,.0f}"]
-                            buy_vals = ["off"] if buy_off else [str(buy_freq), f"${float(buy_amt):,.0f}"]
-
-                            if entry_logic:
-                                if n_clauses or n_regime:
-                                    entry_vals = ["logic", f"clauses {int(n_clauses)}", f"regime {int(n_regime)}"]
-                                else:
-                                    entry_vals = ["logic"]
-                            elif buy_filter and str(buy_filter).lower() != "none":
-                                entry_vals = [str(buy_filter)]
+                            # Step 1 — Cashflow
+                            if dep_off:
+                                cash_desc = "Cash additions: off."
+                                cash_chips = ["off"]
                             else:
-                                entry_vals = [f"scheduled ({buy_freq})"] if not buy_off else ["off"]
+                                cash_desc = f"Adds cash {str(deposit_freq)}: +${float(deposit_amt):,.0f}."
+                                cash_chips = [str(deposit_freq), f"${float(deposit_amt):,.0f}"]
 
-                            mech_rows = [
-                                ("Cash additions", dep_vals),
-                                ("Buy schedule", buy_vals),
-                                ("Entry rule", entry_vals),
-                                ("Allocation cap", [f"{max_alloc_pct * 100:.0f}%"]),
-                                ("Risk controls", [f"SL {sl_pct * 100:.1f}%", f"Trail {trail_pct * 100:.1f}%", f"Time {int(max_hold_bars)} bars"]),
-                                ("Take profit", [f"{tp_pct * 100:.1f}%", f"sell {tp_sell_fraction * 100:.0f}%"]),
+                            # Step 2 — Entry & scaling
+                            gate_chip = "no gate"
+                            gate_desc = "no entry gate"
+                            try:
+                                if entry_logic and (n_clauses or n_regime):
+                                    gate_chip = "entry rules"
+                                    gate_desc = "only when entry rules pass"
+                                elif buy_filter and str(buy_filter).lower() != "none":
+                                    gate_chip = str(buy_filter)
+                                    gate_desc = "only when filter allows"
+                            except Exception:
+                                pass
+
+                            if buy_off:
+                                entry_desc = "Buys: off."
+                                entry_chips = ["off"]
+                            else:
+                                if str(buy_mode).strip().lower() == "signal":
+                                    _lim = f" Up to {int(max_buys_per_gate)} buys per signal window." if int(max_buys_per_gate) > 0 else ""
+                                    entry_desc = f"While gate is true: buys up to ${float(buy_amt):,.0f} every {str(buy_freq)} (cooldown) ({gate_desc}).{_lim}"
+                                    entry_chips = [f"≤ {str(buy_freq)}", f"${float(buy_amt):,.0f}", gate_chip]
+                                    if int(max_buys_per_gate) > 0:
+                                        entry_chips.append(f"max {int(max_buys_per_gate)}")
+                                else:
+                                    entry_desc = f"Buys {str(buy_freq)}: ${float(buy_amt):,.0f} on schedule ({gate_desc})."
+                                    entry_chips = [str(buy_freq), f"${float(buy_amt):,.0f}", gate_chip]
+
+                            # Step 3 — Position limits
+                            alloc_desc = f"Stops buying once invested allocation reaches {max_alloc_pct*100:.0f}% of equity."
+                            alloc_chips = [f"max alloc {max_alloc_pct*100:.0f}%"]
+
+                            # Step 4 — Risk controls
+                            sl_on = float(sl_pct) > 0
+                            trail_on = float(trail_pct) > 0
+                            time_on = int(max_hold_bars) > 0
+
+                            risk_bits = []
+                            risk_chips = []
+                            if sl_on:
+                                risk_bits.append(f"Stop-loss {sl_pct*100:.1f}%")
+                                risk_chips.append(f"SL {sl_pct*100:.1f}%")
+                            else:
+                                risk_chips.append("SL off")
+                            if trail_on:
+                                risk_bits.append(f"Trailing {trail_pct*100:.1f}% from peak")
+                                risk_chips.append(f"Trail {trail_pct*100:.1f}%")
+                            else:
+                                risk_chips.append("Trail off")
+                            if time_on:
+                                risk_bits.append(f"Time stop {int(max_hold_bars)} bars")
+                                risk_chips.append(f"Time {int(max_hold_bars)}")
+                            else:
+                                risk_chips.append("Time off")
+
+                            risk_desc = "Risk controls: " + (", ".join(risk_bits) + "." if risk_bits else "none.")
+
+                            # Step 5 — Exits
+                            tp_on = float(tp_pct) > 0 and float(tp_sell_fraction) > 0
+                            exit_chips = []
+                            if tp_on:
+                                exit_desc = f"Take profit at +{tp_pct*100:.1f}%: sells {tp_sell_fraction*100:.0f}% of position."
+                                exit_chips.extend([f"TP {tp_pct*100:.1f}%", f"sell {tp_sell_fraction*100:.0f}%"])
+                                if float(reserve_frac_of_proceeds or 0.0) > 0:
+                                    exit_desc += f" Reserves {reserve_frac_of_proceeds*100:.0f}% of proceeds as cash."
+                                    exit_chips.append(f"reserve {reserve_frac_of_proceeds*100:.0f}%")
+                                else:
+                                    exit_chips.append("reserve 0%")
+                            else:
+                                exit_desc = "Take profit: off."
+                                exit_chips.append("TP off")
+
+                            steps = [
+                                {"title": "Cashflow", "desc": cash_desc, "chips": cash_chips},
+                                {"title": "Entry & scaling", "desc": entry_desc, "chips": entry_chips},
+                                {"title": "Position limits", "desc": alloc_desc, "chips": alloc_chips},
+                                {"title": "Risk controls", "desc": risk_desc, "chips": risk_chips},
+                                {"title": "Exits", "desc": exit_desc, "chips": exit_chips},
                             ]
-                            st.markdown(_ff_kvlist_html(mech_rows), unsafe_allow_html=True)
+                            st.markdown(_ff_workflow_html(steps), unsafe_allow_html=True)
 
+                            # Decision logic (readable, not JSON)
+                            try:
+                                show_logic = bool(entry_logic) and (int(n_regime) > 0 or int(n_clauses) > 0)
+                            except Exception:
+                                show_logic = bool(entry_logic)
+
+                            if show_logic:
+                                with st.expander("Entry logic (details)", expanded=False):
+                                    if str(buy_mode).strip().lower() == "signal":
+                                        st.caption("Buys can fire on any day while the gate is true, but they are spaced by your cooldown (max buy frequency).")
+                                    else:
+                                        st.caption("Scheduled buy attempts are skipped unless the gate is satisfied.")
+                                    reg = (entry_logic or {}).get("regime") or []
+                                    clauses = (entry_logic or {}).get("clauses") or []
+
+                                    if reg:
+                                        st.markdown("**Regime (must all be true)**")
+                                        for c in reg:
+                                            if isinstance(c, dict):
+                                                st.markdown(f"- `{_human_condition(c)}`")
+
+                                    if not clauses:
+                                        st.markdown("**Triggers**")
+                                        st.caption("No trigger clauses: once regime is true, buys follow schedule.")
+                                    else:
+                                        st.markdown("**Triggers (any one group can fire)**")
+                                        for i, cl in enumerate(clauses, 1):
+                                            st.markdown(f"*Group {i}*")
+                                            if not cl:
+                                                st.markdown("- `(always)`")
+                                            else:
+                                                for c in cl:
+                                                    if isinstance(c, dict):
+                                                        st.markdown(f"- `{_human_condition(c)}`")
+
+                                    if st.checkbox("Show raw entry_logic fields", value=False, key=f"wf_raw_logic_{cid_sel}"):
+                                        st.code(json.dumps(entry_logic, indent=2, ensure_ascii=False), language="json")
+
+                            # Raw config mapping (power users)
+                            if st.checkbox("Show raw fields used", value=False, key=f"wf_raw_fields_{cid_sel}"):
+                                raw = {
+                                    "deposit_freq": deposit_freq,
+                                    "deposit_amount_usd": float(deposit_amt),
+                                    "buy_freq": buy_freq,
+                                    "buy_amount_usd": float(buy_amt),
+                                    "buy_filter": buy_filter,
+                                    "entry_logic": entry_logic,
+                                    "max_alloc_pct": float(max_alloc_pct),
+                                    "sl_pct": float(sl_pct),
+                                    "trail_pct": float(trail_pct),
+                                    "max_hold_bars": int(max_hold_bars),
+                                    "tp_pct": float(tp_pct),
+                                    "tp_sell_fraction": float(tp_sell_fraction),
+                                    "reserve_frac_of_proceeds": float(reserve_frac_of_proceeds or 0.0),
+                                }
+                                st.code(json.dumps(raw, indent=2, ensure_ascii=False), language="json")
                         with c2:
                             st.markdown("**Behavior (what it tends to do)**")
                             tL, tR = st.columns(2, gap="small")
