@@ -1936,11 +1936,15 @@ def _read_csv_cached(path: str, mtime: float) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def _add_features_cached(path: str, mtime: float) -> Optional[pd.DataFrame]:
-    """Load CSV + compute features once per dataset version (used only for UI context)."""
+    """Load dataset + compute features once per dataset version (used only for UI context)."""
     _ = mtime  # cache buster
     if _add_features is None:
         return None
-    df = pd.read_csv(path)
+    p = Path(path)
+    if p.suffix.lower() in {".parquet", ".pq"}:
+        df = pd.read_parquet(path)
+    else:
+        df = pd.read_csv(path)
     try:
         df.columns = [str(c).strip().lower() for c in df.columns]
     except Exception:
@@ -1960,8 +1964,281 @@ def _load_csv(path: Path) -> Optional[pd.DataFrame]:
         return None
 
 
+
+@st.cache_data(show_spinner=False)
+def _read_parquet_cached(path: str, mtime: float) -> pd.DataFrame:
+    """Cached parquet reader (mtime busts cache)."""
+    _ = mtime
+    return pd.read_parquet(path)
+
+
+def _load_any_df(path: Path) -> Optional[pd.DataFrame]:
+    """Load CSV or Parquet (best-effort) for UI preview/diagnostics."""
+    try:
+        if not path or not Path(path).exists():
+            return None
+        p = Path(path)
+        suf = p.suffix.lower()
+        if suf in {".parquet", ".pq"}:
+            return _read_parquet_cached(str(p), p.stat().st_mtime)
+        return _read_csv_cached(str(p), p.stat().st_mtime)
+    except Exception:
+        return None
+
+
+def _load_any_df_tail(path: Path, n: int = 2500) -> Optional[pd.DataFrame]:
+    """Load a tail window for preview (avoids huge loads for large CSVs)."""
+    try:
+        p = Path(path)
+        if not p.exists():
+            return None
+        suf = p.suffix.lower()
+        if suf in {".parquet", ".pq"}:
+            df = _read_parquet_cached(str(p), p.stat().st_mtime)
+            return df.tail(n) if df is not None else None
+
+        # CSV: stream in chunks and keep tail
+        keep = None
+        for chunk in pd.read_csv(str(p), chunksize=50_000):
+            if keep is None:
+                keep = chunk
+            else:
+                keep = pd.concat([keep, chunk], ignore_index=True)
+            if len(keep) > n * 3:
+                keep = keep.tail(n * 2).reset_index(drop=True)
+        if keep is None:
+            return None
+        return keep.tail(n).reset_index(drop=True)
+    except Exception:
+        return None
+
+
+@st.cache_data(show_spinner=False)
+def _read_catalog_cached(path: str, mtime: float) -> List[Dict[str, Any]]:
+    _ = mtime  # cache buster
+    try:
+        obj = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if isinstance(obj, list):
+        out = [x for x in obj if isinstance(x, dict)]
+        return out
+    if isinstance(obj, dict) and isinstance(obj.get("datasets"), list):
+        return [x for x in obj.get("datasets") if isinstance(x, dict)]
+    return []
+
+
+def _resolve_dataset_path(entry: Dict[str, Any]) -> Optional[Path]:
+    try:
+        raw = (
+            entry.get("file_path")
+            or entry.get("path")
+            or entry.get("filepath")
+            or entry.get("file")
+            or ""
+        )
+        if not raw:
+            return None
+        p = Path(str(raw))
+        if not p.is_absolute():
+            # allow paths relative to repo or data dir
+            cand = REPO_ROOT / p
+            if cand.exists():
+                return cand
+            cand2 = DATA_DIR / p
+            if cand2.exists():
+                return cand2
+            return cand  # default repo-relative
+        return p
+    except Exception:
+        return None
+
+
+def _infer_symbol_from_filename(name: str) -> str:
+    try:
+        base = Path(name).stem
+        # common patterns: eth_daily_..., BTCUSDT_1d_..., btc_1d
+        tok = re.split(r"[_\-\s]+", base)[0]
+        tok = tok.upper()
+        tok = tok.replace("USDT", "").replace("USD", "")
+        if 2 <= len(tok) <= 12:
+            return tok
+        return base[:12].upper()
+    except Exception:
+        return str(name or "").upper()
+
+
+def _safe_dt_str(x: Any) -> str:
+    try:
+        if x is None:
+            return ""
+        s = str(x).strip()
+        if not s:
+            return ""
+        # keep YYYY-MM-DD if present
+        if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+            return s[:10]
+        return s
+    except Exception:
+        return ""
+
+
+def _dataset_option_label(d: Dict[str, Any]) -> str:
+    sym = str(d.get("symbol") or d.get("ticker") or d.get("id") or "").upper()
+    name = str(d.get("name") or "").strip()
+    tf = str(d.get("timeframe") or d.get("tf") or "1D").upper()
+    start = _safe_dt_str(d.get("start_dt") or d.get("start") or d.get("start_date"))
+    end = _safe_dt_str(d.get("end_dt") or d.get("end") or d.get("end_date"))
+    rows = d.get("rows") or d.get("n_rows") or d.get("bars") or None
+    rng = ""
+    if start and end:
+        rng = f"{start} → {end}"
+    elif start:
+        rng = f"{start} → …"
+    elif end:
+        rng = f"… → {end}"
+    rtxt = ""
+    try:
+        if rows is not None:
+            rtxt = f" · {int(rows):,} bars"
+    except Exception:
+        rtxt = ""
+    if name and name.lower() != sym.lower():
+        return f"{sym} — {name} · {tf}" + (f" · {rng}" if rng else "") + rtxt
+    return f"{sym} · {tf}" + (f" · {rng}" if rng else "") + rtxt
+
+
+def _catalog_paths() -> List[Path]:
+    return [
+        DATA_DIR / "datasets" / "catalog.json",
+        DATA_DIR / "catalog.json",
+        DATA_DIR / "datasets_catalog.json",
+    ]
+
+
+def _build_fallback_catalog() -> List[Dict[str, Any]]:
+    """Fallback: scan ./data for csv/parquet datasets when no catalog is present."""
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+
+    # Prefer a dedicated datasets folder if it exists
+    roots = []
+    if (DATA_DIR / "datasets").exists():
+        roots.append(DATA_DIR / "datasets")
+    roots.append(DATA_DIR)
+
+    for root in roots:
+        try:
+            for p in root.rglob("*"):
+                if not p.is_file():
+                    continue
+                if p.name.lower() in {"catalog.json", "datasets_catalog.json"}:
+                    continue
+                if p.suffix.lower() not in {".csv", ".parquet", ".pq"}:
+                    continue
+                rel = str(p.relative_to(REPO_ROOT)) if REPO_ROOT in p.parents else str(p)
+                if rel in seen:
+                    continue
+                seen.add(rel)
+
+                sym = _infer_symbol_from_filename(p.name)
+                entry = {
+                    "id": f"{sym}_{p.suffix.lower().lstrip('.')}:{rel}",
+                    "symbol": sym,
+                    "name": "",
+                    "timeframe": "1D",
+                    "file_path": rel,
+                }
+                out.append(entry)
+        except Exception:
+            continue
+
+    # Ensure sample dataset still shows up if present
+    sample_csv = DATA_DIR / "eth_daily_2023_to_now.csv"
+    if sample_csv.exists():
+        rel = str(sample_csv.relative_to(REPO_ROOT)) if REPO_ROOT in sample_csv.parents else str(sample_csv)
+        entry = {
+            "id": "ETH_csv:sample",
+            "symbol": "ETH",
+            "name": "Sample",
+            "timeframe": "1D",
+            "file_path": rel,
+        }
+        out.insert(0, entry)
+
+    return out
+
+
+def _get_dataset_catalog() -> List[Dict[str, Any]]:
+    # Try explicit catalog files first
+    for cp in _catalog_paths():
+        try:
+            if cp.exists():
+                return _read_catalog_cached(str(cp), cp.stat().st_mtime)
+        except Exception:
+            pass
+    return _build_fallback_catalog()
+
+
+def _sort_filter_catalog(
+    catalog: List[Dict[str, Any]],
+    query: str,
+    sort_by: str,
+    *,
+    use_counts: Optional[Dict[str, int]] = None,
+) -> List[Dict[str, Any]]:
+    q = str(query or "").strip().lower()
+    items = []
+    for d in catalog or []:
+        if not isinstance(d, dict):
+            continue
+        sym = str(d.get("symbol") or "").lower()
+        name = str(d.get("name") or "").lower()
+        if q and (q not in sym and q not in name):
+            continue
+        items.append(d)
+
+    def _hist_len(d: Dict[str, Any]) -> float:
+        try:
+            s = d.get("start_dt") or d.get("start") or d.get("start_date")
+            e = d.get("end_dt") or d.get("end") or d.get("end_date")
+            if not s or not e:
+                return 0.0
+            ds = pd.to_datetime(s, errors="coerce")
+            de = pd.to_datetime(e, errors="coerce")
+            if pd.isna(ds) or pd.isna(de):
+                return 0.0
+            return float((de - ds).days)
+        except Exception:
+            return 0.0
+
+    def _updated_ts(d: Dict[str, Any]) -> float:
+        try:
+            u = d.get("updated_at") or d.get("updated") or d.get("last_updated") or ""
+            du = pd.to_datetime(u, errors="coerce")
+            if pd.isna(du):
+                return 0.0
+            return float(du.timestamp())
+        except Exception:
+            return 0.0
+
+    sort_by = str(sort_by or "")
+    if sort_by.startswith("Most") and use_counts:
+        items.sort(key=lambda d: int(use_counts.get(str(d.get("id") or ""), 0)), reverse=True)
+    elif sort_by.startswith("Alphabet"):
+        items.sort(key=lambda d: str(d.get("symbol") or ""))
+    elif sort_by.startswith("Longest"):
+        items.sort(key=_hist_len, reverse=True)
+    elif sort_by.startswith("Newest"):
+        items.sort(key=_updated_ts, reverse=True)
+    else:
+        items.sort(key=lambda d: str(d.get("symbol") or ""))
+
+    return items
+
+
 def _infer_bar_ms_from_csv(path: Path) -> Optional[int]:
-    """Infer median bar size in milliseconds from the first ~5000 rows of a CSV.
+    """Infer median bar size in milliseconds from the first ~5000 rows of a dataset (CSV/Parquet).
 
     Tries 'ts' (ms epoch) first; falls back to parsing 'dt'/'date' as datetimes.
     Returns None if it can't infer a stable interval.
@@ -1969,7 +2246,11 @@ def _infer_bar_ms_from_csv(path: Path) -> Optional[int]:
     try:
         if not path.exists():
             return None
-        sample = pd.read_csv(path, nrows=5000)
+        p = Path(path)
+        if p.suffix.lower() in {'.parquet', '.pq'}:
+            sample = pd.read_parquet(str(p)).head(5000)
+        else:
+            sample = pd.read_csv(str(p), nrows=5000)
         if sample is None or len(sample) < 3:
             return None
 
@@ -4240,7 +4521,7 @@ def _gate_logic_tree_html(entry_logic: Dict[str, Any], snap: Optional[Dict[str, 
 
     reg_box = (
         "<div class='ff-gate-box regime'>"
-        "<div class='hdr'><div class='t'>Regime</div><div class='k'>AND</div></div>"
+        "<div class='hdr'><div class='t'>1) Regime</div><div class='k'>AND</div></div>"
         f"<div class='sub'>{_escape_html(reg_sub)}</div>"
         f"<div class='ff-gate-conds'>{reg_items}</div>"
         "</div>"
@@ -4270,7 +4551,7 @@ def _gate_logic_tree_html(entry_logic: Dict[str, Any], snap: Optional[Dict[str, 
 
     trig_box = (
         "<div class='ff-gate-box triggers'>"
-        "<div class='hdr'><div class='t'>Triggers</div><div class='k'>OR</div></div>"
+        "<div class='hdr'><div class='t'>2) Triggers</div><div class='k'>OR</div></div>"
         f"<div class='sub'>{_escape_html(trig_sub)}</div>"
         f"{trig_box_body}"
         "</div>"
@@ -4283,7 +4564,7 @@ def _gate_logic_tree_html(entry_logic: Dict[str, Any], snap: Optional[Dict[str, 
     why_line = f"<div class='sub'>{_escape_html(why)}</div>" if why else "<div class='sub'>—</div>"
     res_box = (
         f"<div class='ff-gate-box result {res_cls}'>"
-        "<div class='hdr'><div class='t'>Gate</div><div class='k'>Now</div></div>"
+        "<div class='hdr'><div class='t'>3) Gate</div><div class='k'>Now</div></div>"
         f"<div class='sub'>Now: <b>{_escape_html(res_text)}</b></div>"
         f"{why_line}"
         "</div>"
@@ -4295,7 +4576,7 @@ def _gate_logic_tree_html(entry_logic: Dict[str, Any], snap: Optional[Dict[str, 
         "This is a mechanics preview, not a performance estimate."
         "</div>"
     )
-    # Coverage snapshots (Early / Middle / Late), 30 bars each (sanity check, not performance)
+    # Coverage snapshots (Early / Mid / Late), percent-based window (sanity check, not performance)
     snapshots_html = ""
     try:
         snaps = snap.get("snapshots") or []
@@ -4321,8 +4602,12 @@ def _gate_logic_tree_html(entry_logic: Dict[str, Any], snap: Optional[Dict[str, 
                     + f"<div style='width:88px; text-align:right; font-size:0.74rem; opacity:0.65; white-space:nowrap; font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;'>{_escape_html(stat)}</div>"
                     + "</div>"
                 )
-            title = "<div style='font-size:0.74rem; opacity:0.60; margin-top:6px; margin-bottom:2px;'><b>How often the gate opens (train)</b> — Early / Mid / Late</div><div style='font-size:0.70rem; opacity:0.55; margin-bottom:4px;'>30-bar windows (frequency only).</div>"
-            snapshots_html = "<div class='ff-gate-snapshots'>" + title + "<div>" + "".join(rows) + "</div></div>"
+            title = "<div style='font-size:0.74rem; opacity:0.60; margin-top:6px; margin-bottom:2px;'><b>How often the gate opens (train)</b> — Early / Mid / Late</div>"
+            note_txt = str(snap.get("snap_note") or "").strip()
+            if not note_txt:
+                note_txt = "Frequency only (not a performance estimate)."
+            note = "<div style='font-size:0.70rem; opacity:0.55; margin-bottom:4px;'>" + _escape_html(note_txt) + "</div>"
+            snapshots_html = "<div class='ff-gate-snapshots'>" + title + note + "<div>" + "".join(rows) + "</div></div>"
     except Exception:
         snapshots_html = ""
 
@@ -4341,14 +4626,75 @@ def _gate_logic_tree_html(entry_logic: Dict[str, Any], snap: Optional[Dict[str, 
 
 
 
+def _snap_window_len(n_train: int, window_pct: float, *, min_bars: int, max_bars: int) -> int:
+    """Compute snapshot window size as % of train slice, clamped to [min_bars, max_bars]."""
+    try:
+        n_train = int(n_train)
+    except Exception:
+        n_train = 0
+    if n_train <= 0:
+        return 0
+    try:
+        w = int(round(float(n_train) * float(window_pct)))
+    except Exception:
+        w = int(round(float(n_train) * 0.02))
+    if n_train < int(min_bars):
+        return max(1, n_train)
+    w = max(int(min_bars), w)
+    w = min(int(max_bars), w)
+    w = min(n_train, w)
+    return max(1, int(w))
+
+
+def _downsample_bool_bits(bits: List[bool], max_dots: int = 120) -> List[bool]:
+    """Downsample boolean bits to at most max_dots for dot-strip display (majority vote per bin)."""
+    try:
+        max_dots = int(max_dots)
+    except Exception:
+        max_dots = 120
+    if max_dots <= 0:
+        return []
+    if bits is None:
+        return []
+    try:
+        bits = [bool(x) for x in bits]
+    except Exception:
+        return []
+    n = len(bits)
+    if n <= max_dots:
+        return bits
+    # Bin to max_dots; dot is True if >=50% of bin is True.
+    out: List[bool] = []
+    for i in range(max_dots):
+        a = int((i * n) / max_dots)
+        b = int(((i + 1) * n) / max_dots)
+        if b <= a:
+            b = min(n, a + 1)
+        seg = bits[a:b]
+        if not seg:
+            out.append(False)
+        else:
+            t = sum(1 for x in seg if x)
+            out.append(t >= (len(seg) / 2.0))
+    return out
+
+
 def _entry_logic_snapshot(
     df_feat: Optional[pd.DataFrame],
     entry_logic: Dict[str, Any],
     *,
     train_frac: float = 0.70,
-    lookback: int = 30,
+    snap_window_pct: float = 0.02,
+    snap_min_bars: int = 1,
+    snap_max_bars: int = 200,
+    snap_max_dots: int = 120,
 ) -> Dict[str, Any]:
-    """Compute a non-performance sanity snapshot for the gate (train slice only)."""
+    """Compute a non-performance sanity snapshot for the gate (train slice only).
+
+    Notes:
+    - "train" = the slice used for in-sample diagnostics (default: first 70% of rows).
+    - Snapshots are *frequency* checks (how often gate is true), not performance estimates.
+    """
     out: Dict[str, Any] = {
         "ok": False,
         "missing": [],
@@ -4359,6 +4705,12 @@ def _entry_logic_snapshot(
         "lookback": 0,
         "coverage_pct": None,
         "snapshots": [],
+        "snap_window_pct": float(snap_window_pct),
+        "snap_min_bars": int(snap_min_bars),
+        "snap_max_bars": int(snap_max_bars),
+        "snap_max_dots": int(snap_max_dots),
+        "snap_window_bars": 0,
+        "snap_note": "",
         "note": "",
     }
 
@@ -4374,119 +4726,150 @@ def _entry_logic_snapshot(
         out["note"] = "Could not slice dataset."
         return out
 
-    missing = [c for c in _entry_logic_required_columns(entry_logic) if c not in df_cov.columns]
+    # Required columns (best-effort)
+    need: set = set()
+
+    def _add_need(name: Any) -> None:
+        nm = str(name or "").strip()
+        if not nm:
+            return
+        if nm.lower() in {"open", "high", "low", "close", "volume", "vol"}:
+            return
+        need.add(nm)
+
+    try:
+        for c in (entry_logic.get("regime") or []):
+            if isinstance(c, dict):
+                _add_need(c.get("indicator") or c.get("feature") or c.get("lhs"))
+                _add_need(c.get("ref_indicator") or c.get("rhs") or c.get("rhs_indicator"))
+        for cl in (entry_logic.get("clauses") or []):
+            for c in (cl or []):
+                if isinstance(c, dict):
+                    _add_need(c.get("indicator") or c.get("feature") or c.get("lhs"))
+                    _add_need(c.get("ref_indicator") or c.get("rhs") or c.get("rhs_indicator"))
+    except Exception:
+        pass
+
+    missing = sorted([c for c in need if c not in df_cov.columns])
+    out["missing"] = missing
     if missing:
-        out["missing"] = missing
-        out["note"] = "Missing required fields for gate diagnostics."
+        out["note"] = "Missing required fields for coverage: " + ", ".join(missing)
         return out
 
     masks = _entry_logic_masks(df_cov, entry_logic)
     if masks is None:
-        out["note"] = "Could not compute gate masks (invalid condition or missing columns)."
+        out["note"] = "Could not compute gate masks (missing columns or invalid condition)."
         return out
 
     r_mask, e_mask, c_mask = masks
+
     try:
-        out["coverage_pct"] = float(c_mask.mean() * 100.0)
+        cov = float(c_mask.mean() * 100.0)
+        out["coverage_pct"] = cov
     except Exception:
-        pass
+        out["coverage_pct"] = None
 
-    # Gate now (last bar in train slice)
+    # Gate now (last train bar)
     try:
-        gate_now = bool(c_mask.iloc[-1])
-        out["gate_now"] = gate_now
+        out["gate_now"] = bool(c_mask.iloc[-1])
+    except Exception:
+        out["gate_now"] = None
 
-        if not gate_now:
-            # Regime blocker?
-            reg = [c for c in (entry_logic.get("regime") or []) if isinstance(c, dict)]
-            for c in reg:
-                cm = _cond_mask(df_cov, c)
-                if cm is None:
-                    continue
-                if not bool(cm.iloc[-1]):
-                    out["blocker_now"] = f"Blocked by regime: {_plain_condition(c)}"
-                    break
-            if not out["blocker_now"]:
-                out["blocker_now"] = "Blocked by triggers: no clause is satisfied"
+    # Blocker now (best-effort explanation)
+    try:
+        if out["gate_now"] is True:
+            out["blocker_now"] = "Gate is true"
         else:
-            # Which clause(s) are true right now?
+            # Find first failing regime / clause for a minimal hint.
+            bl = ""
             try:
-                cls = entry_logic.get("clauses") or []
-                trigs: List[str] = []
-                for i, cl in enumerate(cls):
-                    if not cl:
+                reg = entry_logic.get("regime") or []
+                for c in reg:
+                    cm = _cond_mask(df_cov, c)
+                    if cm is None:
                         continue
-                    cm_all = pd.Series(True, index=df_cov.index)
-                    ok = True
-                    for c in (cl or []):
-                        if not isinstance(c, dict):
-                            continue
-                        cm = _cond_mask(df_cov, c)
-                        if cm is None:
-                            ok = False
-                            break
-                        cm_all &= cm
-                    if ok and bool(cm_all.iloc[-1]):
-                        trigs.append(chr(65 + i))
-                if trigs:
-                    out["blocker_now"] = "Gate is true (clause " + ", ".join(trigs) + ")"
-                else:
-                    out["blocker_now"] = "Gate is true"
+                    if not bool(cm.iloc[-1]):
+                        bl = _human_condition(c)
+                        break
             except Exception:
-                out["blocker_now"] = "Gate is true"
+                pass
+            if not bl:
+                # Clauses: identify which clauses are true/false at the last bar.
+                try:
+                    cls = entry_logic.get("clauses") or []
+                    ok_letters = []
+                    for i, cl in enumerate(cls):
+                        cm_all = pd.Series(True, index=df_cov.index)
+                        ok = True
+                        for c in (cl or []):
+                            cm = _cond_mask(df_cov, c)
+                            if cm is None:
+                                ok = False
+                                break
+                            cm_all &= cm
+                        if ok and bool(cm_all.iloc[-1]):
+                            ok_letters.append(chr(65 + i))
+                    if ok_letters:
+                        bl = f"Triggered (clause {', '.join(ok_letters)})"
+                    else:
+                        bl = "No trigger clause is true"
+                except Exception:
+                    pass
+            out["blocker_now"] = bl
     except Exception:
         pass
 
-    # Last-N strip (train slice)
+    # Snapshot windows (Early/Mid/Late) on train slice
     try:
-        lb = int(max(1, lookback))
-        tail = c_mask.iloc[-lb:]
-        bits = [bool(x) for x in tail.values.tolist()]
-        out["bits"] = bits
-        out["true_count"] = int(sum(bits))
-        out["lookback"] = int(len(bits))
-    except Exception:
-        pass
+        c_arr = [bool(x) for x in np.asarray(c_mask.values, dtype=bool)]
+        n_tr = int(len(c_arr))
+        w = _snap_window_len(n_tr, float(snap_window_pct), min_bars=int(snap_min_bars), max_bars=int(snap_max_bars))
+        out["snap_window_bars"] = int(w)
 
-
-    # Early / middle / late snapshots (train slice). Sanity check: "how often is the gate true" across time.
-    # This is NOT a performance estimate.
-    try:
-        w_snap = int(max(1, lookback))
-        w_snap = int(min(w_snap, len(c_mask)))
-        if w_snap >= 5:
-            c_arr = np.asarray(c_mask.values, dtype=bool)
-            n_tr = int(len(c_arr))
-
-            # Early = last w bars of the first third (avoids indicator warmup bias at the very beginning)
-            third_end = int(max(w_snap, n_tr // 3))
+        if w > 0:
+            # Early = last w bars of the first third (avoids warmup bias)
+            third_end = int(max(w, n_tr // 3))
             third_end = int(min(n_tr, third_end))
-            early = c_arr[int(max(0, third_end - w_snap)) : third_end]
+            early_raw = c_arr[int(max(0, third_end - w)) : third_end]
 
-            # Middle = centered window
             mid_center = n_tr // 2
-            mid_start = int(max(0, min(n_tr - w_snap, mid_center - (w_snap // 2))))
-            middle = c_arr[mid_start : mid_start + w_snap]
+            mid_start = int(max(0, min(max(0, n_tr - w), mid_center - (w // 2))))
+            mid_raw = c_arr[mid_start : mid_start + w]
 
-            # Late = last w bars
-            late = c_arr[-w_snap:]
+            late_raw = c_arr[-w:]
 
-            def _mk(name: str, arr: np.ndarray) -> Dict[str, Any]:
-                n0 = int(len(arr))
-                t0 = int(arr.sum())
-                pct0 = float((t0 / float(n0)) * 100.0) if n0 > 0 else None
-                return {"name": name, "n": n0, "true": t0, "pct": pct0, "bits": [bool(x) for x in arr.tolist()]}
+            snaps_raw = [("Early", early_raw), ("Mid", mid_raw), ("Late", late_raw)]
+            snaps = []
+            for nm, arr in snaps_raw:
+                nn = int(len(arr))
+                tn = int(sum(1 for x in arr if x))
+                pct = (tn / float(nn)) * 100.0 if nn else 0.0
+                snaps.append(
+                    {
+                        "name": nm,
+                        "bits": _downsample_bool_bits(arr, max_dots=int(snap_max_dots)),
+                        "true": tn,
+                        "n": nn,
+                        "pct": pct,
+                        "n_raw": nn,
+                    }
+                )
+            out["snapshots"] = snaps
 
-            out["snapshots"] = [_mk("Early", early), _mk("Mid", middle), _mk("Late", late)]
+            # Keep a compact strip in out["bits"] for legacy callers: use the Late window.
+            out["bits"] = _downsample_bool_bits(late_raw, max_dots=int(snap_max_dots))
+            out["true_count"] = int(sum(1 for x in late_raw if x))
+            out["lookback"] = int(w)
+
+            pct_ui = float(snap_window_pct) * 100.0
+            out["snap_note"] = f"Window = {pct_ui:.1f}% of train (capped at {int(snap_max_bars)} bars) → {int(w)} bars. Frequency only."
+        else:
+            out["snap_note"] = "Not enough data for snapshots."
     except Exception:
-        pass
+        out["snap_note"] = "Could not compute snapshots."
 
     out["ok"] = True
     return out
-
-
-
-
 def _cond_from_state(prefix: str, ss: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     # Reconstruct a builder condition from st.session_state (no UI).
     try:
@@ -4590,7 +4973,18 @@ def _render_skill_build_header(slot, *, df_feat: Optional[pd.DataFrame]) -> None
     else:
         eff_logic = _entry_logic_from_builder_state(ss)
 
-    snap = _entry_logic_snapshot(df_feat, eff_logic, train_frac=0.70, lookback=30) if df_feat is not None else {"ok": False}
+    snap_pct_ui = float(ss.get('new.gate_snap_pct', 2.0) or 2.0)
+    snap_max_bars = int(ss.get('new.gate_snap_max_bars', 200) or 200)
+    snap_max_bars = int(max(30, min(500, snap_max_bars)))
+    snap = _entry_logic_snapshot(df_feat, eff_logic, train_frac=0.70, snap_window_pct=float(snap_pct_ui)/100.0, snap_min_bars=1, snap_max_bars=snap_max_bars, snap_max_dots=120) if df_feat is not None else {'ok': False}
+    # Cache for downstream sections (keeps Gate logic visual + config snapshots in sync)
+    try:
+        ss["cache.gate.snap"] = snap
+        ss["cache.gate.eff_logic"] = eff_logic
+        ss["cache.gate.snap_pct_ui"] = float(snap_pct_ui)
+        ss["cache.gate.snap_max_bars"] = int(snap_max_bars)
+    except Exception:
+        pass
     cov = snap.get("coverage_pct") if isinstance(snap, dict) else None
     gate_now = snap.get("gate_now") if isinstance(snap, dict) else None
     blocker_now = str(snap.get("blocker_now") or "") if isinstance(snap, dict) else ""
@@ -5267,7 +5661,8 @@ def build_dca_baseline_params() -> Dict[str, Any]:
                     if not clauses:
                         st.warning("No trigger clause is enabled yet. Add at least one condition to at least one clause.")
 
-                    entry_logic = {"regime": reg_conds, "clauses": clauses}
+                    # Build logic from session state to match the visual/summary diagnostics.
+                    entry_logic = _entry_logic_from_builder_state(st.session_state)
 
                     # Live formula (shape) + human preview
                     try:
@@ -5296,9 +5691,33 @@ def build_dca_baseline_params() -> Dict[str, Any]:
                             plain_slot.markdown("**This gate means:**\n" + pe)
                     except Exception:
                         pass
-
+                    
+                    # Gate snapshot settings (window size for Early/Mid/Late dot bars)
+                    snap_pct_ui = float(st.session_state.get('new.gate_snap_pct', 2.0) or 2.0)
+                    snap_max_bars = int(st.session_state.get('new.gate_snap_max_bars', 200) or 200)
+                    with st.expander('Gate snapshot settings', expanded=False):
+                        snap_pct_ui = float(st.slider('Snapshot window (% of train)', min_value=1.0, max_value=5.0, value=float(snap_pct_ui), step=0.5, key='new.gate_snap_pct'))
+                        snap_max_bars = int(st.slider('Max bars per snapshot window', min_value=30, max_value=500, value=int(snap_max_bars), step=10, key='new.gate_snap_max_bars'))
+                    snap_max_bars = int(max(30, min(500, snap_max_bars)))
+                    
                     try:
-                        snap = _entry_logic_snapshot(df_feat, entry_logic, train_frac=0.70, lookback=30)
+                        snap = None
+                        try:
+                            _cached = st.session_state.get("cache.gate.snap")
+                            if isinstance(_cached, dict) and _cached.get("ok"):
+                                try:
+                                    if abs(float(_cached.get("snap_window_pct", 0.0)) - (float(snap_pct_ui) / 100.0)) < 1e-12 and int(_cached.get("snap_max_bars", 0)) == int(snap_max_bars):
+                                        snap = _cached
+                                except Exception:
+                                    pass
+                        except Exception:
+                            snap = None
+                        if snap is None:
+                            snap = _entry_logic_snapshot(df_feat, entry_logic, train_frac=0.70, snap_window_pct=float(snap_pct_ui)/100.0, snap_min_bars=1, snap_max_bars=snap_max_bars, snap_max_dots=120)
+                        try:
+                            st.session_state["cache.gate.snap"] = snap
+                        except Exception:
+                            pass
                         miss = snap.get("missing") or []
                         if miss:
                             now_slot.markdown(
@@ -5369,7 +5788,10 @@ def build_dca_baseline_params() -> Dict[str, Any]:
                                         + "</div>"
                                     )
                                 title = "<div style='font-size:0.78rem; opacity:0.70; margin-top:8px; margin-bottom:2px;'><b>How often the gate opens (train)</b> — Early / Mid / Late</div>"
-                                note = "<div style='font-size:0.74rem; opacity:0.60; margin-bottom:4px;'>30-bar windows (frequency only).</div>"
+                                note_txt = str(snap.get("snap_note") or "").strip()
+                                if not note_txt:
+                                    note_txt = "Frequency only (not a performance estimate)."
+                                note = "<div style='font-size:0.74rem; opacity:0.60; margin-bottom:4px;'>" + _escape_html(note_txt) + "</div>"
                                 snapshots_slot.markdown(title + note + "<div>" + "".join(rows) + "</div>", unsafe_allow_html=True)
                             else:
                                 try:
@@ -5446,42 +5868,50 @@ def build_dca_baseline_params() -> Dict[str, Any]:
                                             band = "Always-on"
 
                                         st.metric("Gate coverage", f"{cov:.1f}% ({band})")
-                                                                                # Coverage snapshots (sanity check across time; not performance)
+                                        # Coverage snapshots (sanity check across time; not performance)
                                         try:
-                                            w = int(min(30, len(c_mask)))
+                                            snap_pct_ui = float(st.session_state.get('new.gate_snap_pct', 2.0) or 2.0)
+                                            snap_window_pct = float(snap_pct_ui) / 100.0
+                                            snap_max_bars = int(st.session_state.get('new.gate_snap_max_bars', 200) or 200)
+                                            snap_max_bars = int(max(30, min(500, snap_max_bars)))
+                                            w = _snap_window_len(len(c_mask), snap_window_pct, min_bars=1, max_bars=snap_max_bars)
                                             if w >= 5:
                                                 c_arr = np.asarray(c_mask.values, dtype=bool)
                                                 n_tr = int(len(c_arr))
                                                 mid_center = n_tr // 2
                                                 mid_start = int(max(0, min(n_tr - w, mid_center - (w // 2))))
-                                                                                                # Early = last w bars of the first third (avoids warmup bias)
+                                                # Early = last w bars of the first third (avoids warmup bias)
                                                 third_end = int(max(w, n_tr // 3))
                                                 third_end = int(min(n_tr, third_end))
                                                 early = c_arr[int(max(0, third_end - w)) : third_end]
-
+                                        
                                                 snaps = [
-                                                    ("Early", early),
-                                                    ("Mid", c_arr[mid_start:mid_start + w]),
-                                                    ("Late", c_arr[-w:]),
+                                                    ('Early', early),
+                                                    ('Mid', c_arr[mid_start:mid_start + w]),
+                                                    ('Late', c_arr[-w:]),
                                                 ]
-
-                                                st.markdown("**How often the gate opens (train)**")
-                                                st.caption("30-bar windows (frequency only). Early = end of 1st third; Mid = center; Late = end.")
+                                        
+                                                st.markdown('**How often the gate opens (train)**')
+                                                note_txt = f"Window = {snap_pct_ui:.1f}% of train (capped at {snap_max_bars} bars) → {w} bars. Frequency only."
+                                                st.caption(note_txt + ' Early = end of 1st third; Mid = center; Late = end.')
                                                 s_cols = st.columns(3)
                                                 for col, (nm, arr) in zip(s_cols, snaps):
-                                                    tn = int(arr.sum())
-                                                    pct = (tn / float(w)) * 100.0
-                                                    strip_html = _gate_strip_html([bool(x) for x in arr])
+                                                    arr_list = [bool(x) for x in arr]
+                                                    tn = int(sum(1 for x in arr_list if x))
+                                                    nn = int(len(arr_list))
+                                                    pct = (tn / float(nn)) * 100.0 if nn else 0.0
+                                                    strip_bits = _downsample_bool_bits(arr_list, max_dots=120)
+                                                    strip_html = _gate_strip_html(strip_bits)
                                                     col.markdown(
                                                         f"<div style='border:1px solid rgba(49,51,63,0.10); border-radius:12px; padding:10px 10px 8px 10px; background:rgba(255,255,255,0.45);'>"
                                                         f"<div style='font-weight:650; font-size:0.86rem; margin-bottom:6px;'>{nm}</div>"
                                                         f"{strip_html}"
-                                                        f"<div style='font-size:0.78rem; opacity:0.72; margin-top:6px;'>{tn}/{w} bars true ({pct:.1f}%)</div>"
+                                                        f"<div style='font-size:0.78rem; opacity:0.72; margin-top:6px;'>{tn}/{nn} bars true ({pct:.1f}%)</div>"
                                                         f"</div>",
                                                         unsafe_allow_html=True,
                                                     )
                                             else:
-                                                st.caption("Not enough bars in the train slice for coverage snapshots.")
+                                                st.caption('Not enough bars in the train slice for coverage snapshots.')
                                         except Exception:
                                             pass
 
@@ -6641,59 +7071,137 @@ if open_existing == "(new run)":
     # Shared: staging dir for temp files
     tmp_dir = TMP_DIR
 
+
     # -------------------------------------------------------------------------
     # Step 0: Data
     # -------------------------------------------------------------------------
     if step == 0:
-        st.write("Pick the dataset you want to test against (daily OHLCV for spot).")
+        st.write("Choose the market data you want to test against (spot, daily OHLCV).")
 
-        uploaded = st.file_uploader("Upload OHLCV CSV", type=["csv"], key="new.upload")
+        catalog = _get_dataset_catalog()
+        use_counts = st.session_state.get("data.use_counts", {}) if isinstance(st.session_state.get("data.use_counts", {}), dict) else {}
 
-        sample_csv = DATA_DIR / "eth_daily_2023_to_now.csv"
-        use_sample = st.checkbox(
-            f"Use sample dataset ({sample_csv.name})",
-            value=(uploaded is None and sample_csv.exists()),
-            key="new.use_sample",
-        )
+        if not catalog:
+            st.error("No datasets found.")
+            st.caption("Add datasets under ./data (or ./data/datasets) or provide a catalog.json.")
+        else:
+            left, right = st.columns([1, 1], gap="large")
 
-        data_path: Optional[Path] = None
-        if use_sample and sample_csv.exists():
-            data_path = sample_csv
-        elif uploaded is not None:
-            out = tmp_dir / f"upload_{_now_slug()}_{_slug(uploaded.name)}"
-            out.write_bytes(uploaded.getvalue())
-            data_path = out
+            # Normalize ids + build lookup
+            by_id: Dict[str, Dict[str, Any]] = {}
+            for d in catalog:
+                if not isinstance(d, dict):
+                    continue
+                did = str(d.get("id") or "").strip()
+                if not did:
+                    # best-effort id fallback
+                    p = _resolve_dataset_path(d) or Path(str(d.get("file_path") or d.get("path") or ""))
+                    did = f"{str(d.get('symbol') or _infer_symbol_from_filename(str(p.name)))}:{str(p)}"
+                    d["id"] = did
+                by_id[did] = d
 
-        if data_path is not None:
-            st.session_state["new.data_path"] = str(data_path)
+            with left:
+                q = st.text_input("Search coins", key="new.data_search", placeholder="e.g., BTC, ETH, Solana…")
+                sort_by = st.selectbox(
+                    "Sort by",
+                    ["Most used", "Alphabetical", "Longest history", "Newest added"],
+                    index=0,
+                    key="new.data_sort",
+                )
+                st.caption("Timeframe: Daily (v1)")
 
-            df_preview = _load_csv(data_path)
-            if df_preview is not None and not df_preview.empty:
-                st.caption(f"Rows: {len(df_preview):,}  Columns: {list(df_preview.columns)}")
-                # Light chart if possible
-                if px is not None:
-                    # Try to detect a date column
-                    dt_col = None
-                    for c in ["dt", "date", "timestamp", "ts"]:
-                        if c in df_preview.columns:
-                            dt_col = c
-                            break
-                    if dt_col:
-                        try:
-                            dfx = df_preview.copy()
-                            dfx[dt_col] = pd.to_datetime(dfx[dt_col], errors="coerce", utc=True)
-                            dfx = dfx.dropna(subset=[dt_col])
-                            if "close" in dfx.columns:
-                                fig = px.line(dfx.tail(2000), x=dt_col, y="close", title="Close (tail)")
-                                _plotly(fig)
-                        except Exception:
-                            pass
-            else:
-                st.warning("Could not preview dataset (CSV parse failed).")
+                filtered = _sort_filter_catalog(list(by_id.values()), q, sort_by, use_counts=use_counts)
+                ids = [str(d.get("id")) for d in filtered if str(d.get("id") or "").strip()]
+
+                if not ids:
+                    st.info("No matches. Try clearing the search.")
+                    st.session_state.pop("new.data_id", None)
+                    st.session_state.pop("new.data_path", None)
+                else:
+                    cur = str(st.session_state.get("new.data_id") or "")
+                    if cur not in ids:
+                        cur = ids[0]
+
+                    sel = st.selectbox(
+                        "Dataset",
+                        ids,
+                        index=ids.index(cur),
+                        format_func=lambda _id: _dataset_option_label(by_id.get(_id, {})),
+                        key="new.data_id",
+                    )
+
+                    entry = by_id.get(str(sel), {})
+                    data_path = _resolve_dataset_path(entry)
+                    if data_path is not None and data_path.exists():
+                        st.session_state["new.data_path"] = str(data_path)
+                    else:
+                        st.session_state.pop("new.data_path", None)
+                        st.warning("Dataset file not found on disk.")
+
+                    # small scan table (read-only)
+                    try:
+                        rows = []
+                        for d in filtered[:80]:
+                            rows.append(
+                                {
+                                    "Symbol": str(d.get("symbol") or "").upper(),
+                                    "Start": _safe_dt_str(d.get("start_dt") or d.get("start") or d.get("start_date")),
+                                    "End": _safe_dt_str(d.get("end_dt") or d.get("end") or d.get("end_date")),
+                                    "Bars": d.get("rows") or d.get("n_rows") or d.get("bars") or "",
+                                }
+                            )
+                        if rows:
+                            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                    except Exception:
+                        pass
+
+            with right:
+                sel_id = str(st.session_state.get("new.data_id") or "")
+                entry = by_id.get(sel_id, {}) if sel_id else {}
+                data_path_str = st.session_state.get("new.data_path")
+                if data_path_str:
+                    p = Path(str(data_path_str))
+                    st.markdown("##### Preview")
+                    st.caption(_dataset_option_label(entry))
+
+                    df_preview = _load_any_df_tail(p, n=2500)
+                    if df_preview is not None and not df_preview.empty:
+                        st.caption(f"Rows (loaded): {len(df_preview):,}  Columns: {list(df_preview.columns)}")
+                        if px is not None:
+                            dt_col = None
+                            for c in ["dt", "date", "datetime", "timestamp", "ts"]:
+                                if c in df_preview.columns:
+                                    dt_col = c
+                                    break
+                            if dt_col and "close" in df_preview.columns:
+                                try:
+                                    dfx = df_preview.copy()
+                                    dfx[dt_col] = pd.to_datetime(dfx[dt_col], errors="coerce", utc=True)
+                                    dfx = dfx.dropna(subset=[dt_col])
+                                    fig = px.line(dfx, x=dt_col, y="close", title="Close (tail)")
+                                    _plotly(fig)
+                                except Exception:
+                                    pass
+                    else:
+                        st.warning("Could not preview dataset (parse failed).")
+                else:
+                    st.info("Pick a dataset to see a preview.")
 
         colL, colR = st.columns(2)
         with colL:
             if st.button("Next →", type="primary", disabled=("new.data_path" not in st.session_state)):
+                # track usage (helps 'Most used' sort)
+                try:
+                    did = str(st.session_state.get("new.data_id") or "")
+                    if did:
+                        counts = st.session_state.get("data.use_counts")
+                        if not isinstance(counts, dict):
+                            counts = {}
+                        counts[did] = int(counts.get(did, 0)) + 1
+                        st.session_state["data.use_counts"] = counts
+                except Exception:
+                    pass
+
                 st.session_state["new.step"] = 1
                 st.rerun()
 
