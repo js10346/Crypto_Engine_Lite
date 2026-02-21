@@ -16,7 +16,7 @@ import threading
 import queue
 from collections import deque, defaultdict
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, date
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -2281,6 +2281,138 @@ def _infer_bar_ms_from_csv(path: Path) -> Optional[int]:
         return None
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Date range helpers (dataset slicing for backtest window)
+# ---------------------------------------------------------------------------
+
+_DT_COL_CANDIDATES = ("dt", "date", "datetime", "timestamp", "time", "ts")
+
+def _dt_series_from_df(df: pd.DataFrame) -> Optional[pd.Series]:
+    """Return a UTC pd.Series[datetime64[ns, UTC]] for the best-effort datetime column."""
+    if df is None or df.empty:
+        return None
+    cols = list(df.columns)
+    # prefer common names first
+    dt_col = None
+    for c in _DT_COL_CANDIDATES:
+        if c in cols:
+            dt_col = c
+            break
+    if not dt_col:
+        return None
+    s = df[dt_col]
+    try:
+        if dt_col == "ts":
+            # Heuristic: seconds vs ms
+            v = pd.to_numeric(s, errors="coerce")
+            v_med = float(v.dropna().iloc[len(v.dropna()) // 2]) if len(v.dropna()) > 0 else 0.0
+            unit = "ms" if v_med > 1e11 else "s"
+            return pd.to_datetime(v, errors="coerce", utc=True, unit=unit)
+        return pd.to_datetime(s, errors="coerce", utc=True)
+    except Exception:
+        try:
+            return pd.to_datetime(s, errors="coerce")
+        except Exception:
+            return None
+
+def _filter_df_to_date_range(df: pd.DataFrame, start_iso: Optional[str], end_iso: Optional[str]) -> pd.DataFrame:
+    """Filter df to [start_date, end_date] inclusive (dates are ISO YYYY-MM-DD)."""
+    if df is None or df.empty:
+        return df
+    if not start_iso or not end_iso:
+        return df
+    dt_s = _dt_series_from_df(df)
+    if dt_s is None:
+        return df
+    try:
+        start_ts = pd.Timestamp(start_iso).tz_localize("UTC")
+        end_excl = pd.Timestamp(end_iso).tz_localize("UTC") + pd.Timedelta(days=1)
+        m = (dt_s >= start_ts) & (dt_s < end_excl)
+        return df.loc[m].copy()
+    except Exception:
+        return df
+
+def _entry_bounds_iso(entry: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    start_s = _safe_dt_str(entry.get("start_dt") or entry.get("start") or entry.get("start_date"))
+    end_s = _safe_dt_str(entry.get("end_dt") or entry.get("end") or entry.get("end_date"))
+    return (start_s or None, end_s or None)
+
+@st.cache_data(show_spinner=False)
+def _infer_dataset_bounds_from_file(path_str: str, mtime: float) -> Tuple[Optional[str], Optional[str]]:
+    """Best-effort (start_iso, end_iso) from the file itself. Assumes data is time-sorted."""
+    try:
+        p = Path(path_str)
+        if not p.exists():
+            return (None, None)
+        # CSV: read small head + tail
+        if p.suffix.lower() in {".csv", ".gz"}:
+            try:
+                head = pd.read_csv(p, nrows=2000)
+            except Exception:
+                head = None
+            try:
+                tail = _load_any_df_tail(p, n=2000)
+            except Exception:
+                tail = None
+            parts = []
+            if head is not None and not head.empty:
+                parts.append(head)
+            if tail is not None and not tail.empty:
+                parts.append(tail)
+            if not parts:
+                return (None, None)
+            df = pd.concat(parts, ignore_index=True)
+        else:
+            # Parquet is typically small enough in v1; load and infer.
+            df = _load_any_df(p)
+            if df is None or df.empty:
+                return (None, None)
+        dt_s = _dt_series_from_df(df)
+        if dt_s is None:
+            return (None, None)
+        dt_s = dt_s.dropna()
+        if dt_s.empty:
+            return (None, None)
+        start_iso = dt_s.min().date().isoformat()
+        end_iso = dt_s.max().date().isoformat()
+        return (start_iso, end_iso)
+    except Exception:
+        return (None, None)
+
+@st.cache_data(show_spinner=False)
+def _load_preview_df_for_date_range(path_str: str, mtime: float, start_iso: Optional[str], end_iso: Optional[str], max_rows: int = 2500) -> Optional[pd.DataFrame]:
+    """Load a preview df for the selected range (downsampled if needed)."""
+    try:
+        p = Path(path_str)
+        df = _load_any_df(p)
+        if df is None or df.empty:
+            return df
+        if start_iso and end_iso:
+            df = _filter_df_to_date_range(df, start_iso, end_iso)
+        if df is None or df.empty:
+            return df
+        # Downsample for chart friendliness
+        if len(df) > max_rows:
+            step = int(max(1, math.ceil(len(df) / float(max_rows))))
+            df = df.iloc[::step].copy()
+        return df
+    except Exception:
+        return None
+
+def _write_dataset_slice_for_run(data_path: Path, out_path: Path, start_iso: str, end_iso: str) -> Path:
+    """Write a parquet slice for the selected date range; returns out_path."""
+    df = _load_any_df(data_path)
+    if df is None or df.empty:
+        raise ValueError("Could not load dataset for slicing.")
+    df2 = _filter_df_to_date_range(df, start_iso, end_iso)
+    if df2 is None or df2.empty:
+        raise ValueError("Selected date range produced 0 rows.")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    df2.to_parquet(out_path, index=False)
+    return out_path
+
 
 
 def _bars_per_day_from_run_meta(run_dir: Path) -> int:
@@ -5160,6 +5292,23 @@ def build_dca_baseline_params() -> Dict[str, Any]:
         except Exception:
             df_feat = None
 
+
+    # Apply optional date range slice (set in Data step)
+    try:
+        range_mode = str(st.session_state.get("new.data_range_mode") or "Full history")
+        start_iso = st.session_state.get("new.data_range_start")
+        end_iso = st.session_state.get("new.data_range_end")
+        if (
+            df_feat is not None
+            and not df_feat.empty
+            and range_mode.startswith("Custom")
+            and start_iso
+            and end_iso
+        ):
+            df_feat = _filter_df_to_date_range(df_feat, str(start_iso), str(end_iso))
+    except Exception:
+        pass
+
     # Skill build header (cards + flow)
     _render_skill_build_header(header_slot, df_feat=df_feat)
 
@@ -7079,7 +7228,17 @@ if open_existing == "(new run)":
         st.write("Choose the market data you want to test against (spot, daily OHLCV).")
 
         catalog = _get_dataset_catalog()
+
+        # Lightweight, session-only personalization (v1)
         use_counts = st.session_state.get("data.use_counts", {}) if isinstance(st.session_state.get("data.use_counts", {}), dict) else {}
+        fav_list = st.session_state.get("data.favorites", [])
+        if not isinstance(fav_list, list):
+            fav_list = []
+        recent_list = st.session_state.get("data.recent", [])
+        if not isinstance(recent_list, list):
+            recent_list = []
+        fav_set = set(str(x) for x in fav_list if str(x).strip())
+        recent_list = [str(x) for x in recent_list if str(x).strip()]
 
         if not catalog:
             st.error("No datasets found.")
@@ -7101,72 +7260,280 @@ if open_existing == "(new run)":
                 by_id[did] = d
 
             with left:
+                # --- Controls ---
                 q = st.text_input("Search coins", key="new.data_search", placeholder="e.g., BTC, ETH, Solana…")
+
+                view = st.selectbox(
+                    "View",
+                    ["All", "Favorites", "Recent"],
+                    index=0,
+                    key="new.data_view",
+                    help="Favorites and Recent are stored for this session only (v1).",
+                )
+
+                sort_opts = ["Alphabetical", "Longest history", "Newest added", "Most used"]
+                default_sort = "Most used" if len(use_counts) > 0 else "Alphabetical"
                 sort_by = st.selectbox(
                     "Sort by",
-                    ["Most used", "Alphabetical", "Longest history", "Newest added"],
-                    index=0,
+                    sort_opts,
+                    index=sort_opts.index(default_sort),
                     key="new.data_sort",
                 )
-                st.caption("Timeframe: Daily (v1)")
 
-                filtered = _sort_filter_catalog(list(by_id.values()), q, sort_by, use_counts=use_counts)
+                # Timeframe badge (v1)
+                st.markdown(
+                    '<div style="margin-top:6px;">'
+                    '<span style="display:inline-block;padding:2px 10px;border-radius:999px;'
+                    'background:#EEF2FF;color:#3730A3;font-size:12px;font-weight:600;">'
+                    'Timeframe: Daily</span>'
+                    '<span style="margin-left:8px;color:#6B7280;font-size:12px;">(v1)</span>'
+                    '</div>',
+                    unsafe_allow_html=True,
+                )
+
+                # --- Build filtered list ---
+                base: List[Dict[str, Any]]
+                if view == "Favorites":
+                    base = [by_id[i] for i in by_id.keys() if i in fav_set]
+                elif view == "Recent":
+                    base = [by_id[i] for i in recent_list if i in by_id]
+                else:
+                    base = list(by_id.values())
+
+                # Apply sort/filter helper (except keep Recent order by default)
+                if view == "Recent":
+                    # simple text filter over option labels
+                    qx = (q or "").strip().lower()
+                    if qx:
+                        base = [d for d in base if qx in _dataset_option_label(d).lower()]
+                    filtered = base
+                else:
+                    filtered = _sort_filter_catalog(base, q, sort_by, use_counts=use_counts)
+
                 ids = [str(d.get("id")) for d in filtered if str(d.get("id") or "").strip()]
+                st.caption(f"Library: **{len(by_id):,}** datasets loaded")
 
                 if not ids:
-                    st.info("No matches. Try clearing the search.")
-                    st.session_state.pop("new.data_id", None)
-                    st.session_state.pop("new.data_path", None)
+                    st.info("No matches. Try clearing the search or switching the view.")
+                    st.session_state.pop("new.data_candidate_id", None)
+                    st.session_state.pop("new.data_candidate_path", None)
                 else:
-                    cur = str(st.session_state.get("new.data_id") or "")
-                    if cur not in ids:
-                        cur = ids[0]
+                    committed_id = str(st.session_state.get("new.data_id") or "")
+                    cur = str(st.session_state.get("new.data_candidate_id") or "")
+                    if not cur or cur not in ids:
+                        cur = committed_id if committed_id in ids else ids[0]
 
                     sel = st.selectbox(
                         "Dataset",
                         ids,
                         index=ids.index(cur),
                         format_func=lambda _id: _dataset_option_label(by_id.get(_id, {})),
-                        key="new.data_id",
+                        key="new.data_candidate_id",
                     )
 
                     entry = by_id.get(str(sel), {})
-                    data_path = _resolve_dataset_path(entry)
-                    if data_path is not None and data_path.exists():
-                        st.session_state["new.data_path"] = str(data_path)
+                    cand_path = _resolve_dataset_path(entry)
+                    if cand_path is not None and cand_path.exists():
+                        st.session_state["new.data_candidate_path"] = str(cand_path)
                     else:
-                        st.session_state.pop("new.data_path", None)
+                        st.session_state.pop("new.data_candidate_path", None)
                         st.warning("Dataset file not found on disk.")
 
-                    # small scan table (read-only)
+
+                    # Backtest date range (affects all later steps + the final run)
                     try:
-                        rows = []
-                        for d in filtered[:80]:
-                            rows.append(
-                                {
-                                    "Symbol": str(d.get("symbol") or "").upper(),
-                                    "Start": _safe_dt_str(d.get("start_dt") or d.get("start") or d.get("start_date")),
-                                    "End": _safe_dt_str(d.get("end_dt") or d.get("end") or d.get("end_date")),
-                                    "Bars": d.get("rows") or d.get("n_rows") or d.get("bars") or "",
-                                }
-                            )
-                        if rows:
-                            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                        prev_sel = str(st.session_state.get("new.data_candidate_id_prev") or "")
+                        if prev_sel != str(sel):
+                            st.session_state["new.data_range_mode"] = "Full history"
+                            st.session_state.pop("new.data_range_dates", None)
+                            st.session_state["new.data_range_start"] = None
+                            st.session_state["new.data_range_end"] = None
+                        st.session_state["new.data_candidate_id_prev"] = str(sel)
                     except Exception:
                         pass
 
+                    bounds_start, bounds_end = _entry_bounds_iso(entry)
+                    if (not bounds_start) or (not bounds_end):
+                        try:
+                            bounds_start, bounds_end = _infer_dataset_bounds_from_file(str(cand_path), os.path.getmtime(str(cand_path)))
+                        except Exception:
+                            bounds_start, bounds_end = (None, None)
+
+                    if "new.data_range_mode" not in st.session_state:
+                        st.session_state["new.data_range_mode"] = "Full history"
+
+                    def _safe_to_date(_x):
+                        try:
+                            _ts = pd.to_datetime(_x, utc=True, errors='coerce')
+                            if _ts is pd.NaT:
+                                return None
+                            return _ts.date()
+                        except Exception:
+                            return None
+
+                    def _on_backtest_mode_change():
+                        _m = str(st.session_state.get('new.data_range_mode') or 'Full history')
+                        if _m != 'Custom dates':
+                            # Clear the effective range so later steps truly use full history.
+                            st.session_state['new.data_range_start'] = None
+                            st.session_state['new.data_range_end'] = None
+
+                    st.markdown("##### Backtest dates")
+                    if bounds_start and bounds_end:
+                        min_d = _safe_to_date(bounds_start)
+                        max_d = _safe_to_date(bounds_end)
+                        if min_d and max_d and min_d > max_d:
+                            min_d, max_d = max_d, min_d
+
+                        if min_d and max_d:
+                            mode = st.radio(
+                                'Backtest window',
+                                options=['Full history', 'Custom dates'],
+                                key='new.data_range_mode',
+                                horizontal=True,
+                                on_change=_on_backtest_mode_change,
+                            )
+
+                            if mode == 'Custom dates':
+                                try:
+                                    cur = st.session_state.get('new.data_range_dates')
+                                    if isinstance(cur, (list, tuple)) and len(cur) == 2 and cur[0] and cur[1]:
+                                        v0, v1 = cur[0], cur[1]
+                                    else:
+                                        cur_start = st.session_state.get('new.data_range_start') or bounds_start
+                                        cur_end = st.session_state.get('new.data_range_end') or bounds_end
+                                        v0 = _safe_to_date(cur_start) or min_d
+                                        v1 = _safe_to_date(cur_end) or max_d
+                                except Exception:
+                                    v0, v1 = (min_d, max_d)
+
+                                # Clamp defaults into bounds
+                                if v0 < min_d:
+                                    v0 = min_d
+                                if v1 > max_d:
+                                    v1 = max_d
+                                if v0 > v1:
+                                    v0, v1 = v1, v0
+
+                                dr = st.date_input(
+                                    'Date range',
+                                    value=(v0, v1),
+                                    min_value=min_d,
+                                    max_value=max_d,
+                                    key='new.data_range_dates',
+                                )
+                                if isinstance(dr, (list, tuple)) and len(dr) == 2 and dr[0] and dr[1]:
+                                    d0, d1 = dr[0], dr[1]
+                                    if d0 > d1:
+                                        d0, d1 = d1, d0
+                                    st.session_state['new.data_range_start'] = d0.isoformat()
+                                    st.session_state['new.data_range_end'] = d1.isoformat()
+
+                                st.caption(
+                                    f"Using **{st.session_state.get('new.data_range_start')} → {st.session_state.get('new.data_range_end')}**."
+                                )
+                            else:
+                                # Enforce invariant: full history means no effective custom slice.
+                                st.session_state['new.data_range_start'] = None
+                                st.session_state['new.data_range_end'] = None
+                                st.caption(f"Full history: **{bounds_start} → {bounds_end}**.")
+                        else:
+                            # Bounds exist but couldn't parse them; fall back to full history display.
+                            st.session_state['new.data_range_start'] = None
+                            st.session_state['new.data_range_end'] = None
+                            st.caption(f"Full history: **{bounds_start} → {bounds_end}**.")
+                    else:
+                        st.caption("Backtest dates are unavailable for this dataset (couldn't infer start/end).")
+
+                    # Favorites toggle (session only)
+                    is_fav = str(sel) in fav_set
+                    colA, colB = st.columns([1, 1])
+                    with colA:
+                        if st.button("★ Favorited" if is_fav else "☆ Add to favorites", key="fav_toggle_btn"):
+                            if is_fav:
+                                fav_set.discard(str(sel))
+                            else:
+                                fav_set.add(str(sel))
+                            st.session_state["data.favorites"] = sorted(fav_set)
+                            st.rerun()
+                    with colB:
+                        # Commit selection for this run
+                        use_disabled = ("new.data_candidate_path" not in st.session_state)
+                        committed_here = (str(st.session_state.get("new.data_id") or "") == str(sel)) and ("new.data_path" in st.session_state)
+                        use_label = "Selected ✓" if committed_here else "Use this dataset"
+                        if st.button(use_label, type="primary", disabled=use_disabled or committed_here, key="use_dataset_btn"):
+                            p = Path(str(st.session_state.get("new.data_candidate_path")))
+                            st.session_state["new.data_id"] = str(sel)
+                            st.session_state["new.data_path"] = str(p)
+
+                            # Track recent + most-used (session only)
+                            try:
+                                # recent
+                                rl = [x for x in recent_list if x != str(sel)]
+                                rl.insert(0, str(sel))
+                                st.session_state["data.recent"] = rl[:10]
+                                # use counts
+                                counts = use_counts if isinstance(use_counts, dict) else {}
+                                counts[str(sel)] = int(counts.get(str(sel), 0)) + 1
+                                st.session_state["data.use_counts"] = counts
+                            except Exception:
+                                pass
+                            st.rerun()
+
+                    if str(st.session_state.get("new.data_id") or "") == str(sel) and "new.data_path" in st.session_state:
+                        st.success("This dataset is selected for the current run.")
+
             with right:
-                sel_id = str(st.session_state.get("new.data_id") or "")
+                sel_id = str(st.session_state.get("new.data_candidate_id") or "")
                 entry = by_id.get(sel_id, {}) if sel_id else {}
-                data_path_str = st.session_state.get("new.data_path")
+                data_path_str = st.session_state.get("new.data_candidate_path") or st.session_state.get("new.data_path")
                 if data_path_str:
                     p = Path(str(data_path_str))
                     st.markdown("##### Preview")
-                    st.caption(_dataset_option_label(entry))
 
-                    df_preview = _load_any_df_tail(p, n=2500)
+                    # Facts strip (human-readable)
+                    sym = str(entry.get("symbol") or "").upper()
+                    nm = str(entry.get("name") or "").strip()
+                    tf = str(entry.get("timeframe") or entry.get("tf") or "1D").upper()
+                    src = str(entry.get("source") or entry.get("exchange") or "").strip()
+                    start_s = _safe_dt_str(entry.get("start_dt") or entry.get("start") or entry.get("start_date"))
+                    end_s = _safe_dt_str(entry.get("end_dt") or entry.get("end") or entry.get("end_date"))
+                    bars = entry.get("rows") or entry.get("n_rows") or entry.get("bars") or ""
+                    title = f"**{sym}**" + (f" — {nm}" if nm else "")
+                    st.markdown(title)
+                    parts = []
+                    if start_s or end_s:
+                        parts.append(f"Range: {start_s or '—'} → {end_s or '—'}")
+                    if bars != "":
+                        parts.append(f"Bars: {bars}")
+                    if tf:
+                        parts.append(f"TF: {tf}")
+                    if src:
+                        parts.append(f"Source: {src}")
+                    if parts:
+                        st.caption(" · ".join(parts))
+
+
+                    range_mode = str(st.session_state.get("new.data_range_mode") or "Full history")
+                    start_sel = st.session_state.get("new.data_range_start")
+                    end_sel = st.session_state.get("new.data_range_end")
+                    use_custom = bool(range_mode.startswith("Custom") and start_sel and end_sel)
+
+                    if use_custom:
+                        st.caption(f"Backtest: **{start_sel} → {end_sel}**")
+                        df_preview = _load_preview_df_for_date_range(
+                            str(p),
+                            os.path.getmtime(str(p)),
+                            str(start_sel),
+                            str(end_sel),
+                            max_rows=2500,
+                        )
+                        chart_title = "Close (selected range)"
+                    else:
+                        df_preview = _load_any_df_tail(p, n=2500)
+                        chart_title = "Close (tail)"
+
                     if df_preview is not None and not df_preview.empty:
-                        st.caption(f"Rows (loaded): {len(df_preview):,}  Columns: {list(df_preview.columns)}")
                         if px is not None:
                             dt_col = None
                             for c in ["dt", "date", "datetime", "timestamp", "ts"]:
@@ -7178,10 +7545,15 @@ if open_existing == "(new run)":
                                     dfx = df_preview.copy()
                                     dfx[dt_col] = pd.to_datetime(dfx[dt_col], errors="coerce", utc=True)
                                     dfx = dfx.dropna(subset=[dt_col])
-                                    fig = px.line(dfx, x=dt_col, y="close", title="Close (tail)")
+                                    fig = px.line(dfx, x=dt_col, y="close", title=chart_title)
                                     _plotly(fig)
                                 except Exception:
                                     pass
+                        with st.expander("Technical details", expanded=False):
+                            st.caption(f"File: `{p}`")
+                            st.caption(f"Rows (loaded): {len(df_preview):,}")
+                            st.code(list(df_preview.columns))
+
                     else:
                         st.warning("Could not preview dataset (parse failed).")
                 else:
@@ -7190,21 +7562,8 @@ if open_existing == "(new run)":
         colL, colR = st.columns(2)
         with colL:
             if st.button("Next →", type="primary", disabled=("new.data_path" not in st.session_state)):
-                # track usage (helps 'Most used' sort)
-                try:
-                    did = str(st.session_state.get("new.data_id") or "")
-                    if did:
-                        counts = st.session_state.get("data.use_counts")
-                        if not isinstance(counts, dict):
-                            counts = {}
-                        counts[did] = int(counts.get(did, 0)) + 1
-                        st.session_state["data.use_counts"] = counts
-                except Exception:
-                    pass
-
                 st.session_state["new.step"] = 1
                 st.rerun()
-
     # -------------------------------------------------------------------------
     # Step 1: Plan
     # -------------------------------------------------------------------------
@@ -7691,7 +8050,13 @@ if open_existing == "(new run)":
 
             grid_n = int(st.session_state.get("new.grid_n", 0) or 0)
             strat = str(st.session_state.get("new.strategy_name", "strategy"))
-            st.caption(f"Testing **{grid_n:,} variations** of **{strat}** on **{data_path.stem}**. Compute mode: **{compute_mode}**.")
+            range_mode = str(st.session_state.get("new.data_range_mode") or "Full history")
+            start_iso = st.session_state.get("new.data_range_start")
+            end_iso = st.session_state.get("new.data_range_end")
+            range_suffix = ""
+            if range_mode.startswith("Custom") and start_iso and end_iso:
+                range_suffix = f" · Range: **{start_iso} → {end_iso}**"
+            st.caption(f"Testing **{grid_n:,} variations** of **{strat}** on **{data_path.stem}**{range_suffix}. Compute mode: **{compute_mode}**.")
 
         # Layout: left (controls) + right (receipt)
         left, right = st.columns([0.62, 0.38], gap="large")
@@ -7879,7 +8244,7 @@ if open_existing == "(new run)":
         # Rough bars/day hint for defaults
         bars_per_day_hint = 1
         try:
-            bar_ms_hint = _infer_bar_ms_from_csv(data_path)
+            bar_ms_hint = _infer_bar_ms_from_csv(effective_data_path)
             if bar_ms_hint:
                 bars_per_day_hint = int(max(1, round(86_400_000 / float(bar_ms_hint))))
         except Exception:
@@ -8138,12 +8503,29 @@ if open_existing == "(new run)":
                 # 3) Batch
                 template_path = str(st.session_state.get("new.template_path", "strategies.dca_swing:Strategy"))
                 market_mode = str(st.session_state.get("new.market_mode", "spot"))
+                # Optional date range slice (keeps the engine untouched by passing a sliced dataset file)
+                effective_data_path = data_path
+                range_mode = str(st.session_state.get("new.data_range_mode") or "Full history")
+                start_iso = st.session_state.get("new.data_range_start")
+                end_iso = st.session_state.get("new.data_range_end")
+                if range_mode.startswith("Custom") and start_iso and end_iso:
+                    try:
+                        slice_path = tmp_run_dir / f"data_slice_{start_iso}_to_{end_iso}.parquet"
+                        effective_data_path = _write_dataset_slice_for_run(
+                            data_path, slice_path, str(start_iso), str(end_iso)
+                        )
+                    except Exception as e:
+                        st.warning(
+                            f"Date range slice failed; falling back to full history. ({e})"
+                        )
+                        effective_data_path = data_path
+
                 batch_cmd: List[str] = [
                     PY,
                     "-m",
                     "engine.batch",
                     "--data",
-                    str(data_path),
+                    str(effective_data_path),
                     "--grid",
                     str(grid_path),
                     "--template",
@@ -8203,7 +8585,12 @@ if open_existing == "(new run)":
                 meta.update({
                     "run_name": str(run_name),
                     "grid_path": str(grid_path),
-                    "data_path": str(data_path),
+                                        "data_path": str(effective_data_path),
+                    "data": str(effective_data_path),
+                    "data_path_original": str(data_path),
+                    "data_range_mode": range_mode,
+                    "data_range_start": str(start_iso) if start_iso else None,
+                    "data_range_end": str(end_iso) if end_iso else None,
                     "template": str(template_path),
                     "market_mode": market_mode,
                     "bars_per_day": int(bars_per_day),

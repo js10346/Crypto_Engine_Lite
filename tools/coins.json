@@ -1,0 +1,11 @@
+{
+  "default_quote": "USDT",
+  "timeframe": "1d",
+  "coins": [
+    {"symbol": "BTC", "enabled": true, "name": "Bitcoin"},
+    {"symbol": "ETH", "enabled": true, "name": "Ethereum"},
+    {"symbol": "SOL", "enabled": true, "name": "Solana"},
+    {"symbol": "BNB", "enabled": true, "name": "BNB"},
+    {"symbol": "XRP", "enabled": true, "name": "XRP"}
+  ]
+}
