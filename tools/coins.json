@@ -2,10 +2,263 @@
   "default_quote": "USDT",
   "timeframe": "1d",
   "coins": [
-    {"symbol": "BTC", "enabled": true, "name": "Bitcoin"},
-    {"symbol": "ETH", "enabled": true, "name": "Ethereum"},
-    {"symbol": "SOL", "enabled": true, "name": "Solana"},
-    {"symbol": "BNB", "enabled": true, "name": "BNB"},
-    {"symbol": "XRP", "enabled": true, "name": "XRP"}
-  ]
+    {
+      "symbol": "BTC",
+      "name": "Bitcoin",
+      "enabled": true
+    },
+    {
+      "symbol": "ETH",
+      "name": "Ethereum",
+      "enabled": true
+    },
+    {
+      "symbol": "SOL",
+      "name": "Solana",
+      "enabled": true
+    },
+    {
+      "symbol": "BNB",
+      "name": "BNB",
+      "enabled": true
+    },
+    {
+      "symbol": "XRP",
+      "name": "XRP",
+      "enabled": true
+    },
+    {
+      "symbol": "TRX",
+      "name": "TRON",
+      "enabled": true
+    },
+    {
+      "symbol": "DOGE",
+      "name": "Dogecoin",
+      "enabled": true
+    },
+    {
+      "symbol": "HYPE",
+      "name": "HYPE",
+      "enabled": false
+    },
+    {
+      "symbol": "LINK",
+      "name": "Chainlink",
+      "enabled": true
+    },
+    {
+      "symbol": "XMR",
+      "name": "Monero",
+      "enabled": false
+    },
+    {
+      "symbol": "XLM",
+      "name": "Stellar",
+      "enabled": true
+    },
+    {
+      "symbol": "HBAR",
+      "name": "Hedera",
+      "enabled": true
+    },
+    {
+      "symbol": "ZEC",
+      "name": "Zcash",
+      "enabled": true
+    },
+    {
+      "symbol": "LTC",
+      "name": "Litecoin",
+      "enabled": true
+    },
+    {
+      "symbol": "AVAX",
+      "name": "Avalanche",
+      "enabled": true
+    },
+    {
+      "symbol": "SHIB",
+      "name": "Shiba Inu",
+      "enabled": true
+    },
+    {
+      "symbol": "SUI",
+      "name": "Sui",
+      "enabled": true
+    },
+    {
+      "symbol": "TON",
+      "name": "Toncoin",
+      "enabled": true
+    },
+    {
+      "symbol": "CRO",
+      "name": "Cronos",
+      "enabled": false
+    },
+    {
+      "symbol": "UNI",
+      "name": "Uniswap",
+      "enabled": true
+    },
+    {
+      "symbol": "DOT",
+      "name": "Polkadot",
+      "enabled": true
+    },
+    {
+      "symbol": "AAVE",
+      "name": "Aave",
+      "enabled": true
+    },
+    {
+      "symbol": "ASTER",
+      "name": "ASTER",
+      "enabled": true
+    },
+    {
+      "symbol": "ADA",
+      "name": "Cardano",
+      "enabled": true
+    },
+    {
+      "symbol": "KAS",
+      "name": "Kaspa",
+      "enabled": false
+    },
+    {
+      "symbol": "RNDR",
+      "name": "Render",
+      "enabled": true
+    },
+    {
+      "symbol": "ARB",
+      "name": "Arbitrum",
+      "enabled": true
+    },
+    {
+      "symbol": "TAO",
+      "name": "Bittensor",
+      "enabled": true
+    },
+    {
+      "symbol": "CAKE",
+      "name": "PancakeSwap",
+      "enabled": true
+    },
+    {
+      "symbol": "NEAR",
+      "name": "NEAR",
+      "enabled": true
+    },
+    {
+      "symbol": "PENGU",
+      "name": "PENGU",
+      "enabled": true
+    },
+    {
+      "symbol": "FET",
+      "name": "Fetch.ai",
+      "enabled": true
+    },
+    {
+      "symbol": "INJ",
+      "name": "Injective",
+      "enabled": true
+    },
+    {
+      "symbol": "AERO",
+      "name": "AERO",
+      "enabled": false
+    },
+    {
+      "symbol": "QNT",
+      "name": "Quant",
+      "enabled": true
+    },
+    {
+      "symbol": "HNT",
+      "name": "Helium",
+      "enabled": false
+    },
+    {
+      "symbol": "OP",
+      "name": "Optimism",
+      "enabled": true
+    },
+    {
+      "symbol": "RAY",
+      "name": "Raydium",
+      "enabled": true
+    },
+    {
+      "symbol": "RUNE",
+      "name": "THORChain",
+      "enabled": true
+    },
+    {
+      "symbol": "IMX",
+      "name": "Immutable",
+      "enabled": true
+    },
+    {
+      "symbol": "RVN",
+      "name": "Ravencoin",
+      "enabled": true
+    },
+    {
+      "symbol": "AKT",
+      "name": "Akash",
+      "enabled": false
+    },
+    {
+      "symbol": "KSM",
+      "name": "Kusama",
+      "enabled": true
+    },
+    {
+      "symbol": "GMX",
+      "name": "GMX",
+      "enabled": true
+    },
+    {
+      "symbol": "ARRR",
+      "name": "Pirate Chain",
+      "enabled": false
+    },
+    {
+      "symbol": "NOBODY",
+      "name": "NOBODY",
+      "enabled": false
+    },
+    {
+      "symbol": "PEPE",
+      "name": "Pepe",
+      "enabled": true
+    },
+    {
+      "symbol": "JUP",
+      "name": "Jupiter",
+      "enabled": true
+    },
+    {
+      "symbol": "DASH",
+      "name": "Dash",
+      "enabled": true
+    },
+    {
+      "symbol": "FLOKI",
+      "name": "Floki",
+      "enabled": true
+    }
+  ],
+  "notes": {
+    "disabled_reason": "disabled because no Binance spot stable-quote market found (USDT/FDUSD/USDC/TUSD) at time of sync",
+    "quote_fallbacks": [
+      "FDUSD",
+      "USDC",
+      "TUSD"
+    ]
+  }
 }

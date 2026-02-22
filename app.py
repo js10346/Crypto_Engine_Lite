@@ -2083,32 +2083,134 @@ def _safe_dt_str(x: Any) -> str:
         return ""
 
 
+def _fmt_compact_int(n: Any) -> str:
+    """Compact integer formatting for UI labels (e.g., 2.9k, 1.2M)."""
+    try:
+        v = int(float(n))
+    except Exception:
+        return ""
+    if v >= 1_000_000_000:
+        return f"{v/1_000_000_000:.1f}B".rstrip("0").rstrip(".")
+    if v >= 1_000_000:
+        return f"{v/1_000_000:.1f}M".rstrip("0").rstrip(".")
+    if v >= 1_000:
+        return f"{v/1_000:.1f}k".rstrip("0").rstrip(".")
+    return str(v)
+
+
 def _dataset_option_label(d: Dict[str, Any]) -> str:
+    """Short, scannable dropdown labels.
+
+    Keep long details (date range, source, etc.) in the preview panel.
+    """
     sym = str(d.get("symbol") or d.get("ticker") or d.get("id") or "").upper()
     name = str(d.get("name") or "").strip()
     tf = str(d.get("timeframe") or d.get("tf") or "1D").upper()
-    start = _safe_dt_str(d.get("start_dt") or d.get("start") or d.get("start_date"))
-    end = _safe_dt_str(d.get("end_dt") or d.get("end") or d.get("end_date"))
     rows = d.get("rows") or d.get("n_rows") or d.get("bars") or None
-    rng = ""
-    if start and end:
-        rng = f"{start} → {end}"
-    elif start:
-        rng = f"{start} → …"
-    elif end:
-        rng = f"… → {end}"
-    rtxt = ""
-    try:
-        if rows is not None:
-            rtxt = f" · {int(rows):,} bars"
-    except Exception:
-        rtxt = ""
+
+    parts: List[str] = []
     if name and name.lower() != sym.lower():
-        return f"{sym} — {name} · {tf}" + (f" · {rng}" if rng else "") + rtxt
-    return f"{sym} · {tf}" + (f" · {rng}" if rng else "") + rtxt
+        parts.append(f"{sym} — {name}")
+    else:
+        parts.append(sym)
+
+    # Always include timeframe (future-proof if you add 4H/1H later)
+    if tf:
+        parts.append(tf)
+
+    # Bars (compact)
+    if rows is not None:
+        r = _fmt_compact_int(rows)
+        if r:
+            parts.append(f"{r} bars")
+
+    return " · ".join([p for p in parts if p])
+
+
+# --- Coin icons (optional) ----------------------------------------------------
+# We can't render images inside Streamlit selectbox options, so we show the icon
+# next to the picker + in the "Browse all coins" panel.
+try:
+    import requests as _requests  # type: ignore
+except Exception:  # pragma: no cover
+    _requests = None
+
+_ICON_URL_TEMPLATES = [
+    # spothq cryptocurrency-icons (32px, color)
+    "https://raw.githubusercontent.com/spothq/cryptocurrency-icons/master/32/color/{sym}.png",
+    # fallback: 64px in case some aren't present at 32 (rare)
+    "https://raw.githubusercontent.com/spothq/cryptocurrency-icons/master/64/color/{sym}.png",
+]
+
+
+def _local_icon_path(symbol: str) -> Optional[Path]:
+    sym = (symbol or "").strip().lower()
+    if not sym:
+        return None
+    # Allow users to drop icons here if they want fully offline rendering
+    icon_dir = DATA_DIR / "icons"
+    for ext in ("png", "jpg", "jpeg", "webp"):
+        p = icon_dir / f"{sym}.{ext}"
+        if p.exists():
+            return p
+    return None
+
+
+@st.cache_data(show_spinner=False)
+def _coin_icon_bytes(symbol: str) -> Optional[bytes]:
+    sym = (symbol or "").strip().lower()
+    if not sym:
+        return None
+
+    lp = _local_icon_path(sym)
+    if lp is not None:
+        try:
+            return lp.read_bytes()
+        except Exception:
+            return None
+
+    if _requests is None:
+        return None
+
+    # Remote best-effort: if it fails, we fall back to a monogram.
+    for tpl in _ICON_URL_TEMPLATES:
+        url = tpl.format(sym=sym)
+        try:
+            resp = _requests.get(url, timeout=2.0)
+            if resp is not None and getattr(resp, "ok", False) and resp.content:
+                return resp.content
+        except Exception:
+            continue
+    return None
+
+
+def _render_coin_icon(symbol: str, size: int = 22) -> None:
+    b = _coin_icon_bytes(symbol)
+    if b:
+        try:
+            st.image(b, width=size)
+            return
+        except Exception:
+            pass
+
+    # Fallback: simple monogram badge
+    s = (symbol or "").strip().upper()
+    label = (s[:3] if s else "?")
+    st.markdown(
+        f"""<div title="{_escape_html(s)}"
+            style="width:{size}px;height:{size}px;border-radius:999px;
+                   background:#EEF2FF;color:#3730A3;display:flex;
+                   align-items:center;justify-content:center;
+                   font-weight:800;font-size:{max(9, size//3)}px;
+                   line-height:1;">
+            {_escape_html(label)}
+        </div>""",
+        unsafe_allow_html=True,
+    )
 
 
 def _catalog_paths() -> List[Path]:
+
     return [
         DATA_DIR / "datasets" / "catalog.json",
         DATA_DIR / "catalog.json",
@@ -7261,7 +7363,40 @@ if open_existing == "(new run)":
 
             with left:
                 # --- Controls ---
+                # Apply pending browse-coin selection BEFORE widgets are instantiated (Streamlit state rule)
+                _pending_sym = st.session_state.pop("new.data_search_pending", None)
+                if _pending_sym:
+                    try:
+                        _pending_sym = str(_pending_sym).upper().strip()
+                    except Exception:
+                        _pending_sym = None
+                if _pending_sym:
+                    st.session_state["new.data_search"] = _pending_sym
+                    st.session_state["new.data_view"] = "All"
+                    _target_id = next((did for did, dd in by_id.items() if str(dd.get("symbol") or "").upper() == _pending_sym), None)
+                    if _target_id:
+                        st.session_state["new.data_candidate_id"] = _target_id
+                        st.session_state["new.data_candidate_id_prev"] = _target_id
                 q = st.text_input("Search coins", key="new.data_search", placeholder="e.g., BTC, ETH, Solana…")
+
+                # Available coins (visibility + quick pick)
+                all_syms = sorted({str(d.get("symbol") or "").upper() for d in by_id.values() if str(d.get("symbol") or "").strip()})
+                if all_syms:
+                    st.caption(f"Available coins: **{len(all_syms):,}**. Tip: type a symbol above, or open **Browse all coins**.")
+                    with st.expander("Browse all coins", expanded=False):
+                        cols = st.columns(10)
+                        for i, sym in enumerate(all_syms):
+                            col = cols[i % len(cols)]
+                            with col:
+                                _render_coin_icon(sym, size=20)
+                                if st.button(sym, key=f"browse_coin_{sym}", use_container_width=True):
+                                    # Ensure the chosen coin is visible and selected
+                                    st.session_state["new.data_view"] = "All"
+                                    st.session_state["new.data_search_pending"] = sym
+                                    target_id = next((did for did, dd in by_id.items() if str(dd.get("symbol") or "").upper() == sym), None)
+                                    if target_id:
+                                        st.session_state["new.data_candidate_id"] = target_id
+                                    st.rerun()
 
                 view = st.selectbox(
                     "View",
@@ -7322,14 +7457,24 @@ if open_existing == "(new run)":
                     cur = str(st.session_state.get("new.data_candidate_id") or "")
                     if not cur or cur not in ids:
                         cur = committed_id if committed_id in ids else ids[0]
-
-                    sel = st.selectbox(
-                        "Dataset",
-                        ids,
-                        index=ids.index(cur),
-                        format_func=lambda _id: _dataset_option_label(by_id.get(_id, {})),
-                        key="new.data_candidate_id",
-                    )
+                    icon_col, sel_col = st.columns([0.07, 0.93], vertical_alignment="center")
+                    with icon_col:
+                        _icon_ph = st.empty()
+                    with sel_col:
+                        sel = st.selectbox(
+                            "Dataset",
+                            ids,
+                            index=ids.index(cur),
+                            format_func=lambda _id: _dataset_option_label(by_id.get(_id, {})),
+                            key="new.data_candidate_id",
+                            help="Click and type to search inside the dropdown. Or use 'Search coins' / 'Browse all coins' above.",
+                        )
+                    try:
+                        _sym_for_icon = str(by_id.get(str(sel), {}).get("symbol") or "").upper()
+                    except Exception:
+                        _sym_for_icon = ""
+                    with _icon_ph.container():
+                        _render_coin_icon(_sym_for_icon, size=24)
 
                     entry = by_id.get(str(sel), {})
                     cand_path = _resolve_dataset_path(entry)
@@ -7500,7 +7645,11 @@ if open_existing == "(new run)":
                     end_s = _safe_dt_str(entry.get("end_dt") or entry.get("end") or entry.get("end_date"))
                     bars = entry.get("rows") or entry.get("n_rows") or entry.get("bars") or ""
                     title = f"**{sym}**" + (f" — {nm}" if nm else "")
-                    st.markdown(title)
+                    _c1, _c2 = st.columns([0.07, 0.93], vertical_alignment="center")
+                    with _c1:
+                        _render_coin_icon(sym, size=26)
+                    with _c2:
+                        st.markdown(title)
                     parts = []
                     if start_s or end_s:
                         parts.append(f"Range: {start_s or '—'} → {end_s or '—'}")

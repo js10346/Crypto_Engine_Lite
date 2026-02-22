@@ -48,6 +48,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -87,6 +88,9 @@ class DatasetSpec:
     pair: str    # exchange symbol id, e.g., BTCUSDT
     timeframe: str  # e.g., 1d
     file_path: str  # relative or absolute
+
+    # Defaults must come after non-defaults (Py3.9 dataclasses requirement)
+    exchange_base: Optional[str] = None  # base asset used on exchange (may differ from registry symbol)
     source: str = "binance"
     name: Optional[str] = None
     start_dt: Optional[str] = None
@@ -152,13 +156,105 @@ def build_pair_index(exchange_info: Dict[str, Any]) -> Dict[Tuple[str, str], str
     return out
 
 
-def resolve_pair(pair_index: Dict[Tuple[str, str], str], base: str, quote: str) -> Tuple[str, str]:
-    """Return (pair_symbol, quote_used)."""
-    base_u = base.upper()
-    quote_u = quote.upper()
-    key = (base_u, quote_u)
-    if key in pair_index:
-        return pair_index[key], quote_u
+_TICKER_RE = re.compile(r"^[A-Z0-9]{2,15}$")
+
+
+def _looks_like_ticker(s: str) -> bool:
+    s = (s or "").strip().upper()
+    return bool(_TICKER_RE.match(s))
+
+
+def _parse_csv_list(val: Optional[str]) -> List[str]:
+    if val is None:
+        return []
+    raw = str(val).strip()
+    if not raw:
+        return []
+    return [p.strip().upper() for p in raw.split(",") if p.strip()]
+
+
+def build_base_candidates(coin: Dict[str, Any], *, allow_name_alias: bool = True) -> List[str]:
+    """Return ordered unique base candidates to resolve a Binance spot pair."""
+    candidates: List[str] = []
+
+    # Explicit overrides
+    for k in ("binance_base", "exchange_base"):
+        v = coin.get(k)
+        if isinstance(v, str) and v.strip():
+            candidates.append(v.strip().upper())
+
+    vlist = coin.get("binance_bases")
+    if isinstance(vlist, list):
+        for v in vlist:
+            if isinstance(v, str) and v.strip():
+                candidates.append(v.strip().upper())
+
+    vlist = coin.get("aliases")
+    if isinstance(vlist, list):
+        for v in vlist:
+            if isinstance(v, str) and v.strip():
+                candidates.append(v.strip().upper())
+
+    # Default: registry symbol
+    sym = coin.get("symbol") or coin.get("base")
+    if isinstance(sym, str) and sym.strip():
+        candidates.append(sym.strip().upper())
+
+    # Optional: treat name as an alias if it looks like a ticker (helps rebrands, e.g., RNDR -> RENDER)
+    if allow_name_alias:
+        name = coin.get("name")
+        if isinstance(name, str) and _looks_like_ticker(name):
+            candidates.append(name.strip().upper())
+
+    # De-dup preserve order
+    out: List[str] = []
+    seen = set()
+    for c in candidates:
+        if c and c not in seen:
+            out.append(c)
+            seen.add(c)
+    return out
+
+
+def build_quote_candidates(primary_quote: str, quote_fallbacks: List[str]) -> List[str]:
+    quotes = [str(primary_quote).upper()]
+    for q in quote_fallbacks:
+        q = str(q).upper().strip()
+        if q:
+            quotes.append(q)
+    out: List[str] = []
+    seen = set()
+    for q in quotes:
+        if q and q not in seen:
+            out.append(q)
+            seen.add(q)
+    return out
+
+
+def resolve_pair(
+    pair_index: Dict[Tuple[str, str], str],
+    base_candidates: List[str],
+    quote_candidates: List[str],
+) -> Tuple[str, str, str]:
+    """Return (pair_symbol, base_used, quote_used)."""
+    tried: List[str] = []
+    for base in base_candidates:
+        for quote in quote_candidates:
+            key = (base.upper(), quote.upper())
+            tried.append(f"{key[0]}/{key[1]}")
+            if key in pair_index:
+                return pair_index[key], key[0], key[1]
+
+    tried_s = ", ".join(tried[:10]) + (" ..." if len(tried) > 10 else "")
+    # Helpful hint: show available quote assets for candidate bases
+    hints: List[str] = []
+    for b in base_candidates:
+        qs = sorted({q for (bb, q) in pair_index.keys() if bb == b.upper()})
+        if qs:
+            hints.append(f"{b.upper()}: " + ",".join(qs[:10]) + ("..." if len(qs) > 10 else ""))
+    hint_s = (" | Available: " + " ; ".join(hints)) if hints else ""
+    raise ValueError(f"No Binance spot market found. Tried: {tried_s}{hint_s}")
+
 
     # Common fallback: try USDC if USDT missing.
     if quote_u == "USDT":
@@ -332,6 +428,7 @@ def build_catalog_entry(
     base_symbol: str,
     quote: str,
     pair: str,
+    exchange_base: Optional[str] = None,
     interval: str,
     rel_path: str,
     df: pd.DataFrame,
@@ -351,6 +448,7 @@ def build_catalog_entry(
         symbol=base_symbol.upper(),
         quote=quote.upper(),
         pair=pair,
+        exchange_base=exchange_base,
         timeframe=interval,
         file_path=rel_path,
         source=source,
@@ -379,6 +477,7 @@ def write_catalog_json(entries: List[DatasetSpec], out_path: Path) -> None:
                 "source": e.source,
                 "quote": e.quote,
                 "pair": e.pair,
+                "exchange_base": e.exchange_base,
                 "file_path": e.file_path,
                 "file_format": e.file_format,
                 "updated_at": e.updated_at,
@@ -403,6 +502,16 @@ def main() -> int:
         help="Catalog output path (default: data/datasets/catalog.json)",
     )
     ap.add_argument("--quote", default=None, help="Override quote asset (default from coins.json or USDT)")
+    ap.add_argument(
+        "--quote-fallbacks",
+        default="FDUSD,USDC,TUSD",
+        help="Comma-separated quote assets to try if the primary quote has no spot pair (default: FDUSD,USDC,TUSD)",
+    )
+    ap.add_argument(
+        "--no-name-alias",
+        action="store_true",
+        help="Do not try coin 'name' as a base-asset alias when resolving a Binance spot pair (useful for rebrands).",
+    )
     ap.add_argument("--interval", default=None, help="Override interval/timeframe (default from coins.json or 1d)")
     ap.add_argument("--sleep", type=float, default=0.25, help="Sleep seconds between API pages")
     ap.add_argument("--start", default=None, help="Optional ISO start date (YYYY-MM-DD) for initial pull")
@@ -457,7 +566,7 @@ def main() -> int:
     print(f"Output dir:     {out_dir}")
     print(f"Catalog:        {catalog_path}")
     print(f"Source:         Binance spot")
-    print(f"Quote:          {quote}")
+    print(f"Quote:          {quote}  (fallbacks: {args.quote_fallbacks})")
     print(f"Interval:       {interval}")
     print(f"Format:         {fmt}")
 
@@ -469,9 +578,16 @@ def main() -> int:
     for coin in coins:
         base = str(coin.get("symbol")).upper()
         name = coin.get("name")
+        enabled = coin.get("enabled", True)
+        if enabled is False:
+            print(f"[SKIP] {base}: disabled in coins registry")
+            continue
+
+        base_candidates = build_base_candidates(coin, allow_name_alias=(not args.no_name_alias))
+        quote_candidates = build_quote_candidates(quote, _parse_csv_list(args.quote_fallbacks))
 
         try:
-            pair, quote_used = resolve_pair(pair_index, base, quote)
+            pair, base_used, quote_used = resolve_pair(pair_index, base_candidates, quote_candidates)
         except Exception as e:
             print(f"[SKIP] {base}: {e}")
             continue
@@ -508,7 +624,7 @@ def main() -> int:
             start_ms = int(pd.to_datetime("2017-01-01", utc=True).value // 1_000_000)
 
         print(
-            f"[SYNC] {base}/{quote_used} ({pair}) -> {out_file.name} "
+            f"[SYNC] {base_used}/{quote_used} ({pair}) -> {out_file.name} "
             f"start={_utc_iso_from_ms(start_ms)}"
         )
 
@@ -553,6 +669,7 @@ def main() -> int:
             base_symbol=base,
             quote=quote_used,
             pair=pair,
+            exchange_base=base_used,
             interval=interval,
             rel_path=rel_path,
             df=df,
