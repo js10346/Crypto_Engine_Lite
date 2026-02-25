@@ -1176,44 +1176,79 @@ def _blank_dca_plan_blueprint() -> Dict[str, Any]:
 
 
 def _clear_builder_gate_ui_state(ss: dict):
-    """Reset builder-gate widget keys back to disabled."""
-    # Regime slots (2)
-    for i in range(1, 3):
-        ss[f"new.regime{i}.type"] = "— (disabled)"
-        for k in (f"new.regime{i}.op", f"new.regime{i}.thr", f"new.regime{i}.ema_len"):
+    """Reset the Logic Builder UI state back to 'no conditions'.
+
+    The current builder uses a dynamic, ID-based session_state schema:
+      - new.logic.uid (int)
+      - new.logic.regime_ids: list[int]
+      - new.logic.clause_ids: list[int]
+      - new.logic.clause.<cid>.cond_ids: list[int]
+      - new.regime.<rid>.* and new.clause.<cid>.<cond_id>.* keys
+    """
+    # Remove all dynamic builder keys
+    for k in list(ss.keys()):
+        if k.startswith("new.regime.") or k.startswith("new.clause.") or k.startswith("new.logic."):
             ss.pop(k, None)
 
-    # Trigger clauses (3 clauses × 3 conditions)
-    for ci in range(1, 4):
-        for cj in range(1, 4):
-            ss[f"new.cl{ci}.c{cj}.type"] = "— (disabled)"
-            for k in (f"new.cl{ci}.c{cj}.op", f"new.cl{ci}.c{cj}.thr", f"new.cl{ci}.c{cj}.ema_len"):
-                ss.pop(k, None)
+    # Restore empty defaults expected by the builder renderer
+    ss["new.logic.uid"] = 0
+    ss["new.logic.regime_ids"] = []
+    ss["new.logic.clause_ids"] = []
 
 
 def _apply_builder_entry_logic_to_ui(ss: dict, entry_logic: dict):
-    """Populate the Logic Builder UI widget state from blueprint entry_logic."""
+    """Populate the Logic Builder UI widget state from blueprint entry_logic.
+
+    entry_logic shape:
+      { "regime": [cond..], "clauses": [[cond..], ...] }
+
+    Where a Condition has:
+      - indicator: str
+      - operator: one of <=, <, >=, >
+      - threshold: number OR "ema_<LEN>" string
+      - (optional) ref_indicator: "ema_<LEN>" (preferred internal form)
+    """
     if not isinstance(entry_logic, dict):
         entry_logic = {"regime": [], "clauses": []}
+
+    # Start from a clean slate
+    _clear_builder_gate_ui_state(ss)
+
+    def _new_uid() -> int:
+        ss["new.logic.uid"] = int(ss.get("new.logic.uid", 0) or 0) + 1
+        return int(ss["new.logic.uid"])
 
     def _apply_cond(prefix: str, cond: dict | None):
         if not isinstance(cond, dict):
             return
 
-        ind = str(cond.get("indicator", "")).strip()
-        op = str(cond.get("operator", "<=")).strip()
+        ind = str(cond.get("indicator") or "").strip()
+        op = str(cond.get("operator") or "<=").strip()
         thr = cond.get("threshold", None)
+        ref = cond.get("ref_indicator", None)
 
-        # EMA reference
-        if ind == "close" and isinstance(thr, str) and thr.startswith("ema_"):
+        if op not in ("<=", "<", ">=", ">"):
+            op = "<="
+
+        # EMA reference: accept either threshold="ema_200" OR ref_indicator="ema_200"
+        ema_ref = None
+        if ind == "close":
+            if isinstance(thr, str) and thr.startswith("ema_"):
+                ema_ref = thr
+            elif isinstance(ref, str) and ref.startswith("ema_"):
+                ema_ref = ref
+
+        if ema_ref:
             ss[f"{prefix}.type"] = "price_vs_ema"
-            ss[f"{prefix}.op"] = op if op in ("<=", "<", ">=", ">") else "<="
+            # UI only offers <= or >= for price_vs_ema; clamp others.
+            ss[f"{prefix}.op"] = op if op in ("<=", ">=") else "<="
             try:
-                ema_len = int(thr.split("_", 1)[1])
+                ema_len = int(str(ema_ref).split("_", 1)[1])
                 ss["new.ema_len"] = ema_len  # keep shared knob consistent
                 ss[f"{prefix}.ema_len"] = ema_len
             except Exception:
-                pass
+                ss["new.ema_len"] = int(ss.get("new.ema_len", 200) or 200)
+                ss[f"{prefix}.ema_len"] = int(ss.get("new.ema_len", 200) or 200)
             return
 
         # Numeric threshold conditions
@@ -1225,35 +1260,43 @@ def _apply_builder_entry_logic_to_ui(ss: dict, entry_logic: dict):
             "macd_hist_12_26_9": "macd_hist_12_26_9",
             "donch_pos_20": "donch_pos_20",
         }
-        ui_type = type_map.get(ind, None)
+        ui_type = type_map.get(ind)
         if ui_type is None:
             return
 
         ss[f"{prefix}.type"] = ui_type
-        ss[f"{prefix}.op"] = op if op in ("<=", "<", ">=", ">") else "<="
+        ss[f"{prefix}.op"] = op
         try:
             ss[f"{prefix}.thr"] = float(thr)
         except Exception:
             # leave default
             pass
 
-    # Start from a clean slate
-    _clear_builder_gate_ui_state(ss)
-
-    regime = entry_logic.get("regime") or []
-    clauses = entry_logic.get("clauses") or []
-
     # Regime (0..2)
-    for i, cond in enumerate(regime[:2], start=1):
-        _apply_cond(f"new.regime{i}", cond)
+    regime_ids: List[int] = []
+    for cond in (entry_logic.get("regime") or [])[:2]:
+        rid = _new_uid()
+        regime_ids.append(rid)
+        _apply_cond(f"new.regime.{rid}", cond)
+    ss["new.logic.regime_ids"] = regime_ids
 
-    # Clauses: list[clause], where clause is list[cond]
-    for ci, clause in enumerate(clauses[:3], start=1):
+    # Clauses (0..3), each clause 0..3 conditions (AND)
+    clause_ids: List[int] = []
+    for clause in (entry_logic.get("clauses") or [])[:3]:
         if not isinstance(clause, (list, tuple)):
             continue
-        for cj, cond in enumerate(list(clause)[:3], start=1):
-            _apply_cond(f"new.cl{ci}.c{cj}", cond)
+        cid = _new_uid()
+        clause_ids.append(cid)
 
+        cond_ids: List[int] = []
+        for cond in list(clause)[:3]:
+            cond_id = _new_uid()
+            cond_ids.append(cond_id)
+            _apply_cond(f"new.clause.{cid}.{cond_id}", cond)
+
+        ss[f"new.logic.clause.{cid}.cond_ids"] = cond_ids
+
+    ss["new.logic.clause_ids"] = clause_ids
 
 def _apply_dca_plan_blueprint(bp: Dict[str, Any]) -> Tuple[bool, str]:
     """Best-effort: apply a pasted plan blueprint into Streamlit session state.
@@ -1646,7 +1689,7 @@ def _apply_dca_plan_blueprint(bp: dict) -> None:
 
     # Allocation / misc
     ss["new.max_alloc_pct"] = _to_float(bp.get("max_alloc_pct", ss.get("new.max_alloc_pct", 1.0)), ss.get("new.max_alloc_pct", 1.0))
-    ss["new.reserve_frac"] = _to_float(bp.get("reserve_frac", ss.get("new.reserve_frac", 0.0)), ss.get("new.reserve_frac", 0.0))
+    ss["new.reserve_frac"] = _to_float(bp.get("reserve_frac_of_proceeds", bp.get("reserve_frac", ss.get("new.reserve_frac", 0.0))), ss.get("new.reserve_frac", 0.0))
     ss["new.tp_sell_frac"] = _to_float(bp.get("tp_sell_fraction", ss.get("new.tp_sell_frac", 1.0)), ss.get("new.tp_sell_frac", 1.0))
 
     # Exits (UI space)
@@ -4642,11 +4685,31 @@ def _plain_condition(cond: Dict[str, Any]) -> str:
         return f"Trend strength is high (ADX ≥ {_fmt_thr(thr)})"
     if ind == "adx_14" and op in {"<", "<="}:
         return f"Trend strength is low (ADX ≤ {_fmt_thr(thr)})"
+    if ind == "donch_pos_20" and op in {"<", "<=", ">", ">="}:
+        # Donchian position is a 0..1 percentile of the recent range (0=range low, 1=range high).
+        t_txt = _fmt_thr(thr)
+        try:
+            t = float(thr)
+        except Exception:
+            t = None
 
-    if ind == "donch_pos_20" and op in {"<", "<="}:
-        return f"Price is near range low (Donchian pos ≤ {_fmt_thr(thr)})"
-    if ind == "donch_pos_20" and op in {">", ">="}:
-        return f"Price is near range high (Donchian pos ≥ {_fmt_thr(thr)})"
+        if op in {"<", "<="}:
+            if isinstance(t, (int, float)) and math.isfinite(float(t)):
+                if t <= 0.15:
+                    return f"Price is near range low (Donch pos ≤ {t_txt})"
+                if t >= 0.85:
+                    return f"Price is below top band (Donch pos ≤ {t_txt})"
+                return f"Price is below range position (Donch pos ≤ {t_txt})"
+            return f"Price is below range position (Donch pos ≤ {t_txt})"
+
+        # op in {">", ">="}
+        if isinstance(t, (int, float)) and math.isfinite(float(t)):
+            if t <= 0.15:
+                return f"Price is off the lows (Donch pos ≥ {t_txt})"
+            if t >= 0.85:
+                return f"Price is near range high (Donch pos ≥ {t_txt})"
+            return f"Price is above range position (Donch pos ≥ {t_txt})"
+        return f"Price is above range position (Donch pos ≥ {t_txt})"
 
     # Fallback
     return _human_condition(cond) or "condition"
@@ -4680,6 +4743,1347 @@ def _entry_logic_plain_english(entry_logic: Dict[str, Any]) -> str:
         parts.extend([f"- {x}" for x in clause_bits])
 
     return "\n".join(parts).strip()
+
+
+
+# ---------------------------------------------------------------------------
+# Gate explainability (mini engine)
+# ---------------------------------------------------------------------------
+
+def _indicator_label(ind: str) -> str:
+    ind = str(ind or "").strip()
+    base = {
+        "close": "Close",
+        "open": "Open",
+        "high": "High",
+        "low": "Low",
+        "volume": "Volume",
+        "vol": "Volume",
+        "rsi_14": "RSI(14)",
+        "adx_14": "ADX(14)",
+        "bb_z_20": "BB z(20)",
+        "donch_pos_20": "Donch pos(20)",
+        "macd_hist": "MACD hist",
+        "macd_hist_12_26_9": "MACD hist",
+    }
+    if ind.startswith("ema_"):
+        try:
+            ln = int(ind.split("_", 1)[1])
+            return f"EMA{ln}"
+        except Exception:
+            return ind.upper()
+    return base.get(ind, ind)
+
+
+def _fmt_value(ind: str, v: Any) -> str:
+    try:
+        if v is None or (isinstance(v, float) and (math.isnan(v) or not math.isfinite(v))):
+            return "—"
+        x = float(v)
+    except Exception:
+        return str(v)
+
+    ind = str(ind or "").strip()
+    if ind in {"rsi_14", "adx_14"}:
+        return f"{x:.1f}"
+    if ind == "bb_z_20":
+        return f"{x:.2f}"
+    if ind in {"donch_pos_20"}:
+        # show both fraction and % for readability
+        return f"{x:.3f} ({x*100.0:.0f}%)"
+    if ind.startswith("macd_hist"):
+        return f"{x:.3f}"
+    # prices / generic
+    if abs(x) >= 1000:
+        return f"{x:,.2f}"
+    if abs(x) >= 10:
+        return f"{x:.2f}"
+    if abs(x) >= 1:
+        return f"{x:.3f}"
+    return f"{x:.4f}"
+
+# ---------------------------------------------------------------------------
+# Beginner-friendly indicator docs + roles
+# ---------------------------------------------------------------------------
+
+def _safe_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+INDICATOR_DOCS: Dict[str, Dict[str, str]] = {
+    "rsi_14": {
+        "name": "RSI(14)",
+        "definition": "A momentum meter over the last ~14 bars. Lower means price has been falling more recently; higher means it has been rising more recently.",
+        "analogy": "Like a speedometer for recent price movement.",
+        "range": "0..100 (common reading)",
+    },
+    "adx_14": {
+        "name": "ADX(14)",
+        "definition": "A trend-strength meter. It measures how strong the trend is, not whether it's up or down.",
+        "analogy": "Like wind strength, not wind direction.",
+        "range": "0..~60+ (higher = stronger trend)",
+    },
+    "bb_z_20": {
+        "name": "BB z(20)",
+        "definition": "How far price is from its 20-bar average, measured in standard deviations. Negative = below average; positive = above average.",
+        "analogy": "A stretch gauge: how far price is from 'normal'.",
+        "range": "Usually around -3..+3",
+    },
+    "macd_hist": {
+        "name": "MACD hist",
+        "definition": "A momentum change gauge. Positive usually means momentum is improving; negative means momentum is weakening. The raw number size depends on the coin’s price scale — the sign and changes matter most.",
+        "analogy": "A 'momentum delta' meter: are we accelerating or decelerating?",
+        "range": "Unbounded (scale depends on price/volatility)",
+    },
+    "donch_pos_20": {
+        "name": "Donch pos(20)",
+        "definition": "Where price sits inside the last 20-bar high/low range: 0 = at the range low, 1 = at the range high.",
+        "analogy": "A percentile rank inside the recent trading range.",
+        "range": "0..1",
+    },
+    "close_vs_ema": {
+        "name": "Price vs EMA",
+        "definition": "Compares price to an Exponential Moving Average (EMA). EMA is a smoothed 'usual price' that reacts faster than a simple average.",
+        "analogy": "A moving 'baseline' line. Above = stronger trend; below = weaker / pullback.",
+        "range": "—",
+    },
+}
+
+
+def _cond_kind(tr: Dict[str, Any]) -> str:
+    ind = str(tr.get("indicator") or "").strip()
+    ref = str(tr.get("ref_indicator") or "").strip()
+    if ind.lower() == "close" and ref.startswith("ema_"):
+        return "close_vs_ema"
+    if ind.startswith("macd_hist"):
+        return "macd_hist"
+    return ind
+
+
+def _clause_intent_label(trs: List[Dict[str, Any]]) -> str:
+    """Best-effort clause intent label so beginners can build a mental model.
+
+    This is intentionally heuristic: we try to name the *style* of the clause based on its ingredients.
+    """
+    if not trs:
+        return "Empty clause"
+
+    ema_dir = None  # "above" | "below"
+    ema_len = None
+    for t in trs:
+        if _cond_kind(t) == "close_vs_ema":
+            op = str(t.get("op") or "").strip()
+            ema_dir = "below" if op in {"<", "<="} else "above"
+            ref = str(t.get("ref_indicator") or "")
+            try:
+                ema_len = int(ref.split("_", 1)[1])
+            except Exception:
+                ema_len = None
+            break
+
+    def _min_thr(kind: str, op_set: set[str]) -> Optional[float]:
+        vals = []
+        for t in trs:
+            if _cond_kind(t) == kind and str(t.get("op") or "").strip() in op_set:
+                v = _safe_float(t.get("threshold"))
+                if v is not None and math.isfinite(v):
+                    vals.append(v)
+        return min(vals) if vals else None
+
+    rsi_cap = _min_thr("rsi_14", {"<", "<="})
+    rsi_floor = _min_thr("rsi_14", {">", ">="})
+    bb_cap = _min_thr("bb_z_20", {"<", "<="})
+
+    has_rsi_dip = (rsi_cap is not None and rsi_cap <= 60)
+    has_rsi_not_overheated = (rsi_cap is not None and 65 <= rsi_cap <= 85)
+    has_bb_below_avg = any(
+        (_cond_kind(t) == "bb_z_20" and str(t.get("op") or "").strip() in {"<", "<="} and (_safe_float(t.get("threshold")) or 999) <= 0.0)
+        for t in trs
+    )
+    has_bb_not_stretched = (bb_cap is not None and bb_cap <= 1.25)
+
+    has_macd_ok = any((_cond_kind(t) == "macd_hist" and str(t.get("op") or "").strip() in {">", ">="}) for t in trs)
+    has_adx_high = any(
+        (_cond_kind(t) == "adx_14" and str(t.get("op") or "").strip() in {">", ">="} and (_safe_float(t.get("threshold")) or 0) >= 18)
+        for t in trs
+    )
+
+    if ema_dir == "above" and (has_rsi_not_overheated or has_bb_not_stretched):
+        return "Trend add (don't chase)"
+
+    if has_adx_high and has_macd_ok:
+        return "Trend pullback / momentum filter"
+
+    if ema_dir == "below" and (not has_rsi_dip) and (not has_bb_below_avg):
+        ema_txt = f"EMA{ema_len}" if ema_len else "EMA"
+        return f"Pullback/value zone (below {ema_txt})"
+
+    if has_rsi_dip or has_bb_below_avg or ema_dir == "below":
+        return "Dip buy / mean-reversion"
+
+    if rsi_floor is not None and rsi_floor >= 50:
+        return "Momentum / trend continuation"
+
+    return "Trigger clause"
+
+
+def _indicator_doc_md(tr: Dict[str, Any], *, deep: bool = False) -> str:
+    kind = _cond_kind(tr)
+    doc = INDICATOR_DOCS.get(kind)
+    if not doc:
+        return ""
+
+    name = doc.get("name", kind)
+    if kind == "close_vs_ema":
+        ref = str(tr.get("ref_indicator") or "")
+        try:
+            ln = int(ref.split("_", 1)[1])
+            name = f"Price vs EMA{ln}"
+        except Exception:
+            name = "Price vs EMA"
+
+    bits = [f"**What it is:** {doc.get('definition','')}".strip()]
+    if deep and doc.get("analogy"):
+        bits.append(f"**Analogy:** {doc.get('analogy')}".strip())
+    if deep and doc.get("range") and doc.get("range") != "—":
+        bits.append(f"**Typical range:** {doc.get('range')}".strip())
+
+    # The first word ("What it is") already signals this is a definition.
+    return "  \n".join([b for b in bits if b.strip()])
+
+
+def _condition_role_md(tr: Dict[str, Any], *, scope: str, clause_intent: Optional[str] = None) -> str:
+    """Explain what this condition is trying to accomplish (beginner-friendly).
+
+    The same indicator can play different roles depending on threshold direction and strictness.
+    """
+    kind = _cond_kind(tr)
+    op = str(tr.get("op") or "").strip()
+    thr_f = _safe_float(tr.get("threshold"))
+
+    # RSI
+    if kind == "rsi_14":
+        if op in {"<", "<="}:
+            if thr_f is not None and thr_f <= 60:
+                return "Acts like a *dip/cool-off* filter: only buy after momentum cooled down."
+            if thr_f is not None and thr_f <= 85:
+                return "Acts like a *no-chasing* cap: avoid buying when momentum looks overheated."
+            return "Acts like a loose cap: avoid buying in extreme momentum spikes."
+        if thr_f is not None and thr_f >= 60:
+            return "Requires *strong momentum*: only buy when price has been rising meaningfully."
+        return "Requires *some momentum*: avoids buying when price is flat/weak."
+
+    # ADX
+    if kind == "adx_14":
+        if op in {">", ">="}:
+            if thr_f is not None and thr_f >= 25:
+                return "Requires a *strong* trend: tries to avoid sideways chop."
+            return "Requires *some* trend strength so we avoid dead chop."
+        return "Prefers low trend strength (more sideways / mean-reverting markets)."
+
+    # BB z-score
+    if kind == "bb_z_20":
+        if op in {"<", "<="}:
+            if thr_f is not None and thr_f <= -0.75:
+                return "Looks for price being *meaningfully below normal* (deeper dip)."
+            if thr_f is not None and thr_f <= 0.0:
+                return "Ensures price is at/below its recent 'normal' (not stretched high)."
+            return "Acts like a *no-chasing* cap: allows buying unless price is very stretched above normal."
+        if thr_f is not None and thr_f >= 1.0:
+            return "Targets *stretched-high / breakout-ish* conditions (price far above normal)."
+        return "Requires price to be above its recent normal."
+
+    # MACD histogram
+    if kind == "macd_hist":
+        if op in {">", ">="}:
+            return "Momentum sanity-check: avoids buying when momentum is collapsing (needs it to be at least stable)."
+        return "Looks for weakening momentum (often used as a risk-off filter)."
+
+    # Donch pos
+    if kind == "donch_pos_20":
+        t = thr_f
+        if op in {"<", "<="}:
+            if isinstance(t, (int, float)) and math.isfinite(float(t)) and t <= 0.15:
+                return "Targets *near-range lows* (classic 'buy the dip' zone)."
+            if isinstance(t, (int, float)) and math.isfinite(float(t)) and t >= 0.85:
+                return "Loose cap: just avoids the very top of the range."
+            return "Avoids buying near the top of the recent range."
+        if isinstance(t, (int, float)) and math.isfinite(float(t)) and t <= 0.15:
+            return "Keeps you from buying while price is pinned at the absolute lows (requires it to be *off the lows*)."
+        if isinstance(t, (int, float)) and math.isfinite(float(t)) and t >= 0.85:
+            return "Favors trend continuation (price is near recent highs)."
+        return "Requires price to be above a minimum position in the recent range."
+
+    # Close vs EMA
+    if kind == "close_vs_ema":
+        ref = str(tr.get("ref_indicator") or "")
+        ln = None
+        try:
+            ln = int(ref.split("_", 1)[1])
+        except Exception:
+            ln = None
+        ema_txt = f"EMA{ln}" if ln else "EMA"
+        if op in {"<", "<="}:
+            return f"Treats this as a *pullback/value zone* relative to {ema_txt}."
+        return f"Treats this as a *trend filter* (only buy when price is above {ema_txt})."
+
+    if clause_intent:
+        return f"Supports the clause intent (**{clause_intent}**)."
+    return "Contributes to the gate decision."
+
+def _eval_condition_now(row: pd.Series, df_feat: pd.DataFrame, cond: Dict[str, Any]) -> Dict[str, Any]:
+    """Evaluate a single condition on a single row. Returns a trace dict."""
+    ind = cond.get("indicator") or cond.get("feature") or cond.get("lhs")
+    op = str(cond.get("operator") or cond.get("op") or "").strip()
+    thr = cond.get("threshold", cond.get("value", 0.0))
+    ref = cond.get("ref_indicator") or cond.get("rhs") or cond.get("rhs_indicator")
+
+    name = str(ind or "").strip()
+    ref_name = str(ref or "").strip()
+
+    # lhs
+    lhs_val = None
+    if name.lower() in {"open", "high", "low", "close", "volume", "vol"}:
+        col = "volume" if name.lower() in {"volume", "vol"} else name.lower()
+        lhs_val = row.get(col)
+    else:
+        lhs_val = row.get(name) if name else None
+
+    # rhs
+    rhs_val = None
+    rhs_label = ""
+    if ref_name:
+        rhs_label = _indicator_label(ref_name)
+        # ref is a column (or OHLCV alias)
+        if ref_name.lower() in {"open", "high", "low", "close", "volume", "vol"}:
+            col = "volume" if ref_name.lower() in {"volume", "vol"} else ref_name.lower()
+            rhs0 = row.get(col)
+        else:
+            rhs0 = row.get(ref_name)
+        try:
+            off = float(thr or 0.0)
+        except Exception:
+            off = 0.0
+        try:
+            rhs_val = (float(rhs0) if rhs0 is not None else float("nan")) + off
+        except Exception:
+            rhs_val = rhs0
+    else:
+        rhs_label = str(thr)
+        try:
+            rhs_val = float(thr)
+        except Exception:
+            rhs_val = thr
+
+    ok = None
+    try:
+        a = float(lhs_val)
+        b = float(rhs_val)
+        if op == "<":
+            ok = a < b
+        elif op == "<=":
+            ok = a <= b
+        elif op == ">":
+            ok = a > b
+        elif op == ">=":
+            ok = a >= b
+        else:
+            ok = None
+    except Exception:
+        ok = None
+
+    lhs_label = _indicator_label(name)
+    rhs_disp = rhs_label if ref_name else _fmt_value(name, rhs_val)
+    lhs_disp = _fmt_value(name, lhs_val)
+    if ref_name:
+        rhs_disp = _fmt_value(ref_name, rhs_val)
+
+    status = "✅" if ok is True else ("❌" if ok is False else "—")
+    expr = f"{lhs_label} {lhs_disp} {op} {rhs_disp} {status}"
+
+    return {
+        "ok": ok,
+        "indicator": name,
+        "op": op,
+        "ref_indicator": ref_name,
+        "threshold": thr,
+        "lhs_label": lhs_label,
+        "rhs_label": rhs_label,
+        "lhs": lhs_val,
+        "rhs": rhs_val,
+        "expr": expr,
+        "plain": _plain_condition(cond),
+        "ctx_close": row.get("close") if hasattr(row, "get") else None,
+    }
+
+
+def _eval_entry_logic_now(df_feat: Optional[pd.DataFrame], entry_logic: Dict[str, Any], *, train_frac: float = 0.70) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"ok": False}
+    if df_feat is None or df_feat.empty or not isinstance(entry_logic, dict):
+        out["note"] = "No dataset loaded."
+        return out
+
+    try:
+        n = int(len(df_feat))
+        n_train = int(max(1, round(n * float(train_frac))))
+        df_cov = df_feat.iloc[:n_train]
+        row = df_cov.iloc[-1]
+    except Exception:
+        out["note"] = "Could not slice dataset."
+        return out
+
+    # Timestamp label (best-effort)
+    ts = None
+    for k in ("dt", "timestamp", "ts", "time"):
+        if k in df_cov.columns:
+            ts = row.get(k)
+            break
+    if ts is None:
+        try:
+            ts = df_cov.index[-1]
+        except Exception:
+            ts = None
+
+    regime = [c for c in (entry_logic.get("regime") or []) if isinstance(c, dict)]
+    clauses_raw = entry_logic.get("clauses") or []
+    clauses: List[List[Dict[str, Any]]] = []
+    for cl in clauses_raw:
+        if isinstance(cl, list):
+            clauses.append([c for c in cl if isinstance(c, dict)])
+
+    reg_tr = [_eval_condition_now(row, df_cov, c) for c in regime]
+    reg_ok = all([t.get("ok") is True for t in reg_tr]) if regime else True
+    first_reg_fail = next((t for t in reg_tr if t.get("ok") is False), None)
+
+    clause_traces = []
+    triggered = []
+    for i, cl in enumerate(clauses):
+        letter = chr(ord("A") + i)
+        c_tr = [_eval_condition_now(row, df_cov, c) for c in cl]
+        c_ok = all([t.get("ok") is True for t in c_tr]) if cl else False
+        pass_cnt = sum([1 for t in c_tr if t.get("ok") is True])
+        clause_traces.append(
+            {
+                "letter": letter,
+                "ok": c_ok,
+                "conds": c_tr,
+                "pass_count": pass_cnt,
+                "n": len(c_tr),
+                "first_fail": next((t for t in c_tr if t.get("ok") is False), None),
+            }
+        )
+        if c_ok:
+            triggered.append(letter)
+
+    if not clauses:
+        gate_ok = bool(reg_ok)
+    else:
+        gate_ok = bool(reg_ok and len(triggered) > 0)
+
+    blocker = ""
+    if gate_ok:
+        blocker = f"Gate is open because Clause {', '.join(triggered)} passed" if triggered else "Gate is open"
+    else:
+        if not reg_ok and first_reg_fail:
+            blocker = f"Blocked by regime: {first_reg_fail.get('plain')}"
+        else:
+            # pick the "closest" clause: most conditions satisfied
+            best = None
+            for ct in clause_traces:
+                if best is None:
+                    best = ct
+                else:
+                    if int(ct.get("pass_count") or 0) > int(best.get("pass_count") or 0):
+                        best = ct
+            if best and best.get("first_fail"):
+                blocker = f"No trigger clause is true (closest: Clause {best.get('letter')} failed {best['first_fail'].get('plain')})"
+            else:
+                blocker = "No trigger clause is true"
+
+    out.update(
+        {
+            "ok": True,
+            "ts": ts,
+            "regime": {"ok": reg_ok, "conds": reg_tr, "first_fail": first_reg_fail},
+            "clauses": clause_traces,
+            "triggered": triggered,
+            "gate_ok": gate_ok,
+            "blocker": blocker,
+        }
+    )
+    return out
+
+
+def _plain_english_build_md(
+    *,
+    deposit_freq: str,
+    deposit_amt: float,
+    buy_mode: str,
+    buy_freq: str,
+    buy_amt: float,
+    max_buys_per_gate: int,
+    max_alloc_pct: float,
+    sl_pct: float,
+    tp_pct: float,
+    tp_sell_frac: float,
+    reserve_frac: float,
+    trail_pct: float,
+    time_stop_bars: int,
+) -> str:
+    def _freq_word(freq: str) -> str:
+        f = str(freq or "").strip().lower()
+        return {"daily": "day", "weekly": "week", "monthly": "month"}.get(f, f or "day")
+
+    freq_w = _freq_word(buy_freq)
+
+    lines: List[str] = []
+    if deposit_freq == "none" or deposit_amt <= 0:
+        lines.append("**Funding:** No scheduled deposits.")
+    else:
+        lines.append(f"**Funding:** Adds **${int(round(deposit_amt))}** {deposit_freq}.")
+    if buy_amt <= 0 or buy_freq == "none":
+        lines.append("**Buying:** Off.")
+    else:
+        if buy_mode == "signal":
+            cap_txt = "unlimited" if max_buys_per_gate == 0 else str(max_buys_per_gate)
+            lines.append(
+                f"**Buying:** While the gate is open, attempt a **${int(round(buy_amt))}** buy **at most once per {freq_w}**, up to **{cap_txt} buys per gate session**."
+            )
+        else:
+            lines.append(f"**Buying:** Attempt a **${int(round(buy_amt))}** buy **every {freq_w}** (the gate can still veto).")
+    if max_alloc_pct >= 0.999:
+        lines.append("**Allocation cap:** None (can go fully invested).")
+    else:
+        lines.append(f"**Allocation cap:** Won't invest beyond **{int(round(max_alloc_pct*100))}%** of equity.")
+    exits = []
+    if sl_pct and sl_pct > 0:
+        exits.append(f"Stop-loss **{sl_pct:.1f}%**")
+    if tp_pct and tp_pct > 0:
+        tp_line = f"Take-profit **{tp_pct:.1f}%**"
+        extras: List[str] = []
+        if tp_sell_frac and tp_sell_frac > 0 and tp_sell_frac < 1:
+            extras.append(f"sell **{int(round(tp_sell_frac*100))}%**")
+        if reserve_frac and reserve_frac > 0:
+            extras.append(f"reserve **{int(round(reserve_frac*100))}%** of proceeds")
+        if extras:
+            tp_line += " (" + ", ".join(extras) + ")"
+        exits.append(tp_line)
+    if trail_pct and trail_pct > 0:
+        exits.append(f"Trailing stop **{trail_pct:.1f}%**")
+    if time_stop_bars and time_stop_bars > 0:
+        exits.append(f"Time stop **{time_stop_bars} bars**")
+    if exits:
+        lines.append("**Exits:** " + ", ".join(exits) + ".")
+    else:
+        lines.append("**Exits:** Off.")
+    return "\n\n".join(lines).strip()
+
+
+def _clause_intent_story(intent: str) -> str:
+    it = str(intent or "").strip().lower()
+    if "trend add" in it:
+        return "Buy in an uptrend, but avoid buying when price looks overheated or overly stretched."
+    if "trend pullback" in it:
+        return "Buy pullbacks only when trend strength is present and momentum isn't collapsing."
+    if "pullback/value zone" in it:
+        return "Buy when price is below a long-term baseline (a pullback/value zone), but only if other filters say it's not risky."
+    if "dip buy" in it or "mean-reversion" in it:
+        return "Buy dips: look for cooled momentum and price at/below its recent 'normal', not near the top of the range."
+    if "momentum" in it or "trend continuation" in it:
+        return "Buy when momentum is clearly positive (trend continuation / breakout style)."
+    return "One of several reasons this plan allows buys."
+
+
+def _tldr_phrase_for_condition(c: Dict[str, Any]) -> Optional[str]:
+    if c.get("ok") is not True:
+        return None
+
+    kind = _cond_kind(c)
+    lhs = _safe_float(c.get("lhs"))
+    op = str(c.get("op") or "").strip()
+    thr = _safe_float(c.get("threshold"))
+
+    if kind == "rsi_14" and lhs is not None:
+        if op in {"<", "<="} and thr is not None and thr <= 60:
+            return f"momentum cooled (RSI {lhs:.0f})"
+        if op in {"<", "<="}:
+            return f"not overheated (RSI {lhs:.0f})"
+        return f"strong momentum (RSI {lhs:.0f})"
+
+    if kind == "bb_z_20" and lhs is not None:
+        if lhs <= 0:
+            return f"price below normal (BB z {lhs:.2f})"
+        return f"not too stretched (BB z {lhs:.2f})"
+
+    if kind == "donch_pos_20" and lhs is not None:
+        pct = lhs * 100.0
+        if op in {"<", "<="}:
+            return f"not near range highs (Donch {pct:.0f}%)"
+        return f"off the lows (Donch {pct:.0f}%)"
+
+    if kind == "adx_14" and lhs is not None:
+        return f"trend strength present (ADX {lhs:.0f})"
+
+    if kind == "close_vs_ema":
+        ref = str(c.get("ref_indicator") or "")
+        ln = None
+        try:
+            ln = int(ref.split("_", 1)[1])
+        except Exception:
+            ln = None
+        ema_txt = f"EMA{ln}" if ln else "EMA"
+        if op in {">", ">="}:
+            return f"above {ema_txt}"
+        return f"below {ema_txt}"
+
+    if kind == "macd_hist":
+        return "momentum not collapsing"
+
+    return None
+
+def _gate_plain_english_report_md(
+    *,
+    df_feat: Optional[pd.DataFrame],
+    entry_logic: Dict[str, Any],
+    snap: Optional[Dict[str, Any]],
+    deposit_freq: str,
+    deposit_amt: float,
+    buy_mode: str,
+    buy_freq: str,
+    buy_amt: float,
+    max_buys_per_gate: int,
+    max_alloc_pct: float,
+    sl_ui: float,
+    tp_ui: float,
+    tp_sell_frac: float,
+    reserve_frac: float,
+    trail_ui: float,
+    max_hold: int,
+    explain_mode: str = "Beginner",
+) -> str:
+    """Human-readable gate report. explain_mode: Basic | Beginner | Deep"""
+    mode = str(explain_mode or "Beginner").strip().lower()
+    beginner = mode in {"beginner", "deep"}
+    deep = mode == "deep"
+
+    # Evaluate "now" on the same train slice used by the visual snapshot.
+    tr = _eval_entry_logic_now(df_feat, entry_logic, train_frac=0.70)
+    cov = None
+    if isinstance(snap, dict):
+        cov = snap.get("coverage_pct")
+
+    parts: List[str] = []
+    parts.append(
+        _plain_english_build_md(
+            deposit_freq=deposit_freq,
+            deposit_amt=deposit_amt,
+            buy_mode=buy_mode,
+            buy_freq=buy_freq,
+            buy_amt=buy_amt,
+            max_buys_per_gate=max_buys_per_gate,
+            max_alloc_pct=max_alloc_pct,
+            sl_pct=sl_ui,
+            tp_pct=tp_ui,
+            tp_sell_frac=tp_sell_frac,
+            reserve_frac=reserve_frac,
+            trail_pct=trail_ui,
+            time_stop_bars=max_hold,
+        )
+    )
+
+    parts.append(
+        """**Gate rule:** Buy is allowed when **(Regime is true)** AND **(any Trigger clause is true)**.  
+- **Regime:** big-picture filter (AND). If it fails, nothing else matters.  
+- **Clauses:** reasons to buy (OR). Any clause can open the buy window; inside a clause everything is AND."""
+    )
+
+    # If we can't evaluate live, still return a helpful stub.
+    if not tr.get("ok"):
+        parts.append("**Gate (plain English):** Load a dataset to see live values and 'why now' explanations.")
+        parts.append(
+            "**Note on Donch pos(20):** This is a 0..1 range percentile of the last 20 bars (**0 = range low**, **1 = range high**)."
+        )
+        return "\n\n".join([p for p in parts if str(p).strip()]).strip()
+
+    shown_kinds: set[str] = set()
+
+    def _infer_clause_intent(ct: Dict[str, Any]) -> str:
+        conds = ct.get("conds") or []
+        kinds = [_cond_kind(c) for c in conds if isinstance(c, dict)]
+        ops = {str(c.get("op") or "").strip(): True for c in conds if isinstance(c, dict)}
+        # Heuristics (good enough; keeps text readable)
+        has_rsi = "rsi_14" in kinds
+        has_bb = "bb_z_20" in kinds
+        has_donch = "donch_pos_20" in kinds
+        has_adx = "adx_14" in kinds
+        has_macd = "macd_hist" in kinds
+        has_ema = "close_vs_ema" in kinds
+
+        # If it looks like a dip/mean-reversion clause
+        if has_rsi and has_bb and has_donch:
+            return "Dip buy / mean-reversion"
+        # If it looks like a momentum sanity-check in trend
+        if has_adx and has_macd:
+            return "Trend pullback / momentum filter"
+        # If it looks like trend add with anti-chase caps
+        if has_ema and (has_rsi or has_bb):
+            # Decide whether EMA is used as trend filter or pullback zone
+            ema_cond = next((c for c in conds if _cond_kind(c) == "close_vs_ema"), None)
+            op = str((ema_cond or {}).get("op") or "").strip()
+            if op in {">", ">="}:
+                return "Trend add / don't chase"
+            return "Pullback / value zone"
+
+        return "Trigger clause"
+
+    def _clause_meaning(intent: str, ct: Dict[str, Any]) -> str:
+        intent_l = (intent or "").lower()
+        if "dip" in intent_l or "mean" in intent_l:
+            return "Buy when momentum cooled off and price is at/below its recent 'normal' — classic dip accumulation."
+        if "trend pullback" in intent_l or "momentum" in intent_l:
+            return "Buy pullbacks only when trend strength exists and momentum isn't collapsing (tries to avoid catching falling knives in chop)."
+        if "don't chase" in intent_l or "trend add" in intent_l:
+            return "Add in an uptrend, but avoid buying when price looks overheated or too stretched."
+        if "value" in intent_l or "pullback" in intent_l:
+            return "Treats buys as 'value/pullback' entries relative to a smoothed baseline."
+        return "One of the strategy's possible reasons to allow buying."
+
+    def _add_cond_lines(lines: List[str], c: Dict[str, Any], *, scope: str, clause_intent: Optional[str] = None) -> None:
+        # Core math line
+        expr = str(c.get("expr") or "").strip()
+        if expr:
+            lines.append(f"- {expr}")
+        if not beginner:
+            return
+
+        kind = _cond_kind(c)
+
+        # MACD histogram is scale-dependent; in Deep mode also show it normalized as % of price.
+        if deep and kind == "macd_hist":
+            try:
+                close_v = _safe_float(c.get("ctx_close"))
+                lhs_v = _safe_float(c.get("lhs"))
+                rhs_v = _safe_float(c.get("rhs"))
+                if close_v and lhs_v is not None and math.isfinite(close_v) and close_v != 0.0:
+                    lhs_pct = (lhs_v / close_v) * 100.0
+                    extra = f"  *As % of price:* {lhs_pct:+.3f}%"
+                    if rhs_v is not None and math.isfinite(rhs_v):
+                        rhs_pct = (rhs_v / close_v) * 100.0
+                        extra += f" (threshold {rhs_pct:+.3f}%)"
+                    lines.append(extra)
+            except Exception:
+                pass
+
+        # Show definition once per indicator kind to avoid spam
+        if kind not in shown_kinds:
+            shown_kinds.add(kind)
+            doc_md = _indicator_doc_md(c, deep=deep)
+            if doc_md:
+                lines.append(f"  {doc_md}")
+
+        role = _condition_role_md(c, scope=scope, clause_intent=clause_intent)
+        if role:
+            lines.append(f"  **Why it's here:** {role}")
+
+    # Gate now
+    ts = tr.get("ts")
+    ts_txt = f"{ts}" if ts is not None else "(latest)"
+    gate_ok = bool(tr.get("gate_ok"))
+    triggered = tr.get("triggered") or []
+    gate_line = f"**Gate now:** {'TRUE' if gate_ok else 'FALSE'}"
+    if gate_ok and triggered:
+        gate_line += f" — **because Clause {', '.join(triggered)} passed**"
+    if isinstance(cov, (int, float)) and math.isfinite(float(cov)):
+        gate_line += f" (coverage ~{float(cov):.1f}% of bars in the train preview window where the gate is TRUE)"
+    gate_line += f".  \n**As of:** {ts_txt}"
+    parts.append(gate_line)
+
+    # TL;DR (human reason)
+    if gate_ok and triggered:
+        first_letter = str(triggered[0])
+        ct = next((x for x in (tr.get("clauses") or []) if str(x.get("letter")) == first_letter), None)
+        phrases: List[str] = []
+        if isinstance(ct, dict):
+            for c in (ct.get("conds") or []):
+                if not isinstance(c, dict) or c.get("ok") is not True:
+                    continue
+                kind = _cond_kind(c)
+                lhs = c.get("lhs")
+                thr = c.get("threshold")
+                if kind == "rsi_14":
+                    phrases.append(f"momentum cooled (RSI {lhs:.1f} ≤ {thr:.0f})" if isinstance(lhs,(int,float)) and isinstance(thr,(int,float)) else "momentum cooled")
+                elif kind == "bb_z_20":
+                    phrases.append(f"price below normal (BB z {lhs:+.2f} ≤ {thr:+.2f})" if isinstance(lhs,(int,float)) and isinstance(thr,(int,float)) else "price below normal")
+                elif kind == "donch_pos_20":
+                    try:
+                        pct = int(round(float(lhs) * 100))
+                        thr_pct = int(round(float(thr) * 100)) if isinstance(thr,(int,float)) else None
+                        if thr_pct is not None:
+                            phrases.append(f"not near range highs (Donch {pct}% ≤ {thr_pct}%)")
+                        else:
+                            phrases.append(f"not near range highs (Donch {pct}%)")
+                    except Exception:
+                        phrases.append("not near range highs")
+                elif kind == "close_vs_ema":
+                    phrases.append("price in value/trend zone vs EMA")
+                elif kind == "adx_14":
+                    phrases.append("trend has some strength (ADX ok)")
+                elif kind == "macd_hist":
+                    phrases.append("momentum isn't collapsing (MACD ok)")
+        if phrases:
+            parts.append("**TL;DR:** " + ", ".join(phrases[:3]) + ".")
+        else:
+            parts.append("**TL;DR:** Gate is open because at least one trigger clause passed.")
+    else:
+        blocker = str(tr.get("blocker") or "Gate is closed.").strip()
+        parts.append(f"**TL;DR:** {blocker}")
+
+    # Regime section
+    reg = tr.get("regime") or {}
+    reg_lines: List[str] = []
+    reg_lines.append("### Regime (plain English)\nRegime is the bouncer: if any of these fail, buys are blocked.")
+    for c in (reg.get("conds") or []):
+        if isinstance(c, dict):
+            _add_cond_lines(reg_lines, c, scope="regime")
+    reg_ok = bool(reg.get("ok"))
+    reg_lines.append(f"**Regime result:** {'PASS ✅' if reg_ok else 'FAIL ❌'}")
+    parts.append("\n".join(reg_lines).strip())
+
+    # Triggers section
+    trig_lines: List[str] = []
+    trig_lines.append("### Triggers (clauses)\nAny one clause passing opens the buy window (OR).")
+    for ct in (tr.get("clauses") or []):
+        if not isinstance(ct, dict):
+            continue
+        letter = str(ct.get("letter") or "?")
+        ok = bool(ct.get("ok"))
+        intent = _infer_clause_intent(ct)
+        hdr = f"**Clause {letter} — {intent} — {'PASS ✅' if ok else 'FAIL ❌'}**"
+        trig_lines.append(hdr)
+        if beginner:
+            trig_lines.append(f"*Meaning:* {_clause_meaning(intent, ct)}")
+        for c in (ct.get("conds") or []):
+            if isinstance(c, dict):
+                _add_cond_lines(trig_lines, c, scope="trigger", clause_intent=intent)
+        trig_lines.append("")  # spacing
+    parts.append("\n".join(trig_lines).strip())
+
+    # Gate verdict
+    if gate_ok and triggered:
+        parts.append(f"### Gate (what it's telling you)\nGate is true because **Clause {', '.join(triggered)}** passed.")
+    else:
+        parts.append(f"### Gate (what it's telling you)\nGate is false. {str(tr.get('blocker') or '').strip()}")
+    parts.append(
+        "**Note on Donch pos(20):** This is a 0..1 range percentile of the last 20 bars (**0 = range low**, **1 = range high**)."
+    )
+
+    # Glossary
+    if deep:
+        gl_lines: List[str] = []
+        gl_lines.append("### Glossary (quick TA cheat-sheet)")
+        # Prefer stable order
+        order = ["adx_14", "donch_pos_20", "rsi_14", "bb_z_20", "close_vs_ema", "macd_hist"]
+        for k in order:
+            if k in shown_kinds:
+                doc = INDICATOR_DOCS.get(k, {})
+                if not doc:
+                    continue
+                name = doc.get("name", k)
+                if k == "close_vs_ema":
+                    # Mention the EMA length used in the current logic (best-effort)
+                    ref = None
+                    try:
+                        # scan the logic for a ref_indicator
+                        for scope in (entry_logic.get("regime") or []):
+                            if isinstance(scope, dict) and str(scope.get("ref_indicator") or "").startswith("ema_"):
+                                ref = scope.get("ref_indicator")
+                                break
+                        if ref is None:
+                            for cl in (entry_logic.get("clauses") or []):
+                                for c in (cl or []):
+                                    if isinstance(c, dict) and str(c.get("ref_indicator") or "").startswith("ema_"):
+                                        ref = c.get("ref_indicator")
+                                        break
+                                if ref:
+                                    break
+                    except Exception:
+                        ref = None
+                    if isinstance(ref, str) and ref.startswith("ema_"):
+                        try:
+                            ln = int(ref.split("_", 1)[1])
+                            name = f"Price vs EMA{ln}"
+                        except Exception:
+                            pass
+                gl_lines.append(f"**{name}:** {doc.get('definition','')}")
+                if doc.get("analogy"):
+                    gl_lines.append(f"*Analogy:* {doc.get('analogy')}")
+                if doc.get("range") and doc.get("range") != "—":
+                    gl_lines.append(f"*Typical range:* {doc.get('range')}")
+                gl_lines.append("")
+        parts.append("\n".join(gl_lines).strip())
+
+    return "\n\n".join([p for p in parts if str(p).strip()]).strip()
+
+
+def _render_gate_plain_english_report(
+    *,
+    df_feat: Optional[pd.DataFrame],
+    entry_logic: Dict[str, Any],
+    snap: Optional[Dict[str, Any]],
+    deposit_freq: str,
+    deposit_amt: float,
+    buy_mode: str,
+    buy_freq: str,
+    buy_amt: float,
+    max_buys_per_gate: int,
+    max_alloc_pct: float,
+    sl_ui: float,
+    tp_ui: float,
+    tp_sell_frac: float,
+    reserve_frac: float,
+    trail_ui: float,
+    max_hold: int,
+    explain_mode: str = "Beginner",
+) -> None:
+    """Render the gate explainer directly with Streamlit components.
+
+    Improvements:
+    - Collapsible clauses (expanders)
+    - Clause-level one-line "why passed/failed"
+    - "Closest clause" hint when gate is FALSE
+    - Micro-status: estimated buy pacing (cooldown + cap) for signal-mode
+    - MACD histogram normalized display formatting (avoid -0.000%)
+    """
+
+    mode = str(explain_mode or "Beginner").strip().lower()
+    beginner = mode in {"beginner", "deep"}
+    deep = mode == "deep"
+
+    # Build summary
+    st.markdown(
+        _plain_english_build_md(
+            deposit_freq=deposit_freq,
+            deposit_amt=deposit_amt,
+            buy_mode=buy_mode,
+            buy_freq=buy_freq,
+            buy_amt=buy_amt,
+            max_buys_per_gate=max_buys_per_gate,
+            max_alloc_pct=max_alloc_pct,
+            sl_pct=sl_ui,
+            tp_pct=tp_ui,
+            tp_sell_frac=tp_sell_frac,
+            reserve_frac=reserve_frac,
+            trail_pct=trail_ui,
+            time_stop_bars=max_hold,
+        )
+    )
+
+    st.markdown(
+        """**Gate rule:** Buy is allowed when **(Regime is true)** AND **(any Trigger clause is true)**.  
+- **Regime:** big-picture filter (AND). If it fails, nothing else matters.  
+- **Clauses:** reasons to buy (OR). Any clause can open the buy window; inside a clause everything is AND."""
+    )
+
+    tr = _eval_entry_logic_now(df_feat, entry_logic, train_frac=0.70)
+    cov = None
+    if isinstance(snap, dict):
+        cov = snap.get("coverage_pct")
+
+    if not tr.get("ok"):
+        st.info("Load a dataset to see live values and 'why now' explanations.")
+        st.caption("Donch pos(20) is a 0..1 percentile inside the last 20-bar range (0 = range low, 1 = range high).")
+        return
+
+    # Helper: interpret buy cooldown
+    def _cooldown_td(freq: str) -> Optional[pd.Timedelta]:
+        f = str(freq or "").strip().lower()
+        if f == "daily":
+            return pd.Timedelta(days=1)
+        if f == "weekly":
+            return pd.Timedelta(days=7)
+        if f == "monthly":
+            return pd.Timedelta(days=30)
+        return None
+
+    def _human_td(td: pd.Timedelta) -> str:
+        try:
+            secs = int(max(0, td.total_seconds()))
+        except Exception:
+            return "unknown"
+        if secs <= 0:
+            return "now"
+        mins = secs // 60
+        hours = mins // 60
+        days = hours // 24
+        if days > 0:
+            rem_h = hours % 24
+            return f"~{days}d {rem_h}h"
+        if hours > 0:
+            rem_m = mins % 60
+            return f"~{hours}h {rem_m}m"
+        return f"~{mins}m"
+
+    def _fmt_pct_clean(p: float) -> str:
+        # Avoid '-0.000%' noise: show approx when extremely tiny.
+        try:
+            p = float(p)
+        except Exception:
+            return "—"
+        if not math.isfinite(p):
+            return "—"
+        if abs(p) < 0.0005:
+            return "≈0.000%"
+        return f"{p:+.3f}%"
+
+    # Gate line
+    ts = tr.get("ts")
+    ts_txt = f"{ts}" if ts is not None else "(latest)"
+    gate_ok = bool(tr.get("gate_ok"))
+    triggered = tr.get("triggered") or []
+    gate_line = f"**Gate now:** {'TRUE' if gate_ok else 'FALSE'}"
+    if gate_ok and triggered:
+        gate_line += f" — **because Clause {', '.join(triggered)} passed**"
+    if isinstance(cov, (int, float)) and math.isfinite(float(cov)):
+        gate_line += f" (coverage ~{float(cov):.1f}% of bars in the train preview window where the gate is TRUE)"
+    gate_line += f".  \n**As of:** {ts_txt}"
+    st.markdown(gate_line)
+
+    # Closest clause hint (when gate is FALSE)
+    closest = None
+    for ct in (tr.get("clauses") or []):
+        if not isinstance(ct, dict):
+            continue
+        if closest is None or int(ct.get("pass_count") or 0) > int(closest.get("pass_count") or 0):
+            closest = ct
+    if (not gate_ok) and closest:
+        letter = str(closest.get("letter") or "?")
+        pc = int(closest.get("pass_count") or 0)
+        nn = int(closest.get("n") or 0)
+        ff = closest.get("first_fail") or {}
+        ff_plain = str(ff.get("plain") or "").strip()
+        extra = f" — blocked by {ff_plain}" if ff_plain else ""
+        st.markdown(f"**Closest clause:** Clause **{letter}** ({pc}/{nn} conditions passed){extra}.")
+
+    # TL;DR (human reason)
+    def _tldr_phrases_from_clause(ct: Dict[str, Any]) -> List[str]:
+        phrases: List[str] = []
+        for c in (ct.get("conds") or []):
+            if not isinstance(c, dict) or c.get("ok") is not True:
+                continue
+            kind = _cond_kind(c)
+            lhs = c.get("lhs")
+            thr = c.get("threshold")
+            if kind == "rsi_14" and isinstance(lhs, (int, float)) and isinstance(thr, (int, float)):
+                phrases.append(f"momentum cooled (RSI {lhs:.1f} ≤ {thr:.0f})")
+            elif kind == "bb_z_20" and isinstance(lhs, (int, float)) and isinstance(thr, (int, float)):
+                phrases.append(f"price below normal (BB z {lhs:+.2f} ≤ {thr:+.2f})")
+            elif kind == "donch_pos_20":
+                try:
+                    pct = int(round(float(lhs) * 100)) if isinstance(lhs, (int, float)) else None
+                    thr_pct = int(round(float(thr) * 100)) if isinstance(thr, (int, float)) else None
+                    if pct is not None and thr_pct is not None:
+                        phrases.append(f"not near range highs (Donch {pct}% ≤ {thr_pct}%)")
+                    elif pct is not None:
+                        phrases.append(f"range position ok (Donch {pct}%)")
+                except Exception:
+                    pass
+            elif kind == "close_vs_ema":
+                phrases.append("price in value/trend zone vs EMA")
+            elif kind == "adx_14":
+                phrases.append("trend has some strength (ADX ok)")
+            elif kind == "macd_hist":
+                phrases.append("momentum isn't collapsing (MACD ok)")
+        return phrases
+
+    if gate_ok and triggered:
+        first_letter = str(triggered[0])
+        ct0 = next((x for x in (tr.get("clauses") or []) if str(x.get("letter")) == first_letter), None)
+        phrases = _tldr_phrases_from_clause(ct0) if isinstance(ct0, dict) else []
+        if phrases:
+            st.markdown("**TL;DR:** " + ", ".join(phrases[:3]) + ".")
+        else:
+            st.markdown("**TL;DR:** Gate is open because at least one trigger clause passed.")
+    else:
+        blocker = str(tr.get("blocker") or "Gate is closed.").strip()
+        st.markdown(f"**TL;DR:** {blocker}")
+
+    # Micro-status: estimated pacing for signal mode (mechanics-only)
+    if str(buy_mode).strip().lower() == "signal" and buy_amt > 0 and str(buy_freq).strip().lower() != "none":
+        cooldown = _cooldown_td(buy_freq)
+        cap = int(max_buys_per_gate or 0)
+
+        # Best-effort: estimate buy slots used in the current gate session from the train preview window.
+        est_line = None
+        try:
+            n = int(len(df_feat))
+            n_train = int(max(1, round(n * 0.70)))
+            df_cov = df_feat.iloc[:n_train]
+            df_tail = df_cov.tail(1500)  # keep it bounded
+            # timestamp series
+            if "dt" in df_tail.columns:
+                ts_ser = pd.to_datetime(df_tail["dt"], errors="coerce")
+            else:
+                ts_ser = pd.to_datetime(df_tail.index, errors="coerce")
+
+            # gate series
+            regime = [c for c in (entry_logic.get("regime") or []) if isinstance(c, dict)]
+            clauses_raw = entry_logic.get("clauses") or []
+            clauses: List[List[Dict[str, Any]]] = []
+            for cl in clauses_raw:
+                if isinstance(cl, list):
+                    clauses.append([c for c in cl if isinstance(c, dict)])
+
+            gates: List[bool] = []
+            for _i, row in df_tail.iterrows():
+                reg_ok_i = True
+                if regime:
+                    reg_ok_i = all([_eval_condition_now(row, df_cov, c).get("ok") is True for c in regime])
+                trig_ok_i = False
+                for cl in clauses:
+                    if cl and all([_eval_condition_now(row, df_cov, c).get("ok") is True for c in cl]):
+                        trig_ok_i = True
+                        break
+                gates.append(bool(reg_ok_i and trig_ok_i) if clauses else bool(reg_ok_i))
+
+            # Simulate buy slots with cooldown + per-session cap.
+            last_buy_ts = None
+            buys_in_session = 0
+            in_session = False
+            prev_gate = False
+            session_start_idx = None
+
+            for i, gate in enumerate(gates):
+                ts_i = ts_ser.iloc[i] if i < len(ts_ser) else pd.NaT
+                if gate and not prev_gate:
+                    buys_in_session = 0
+                    in_session = True
+                    session_start_idx = i
+                if not gate:
+                    in_session = False
+                if gate and pd.notna(ts_i):
+                    cap_ok = (cap == 0) or (buys_in_session < cap)
+                    cd_ok = True
+                    if cooldown is not None and last_buy_ts is not None and pd.notna(last_buy_ts):
+                        cd_ok = (ts_i - last_buy_ts) >= cooldown
+                    if cap_ok and cd_ok:
+                        # buy slot fires
+                        buys_in_session += 1
+                        last_buy_ts = ts_i
+                prev_gate = gate
+
+            now_ts = ts_ser.iloc[-1] if len(ts_ser) else pd.NaT
+            gate_now = bool(gates[-1]) if gates else False
+
+            if gate_now:
+                cap_txt = "unlimited" if cap == 0 else f"{buys_in_session}/{cap}"
+                if cap != 0 and buys_in_session >= cap:
+                    est_line = f"**Buy pacing:** estimated buys used this gate session: **{cap_txt}** (cap reached). Next buys only after the gate closes and re-opens."
+                else:
+                    nxt = None
+                    if cooldown is not None and last_buy_ts is not None and pd.notna(now_ts) and pd.notna(last_buy_ts):
+                        nxt = (last_buy_ts + cooldown) - now_ts
+                    nxt_txt = "now" if (nxt is None or (isinstance(nxt, pd.Timedelta) and nxt <= pd.Timedelta(0))) else _human_td(nxt)
+                    cap_note = "" if cap != 0 else " (no cap)"
+                    est_line = f"**Buy pacing:** estimated buys used this gate session: **{cap_txt}**{cap_note}. Next eligible buy: **{nxt_txt}** (cooldown = {buy_freq})."
+            else:
+                cap_txt = "unlimited" if cap == 0 else str(cap)
+                est_line = f"**Buy pacing:** when the gate opens, buys can trigger at most once per {buy_freq} (cooldown), up to {cap_txt} buys per gate session."
+        except Exception:
+            est_line = None
+
+        if est_line:
+            st.markdown(est_line)
+
+    # Regime section
+    reg = tr.get("regime") or {}
+    st.markdown("### Regime (plain English)\nRegime is the bouncer: if any of these fail, buys are blocked.")
+    shown_kinds: set[str] = set()
+    for c in (reg.get("conds") or []):
+        if not isinstance(c, dict):
+            continue
+        st.markdown(f"- {c.get('expr','')}")
+        if beginner:
+            kind = _cond_kind(c)
+            if kind not in shown_kinds:
+                shown_kinds.add(kind)
+                doc_md = _indicator_doc_md(c, deep=deep)
+                if doc_md:
+                    st.caption(doc_md.replace("  ", " ").strip())
+            role = _condition_role_md(c, scope="regime", clause_intent=None)
+            if role:
+                st.markdown(f"  *Why it's here:* {role}")
+    st.markdown(f"**Regime result:** {'PASS ✅' if bool(reg.get('ok')) else 'FAIL ❌'}")
+
+    # Triggers section
+    st.markdown("### Triggers (clauses)\nAny one clause passing opens the buy window (OR).")
+
+    def _infer_clause_intent(ct: Dict[str, Any]) -> str:
+        conds = ct.get("conds") or []
+        kinds = [_cond_kind(c) for c in conds if isinstance(c, dict)]
+        has_rsi = "rsi_14" in kinds
+        has_bb = "bb_z_20" in kinds
+        has_donch = "donch_pos_20" in kinds
+        has_adx = "adx_14" in kinds
+        has_macd = "macd_hist" in kinds
+        has_ema = "close_vs_ema" in kinds
+
+        if has_rsi and has_bb and has_donch:
+            return "Dip buy / mean-reversion"
+        if has_adx and has_macd:
+            return "Trend pullback / momentum filter"
+        if has_ema and (has_rsi or has_bb):
+            ema_cond = next((c for c in conds if _cond_kind(c) == "close_vs_ema"), None)
+            op = str((ema_cond or {}).get("op") or "").strip()
+            if op in {">", ">="}:
+                return "Trend add / don't chase"
+            return "Pullback / value zone"
+        return "Trigger clause"
+
+    def _clause_meaning(intent: str) -> str:
+        intent_l = (intent or "").lower()
+        if "dip" in intent_l or "mean" in intent_l:
+            return "Buy when momentum cooled off and price is at/below its recent 'normal' — classic dip accumulation."
+        if "trend pullback" in intent_l or "momentum" in intent_l:
+            return "Buy pullbacks only when trend strength exists and momentum isn't collapsing (tries to avoid catching falling knives in chop)."
+        if "don't chase" in intent_l or "trend add" in intent_l:
+            return "Add in an uptrend, but avoid buying when price looks overheated or too stretched."
+        if "value" in intent_l or "pullback" in intent_l:
+            return "Treats buys as 'value/pullback' entries relative to a smoothed baseline."
+        return "One of the strategy's possible reasons to allow buying."
+
+    def _short_fail_reason(c: Dict[str, Any]) -> str:
+        k = _cond_kind(c)
+        return {
+            "close_vs_ema": "price vs EMA",
+            "macd_hist": "MACD momentum",
+            "adx_14": "trend strength (ADX)",
+            "rsi_14": "momentum (RSI)",
+            "bb_z_20": "stretch (BB z)",
+            "donch_pos_20": "range position (Donch)",
+        }.get(k, str(c.get("plain") or "a condition"))
+
+    # Choose which clause expander(s) should open by default.
+    open_letters: set[str] = set()
+    if gate_ok and triggered:
+        open_letters = set([str(x) for x in triggered])
+    elif (not gate_ok) and closest:
+        open_letters = {str(closest.get("letter") or "")}
+
+    for ct in (tr.get("clauses") or []):
+        if not isinstance(ct, dict):
+            continue
+        letter = str(ct.get("letter") or "?")
+        ok = bool(ct.get("ok"))
+        pc = int(ct.get("pass_count") or 0)
+        nn = int(ct.get("n") or 0)
+        intent = _infer_clause_intent(ct)
+
+        status = "PASS ✅" if ok else "FAIL ❌"
+        title = f"Clause {letter} — {intent} — {status} ({pc}/{nn})"
+        with st.expander(title, expanded=(letter in open_letters)):
+            if beginner:
+                st.markdown(f"**Meaning:** {_clause_meaning(intent)}")
+
+            if ok:
+                st.markdown(f"**Why:** Passed — all {nn} conditions are true.")
+            else:
+                ff = ct.get("first_fail") or {}
+                ff_plain = str(ff.get("plain") or "").strip()
+                fails = [c for c in (ct.get("conds") or []) if isinstance(c, dict) and c.get("ok") is False]
+                tags = ", ".join([_short_fail_reason(c) for c in fails[:3]])
+                why = f"Blocked — {pc}/{nn} conditions passed."
+                if ff_plain:
+                    why = f"Blocked by **{ff_plain}** — {pc}/{nn} conditions passed."
+                if tags:
+                    why += f" (Issues: {tags})"
+                st.markdown(f"**Why:** {why}")
+
+            for c in (ct.get("conds") or []):
+                if not isinstance(c, dict):
+                    continue
+                st.markdown(f"- {c.get('expr','')}")
+                kind = _cond_kind(c)
+
+                # Deep-only: MACD normalized display (percent of price), with clean formatting.
+                if deep and kind == "macd_hist":
+                    try:
+                        close_v = _safe_float(c.get("ctx_close"))
+                        lhs_v = _safe_float(c.get("lhs"))
+                        rhs_v = _safe_float(c.get("rhs"))
+                        if close_v and lhs_v is not None and math.isfinite(close_v) and close_v != 0.0:
+                            lhs_pct = (lhs_v / close_v) * 100.0
+                            extra = f"As % of price: {_fmt_pct_clean(lhs_pct)}"
+                            if rhs_v is not None and math.isfinite(rhs_v):
+                                rhs_pct = (rhs_v / close_v) * 100.0
+                                extra += f" (threshold {_fmt_pct_clean(rhs_pct)})"
+                            st.caption(extra)
+                    except Exception:
+                        pass
+
+                if beginner:
+                    if kind not in shown_kinds:
+                        shown_kinds.add(kind)
+                        doc_md = _indicator_doc_md(c, deep=deep)
+                        if doc_md:
+                            st.caption(doc_md.replace("  ", " ").strip())
+                    role = _condition_role_md(c, scope="trigger", clause_intent=intent)
+                    if role:
+                        st.markdown(f"  *Why it's here:* {role}")
+
+    # Gate verdict
+    if gate_ok and triggered:
+        st.markdown(f"### Gate (what it's telling you)\nGate is true because **Clause {', '.join(triggered)}** passed.")
+    else:
+        st.markdown(f"### Gate (what it's telling you)\nGate is false. {str(tr.get('blocker') or '').strip()}")
+    st.caption("Donch pos(20) is a 0..1 percentile inside the last 20-bar range (0 = range low, 1 = range high).")
+
+    # Glossary (Deep mode)
+    if deep:
+        with st.expander("Glossary (quick TA cheat-sheet)", expanded=False):
+            order = ["adx_14", "donch_pos_20", "rsi_14", "bb_z_20", "close_vs_ema", "macd_hist"]
+            for k in order:
+                if k not in shown_kinds:
+                    continue
+                doc = INDICATOR_DOCS.get(k, {})
+                if not doc:
+                    continue
+                name = doc.get("name", k)
+                if k == "close_vs_ema":
+                    # Mention EMA length (best-effort)
+                    ref = None
+                    try:
+                        for scope in (entry_logic.get("regime") or []):
+                            if isinstance(scope, dict) and str(scope.get("ref_indicator") or "").startswith("ema_"):
+                                ref = scope.get("ref_indicator")
+                                break
+                        if ref is None:
+                            for cl in (entry_logic.get("clauses") or []):
+                                for cc in (cl or []):
+                                    if isinstance(cc, dict) and str(cc.get("ref_indicator") or "").startswith("ema_"):
+                                        ref = cc.get("ref_indicator")
+                                        break
+                                if ref:
+                                    break
+                    except Exception:
+                        ref = None
+                    if isinstance(ref, str) and ref.startswith("ema_"):
+                        try:
+                            ln = int(ref.split("_", 1)[1])
+                            name = f"Price vs EMA{ln}"
+                        except Exception:
+                            pass
+                st.markdown(f"**{name}:** {doc.get('definition','')}")
+                if doc.get("analogy"):
+                    st.markdown(f"*Analogy:* {doc.get('analogy')}")
+                if doc.get("range") and doc.get("range") != "—":
+                    st.markdown(f"*Typical range:* {doc.get('range')}")
+                st.markdown("")
+
 
 
 def _gate_strip_html(bits: List[bool]) -> str:
@@ -5201,6 +6605,9 @@ def _render_skill_build_header(slot, *, df_feat: Optional[pd.DataFrame]) -> None
     trail_ui = float(ss.get("new.trail_pct_ui", 0.0) or 0.0)
     max_hold = int(ss.get("new.max_hold_bars", 0) or 0)
 
+    tp_sell_frac = float(ss.get("new.tp_sell_frac", 1.0) or 1.0)
+    reserve_frac = float(ss.get("new.reserve_frac", 0.0) or 0.0)
+
     # Effective entry_logic for diagnostics
     if str(entry_mode).startswith("Simple"):
         eff_logic = _simple_filter_to_entry_logic(buy_filter)
@@ -5372,6 +6779,31 @@ def _render_skill_build_header(slot, *, df_feat: Optional[pd.DataFrame]) -> None
         if not str(entry_mode).startswith("Simple"):
             st.markdown("##### Gate logic (visual)")
             st.markdown(_gate_logic_tree_html(eff_logic, snap), unsafe_allow_html=True)
+
+            st.markdown("##### Gate logic (plain English)")
+            explain_mode = st.selectbox("Explain mode", ["Basic", "Beginner", "Deep"], index=1, key="new.gate_explain_mode")
+            try:
+                _render_gate_plain_english_report(
+                    df_feat=df_feat,
+                    entry_logic=eff_logic,
+                    snap=snap,
+                    deposit_freq=deposit_freq,
+                    deposit_amt=deposit_amt,
+                    buy_mode=buy_mode,
+                    buy_freq=buy_freq,
+                    buy_amt=buy_amt,
+                    max_buys_per_gate=max_buys_per_gate,
+                    max_alloc_pct=max_alloc_pct,
+                    sl_ui=sl_ui,
+                    tp_ui=tp_ui,
+                    tp_sell_frac=tp_sell_frac,
+                    reserve_frac=reserve_frac,
+                    trail_ui=trail_ui,
+                    max_hold=max_hold,
+                    explain_mode=explain_mode,
+                )
+            except Exception as _e:
+                st.caption(f"Could not render plain-English gate explanation: {_e}")
 
     
 
