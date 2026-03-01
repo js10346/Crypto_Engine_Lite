@@ -26,6 +26,28 @@ import streamlit as st
 import streamlit.components.v1 as components
 com = components
 
+# ----------------------------
+# Debug UI toggle (env or ?debug=1)
+# ----------------------------
+def _debug_ui_enabled() -> bool:
+    try:
+        env = str(os.getenv("CE_DEBUG_UI", "0")).strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        env = False
+    try:
+        qp = st.query_params
+        # Streamlit query params behave like a dict; accept ?debug=1 (or true/yes/on)
+        qv = str((qp.get("debug") if hasattr(qp, "get") else "") or "").strip().lower()
+        if qv in ("1", "true", "yes", "on"):
+            return True
+    except Exception:
+        pass
+    return env
+
+# Backwards-compatible global used in a few sections (e.g., Run details debug panels)
+debug_ui = _debug_ui_enabled()
+
+
 import html as _html
 
 
@@ -807,7 +829,21 @@ def _verdict_color(v: str) -> str:
 # App meta
 # =============================================================================
 
-REPO_ROOT = Path(__file__).resolve().parent
+def _find_repo_root(start_dir: Path) -> Path:
+    """Find the project root by walking upward for known markers."""
+    start_dir = Path(start_dir).resolve()
+    markers = ("library_validate.py", "library_catalog.py", "runs", "data")
+    for parent in [start_dir] + list(start_dir.parents):
+        for mk in markers:
+            if (parent / mk).exists():
+                return parent
+    return start_dir
+
+REPO_ROOT = _find_repo_root(Path(__file__).resolve().parent)
+
+# Ensure repo root is importable (so `import library_validate` works even if app lives in a subdir).
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 RUNS_DIR = REPO_ROOT / "runs"
 DATA_DIR = REPO_ROOT / "data"
 TMP_DIR = REPO_ROOT / ".ui_tmp"
@@ -816,6 +852,14 @@ TMP_DIR.mkdir(parents=True, exist_ok=True)
 PY = sys.executable
 
 st.set_page_config(page_title="Spot Strategy Stress Lab", layout="wide")
+
+# One-shot toast messages (set before rerun)
+try:
+    _t = st.session_state.pop("ui.post_toast", None)
+    if _t:
+        st.toast(str(_t))
+except Exception:
+    pass
 
 st.markdown(
     """
@@ -889,6 +933,11 @@ st.markdown(
 
 /* Workflow (build sheet) */
 .ff-workflow { display:flex; flex-direction:column; gap:10px; margin-top:6px; }
+.ff-workflow-grid { display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin-top:6px; }
+@media (max-width: 900px) { .ff-workflow-grid { grid-template-columns: 1fr; } }
+.ff-step { display:flex; gap:10px; align-items:flex-start; border:1px solid rgba(49,51,63,0.14);
+          border-radius:14px; padding:10px 10px; background: rgba(255,255,255,0.55); }
+
 .ff-step { display:flex; gap:10px; align-items:flex-start; border:1px solid rgba(49,51,63,0.14);
           border-radius:14px; padding:10px 10px; background: rgba(255,255,255,0.55); }
 .ff-step .n { width:26px; height:26px; border-radius:999px; display:flex; align-items:center; justify-content:center;
@@ -950,8 +999,8 @@ st.markdown(
 .ff-gate-chip.info { background: rgba(52, 152, 219, 0.14); }
 .ff-gate-chip.warn { background: rgba(241, 196, 15, 0.18); }
 
-.ff-gate-tree { display:flex; gap:10px; flex-wrap:wrap; align-items:stretch; }
-.ff-gate-join { display:flex; align-items:center; justify-content:center; font-weight:850; opacity:0.55; padding:0 4px; }
+.ff-gate-tree { display:flex; gap:10px; flex-wrap:wrap; align-items:flex-start; }
+.ff-gate-join { display:flex; align-items:center; justify-content:center; font-weight:850; opacity:0.55; padding:0 4px; align-self:flex-start; margin-top:22px; }
 .ff-gate-box { flex: 1 1 260px; min-width: 240px; border:1px solid rgba(49,51,63,0.14); border-radius:14px; padding:10px; background: rgba(149,165,166,0.08); }
 .ff-gate-box .hdr { display:flex; justify-content:space-between; gap:10px; align-items:baseline; margin-bottom:6px; }
 .ff-gate-box .hdr .t { font-weight:800; }
@@ -962,9 +1011,11 @@ st.markdown(
                 font-size:0.78rem; background: rgba(255,255,255,0.55); }
 .ff-gate-cond.dim { opacity:0.72; }
 
-.ff-gate-box.regime { background: rgba(46, 204, 113, 0.10); }
-.ff-gate-box.triggers { background: rgba(155, 89, 182, 0.10); }
-.ff-gate-box.result { background: rgba(52, 152, 219, 0.10); }
+.ff-gate-box.regime { background: rgba(46, 204, 113, 0.10); flex: 0 0 320px; }
+.ff-gate-box.triggers { background: rgba(155, 89, 182, 0.10); flex: 1 1 520px; }
+.ff-gate-box.result { background: rgba(52, 152, 219, 0.10); flex: 0 0 320px; }
+
+
 .ff-gate-box.result.on { background: rgba(46, 204, 113, 0.14); }
 .ff-gate-box.result.off { background: rgba(231, 76, 60, 0.12); }
 
@@ -1138,6 +1189,32 @@ def _ff_workflow_html(steps: List[Dict[str, Any]]) -> str:
         parts.append(
             "<div class='ff-step'>"
             f"<div class='n'>{i}</div>"
+            "<div style='flex:1'>"
+            f"<div class='t'>{_html.escape(title)}</div>"
+            f"<div class='d'>{_html.escape(desc)}</div>"
+            f"<div class='meta'>{chips_html}</div>"
+            "</div>"
+            "</div>"
+        )
+    parts.append("</div>")
+    return "".join(parts)
+
+
+def _ff_workflow_grid_html(steps: List[Dict[str, Any]]) -> str:
+    """Same content as _ff_workflow_html, but laid out as a 2-column grid to reduce vertical whitespace."""
+    import html as _html
+    if not steps:
+        return ""
+    parts = ["<div class='ff-workflow-grid'>"]
+    for i, s in enumerate(steps, 1):
+        n = s.get("n", i)
+        title = str(s.get("title") or "").strip()
+        desc = str(s.get("desc") or "").strip()
+        chips = s.get("chips") or []
+        chips_html = _ff_chip_row_html([str(x) for x in chips if str(x).strip()])
+        parts.append(
+            "<div class='ff-step'>"
+            f"<div class='n'>{_html.escape(str(n))}</div>"
             "<div style='flex:1'>"
             f"<div class='t'>{_html.escape(title)}</div>"
             f"<div class='d'>{_html.escape(desc)}</div>"
@@ -2215,6 +2292,49 @@ def _resolve_dataset_path(entry: Dict[str, Any]) -> Optional[Path]:
         return None
 
 
+def _match_catalog_id_by_path(catalog: List[Dict[str, Any]], target_path: Any) -> str:
+    """Best-effort: return dataset id from catalog whose resolved path matches target_path."""
+    try:
+        tp = Path(str(target_path)).expanduser()
+        tp_abs = tp.resolve() if tp.exists() else tp
+    except Exception:
+        tp_abs = None
+    if not catalog or tp_abs is None:
+        return ""
+    try:
+        for e in catalog:
+            if not isinstance(e, dict):
+                continue
+            _id = str(e.get("id") or "").strip()
+            if not _id:
+                continue
+            p = _resolve_dataset_path(e)
+            if p is None:
+                continue
+            try:
+                p_abs = p.resolve() if p.exists() else p
+            except Exception:
+                p_abs = p
+            if str(p_abs) == str(tp_abs):
+                return _id
+    except Exception:
+        pass
+    # fallback: symbol match from filename
+    try:
+        sym = _infer_symbol_from_filename(Path(str(target_path)).name)
+        for e in catalog:
+            if not isinstance(e, dict):
+                continue
+            if str(e.get("symbol") or "").upper() == str(sym).upper():
+                _id = str(e.get("id") or "").strip()
+                if _id:
+                    return _id
+    except Exception:
+        pass
+    return ""
+
+
+
 def _infer_symbol_from_filename(name: str) -> str:
     try:
         base = Path(name).stem
@@ -2443,6 +2563,343 @@ def _get_dataset_catalog() -> List[Dict[str, Any]]:
     return _build_fallback_catalog()
 
 
+
+
+def _human_bytes(n: int) -> str:
+    try:
+        n = int(n)
+    except Exception:
+        return "?"
+    if n < 0:
+        return "?"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    x = float(n)
+    for u in units:
+        if x < 1024.0 or u == units[-1]:
+            if u == "B":
+                return f"{int(x)} {u}"
+            return f"{x:.2f} {u}"
+        x /= 1024.0
+    return f"{x:.2f} TB"
+
+
+def _interval_label_from_step_ms(step_ms: Optional[int]) -> str:
+    """Best-effort human label from an inferred bar size in milliseconds."""
+    if not step_ms:
+        return "unknown"
+    try:
+        ms = int(step_ms)
+    except Exception:
+        return "unknown"
+    # Snap to common intervals (within ~2%)
+    targets = [
+        (60_000, "1m"),
+        (300_000, "5m"),
+        (900_000, "15m"),
+        (3_600_000, "1h"),
+        (14_400_000, "4h"),
+        (86_400_000, "1d"),
+    ]
+    for t, lab in targets:
+        if abs(ms - t) / float(t) <= 0.02:
+            return lab
+    # Otherwise show a rough breakdown
+    sec = ms / 1000.0
+    if sec < 90:
+        return f"{sec:.0f}s"
+    mins = sec / 60.0
+    if mins < 90:
+        return f"{mins:.0f}m"
+    hrs = mins / 60.0
+    if hrs < 48:
+        return f"{hrs:.1f}h"
+    days = hrs / 24.0
+    return f"{days:.1f}d"
+
+
+@st.cache_data(show_spinner=False)
+def _dataset_quick_stats(path_str: str, mtime: float) -> Dict[str, Any]:
+    """Lightweight dataset summary used by the UI (cached).
+
+    Reads only minimal columns when possible and computes:
+    - row count, dt range
+    - monotonicity + duplicate ts check
+    - inferred bar interval (mode of ts diffs)
+    - rough missing-bar estimate (gap diffs)
+    """
+    _ = mtime  # cache buster
+    p = Path(str(path_str)).expanduser()
+    out: Dict[str, Any] = {"ok": False, "path": str(p)}
+    if not p.exists():
+        out["error"] = "File not found"
+        return out
+
+    try:
+        suf = p.suffix.lower()
+        df = None
+        if suf in {".parquet", ".pq"}:
+            try:
+                df = pd.read_parquet(p, columns=["ts", "dt"])
+            except Exception:
+                df = pd.read_parquet(p)
+                cols = {c.lower(): c for c in df.columns}
+                keep = []
+                if "ts" in cols:
+                    keep.append(cols["ts"])
+                if "dt" in cols:
+                    keep.append(cols["dt"])
+                if keep:
+                    df = df[keep]
+        elif suf == ".csv":
+            # Read minimal columns if possible
+            try:
+                df = pd.read_csv(p, usecols=["ts", "dt"])
+            except Exception:
+                df = pd.read_csv(p)
+        else:
+            out["error"] = f"Unsupported file type: {p.suffix}"
+            return out
+
+        if df is None or df.empty:
+            out["error"] = "Empty dataset"
+            return out
+
+        cols = {c.lower(): c for c in df.columns}
+        ts_col = cols.get("ts")
+        dt_col = cols.get("dt")
+
+        # Build ts series
+        if ts_col is not None:
+            ts = pd.to_numeric(df[ts_col], errors="coerce")
+        elif dt_col is not None:
+            dt = pd.to_datetime(df[dt_col], utc=True, errors="coerce")
+            ts = (dt.view("int64") // 1_000_000).astype("float64")
+        else:
+            out["error"] = "Missing both ts and dt columns"
+            return out
+
+        ts = ts.dropna()
+        if ts.empty:
+            out["error"] = "No valid timestamps"
+            return out
+
+        # Normalize to int64 ms
+        ts_i = ts.astype("int64")
+
+        rows = int(len(ts_i))
+        out["rows"] = rows
+        out["dupes"] = int(ts_i.duplicated().sum())
+        out["monotonic"] = bool(ts_i.is_monotonic_increasing)
+
+        # Range
+        start_ts = int(ts_i.iloc[0])
+        end_ts = int(ts_i.iloc[-1])
+        out["start_ts"] = start_ts
+        out["end_ts"] = end_ts
+        try:
+            out["start_dt"] = str(pd.to_datetime(start_ts, unit="ms", utc=True))
+            out["end_dt"] = str(pd.to_datetime(end_ts, unit="ms", utc=True))
+        except Exception:
+            out["start_dt"] = ""
+            out["end_dt"] = ""
+
+        # Infer interval + gaps (O(n))
+        step_ms = None
+        gap_segments = 0
+        missing_est = 0
+
+        if rows >= 3:
+            arr = ts_i.to_numpy(dtype="int64", copy=False)
+            diffs = np.diff(arr)
+            diffs = diffs[diffs > 0]
+            if diffs.size:
+                # mode of diffs (using value_counts is faster than scipy)
+                vc = pd.Series(diffs).value_counts()
+                if not vc.empty:
+                    step_ms = int(vc.index[0])
+                if step_ms and step_ms > 0:
+                    # gaps where diff is > 1.5x expected step
+                    gmask = diffs > int(step_ms * 1.5)
+                    gap_segments = int(gmask.sum())
+                    if gap_segments:
+                        # missing bars per gap segment ~ (diff / step) - 1
+                        missing_est = int(((diffs[gmask] // step_ms) - 1).sum())
+
+        out["step_ms"] = step_ms
+        out["interval"] = _interval_label_from_step_ms(step_ms)
+        out["gap_segments"] = gap_segments
+        out["missing_est"] = missing_est
+
+        # File info
+        try:
+            stt = p.stat()
+            out["size_bytes"] = int(stt.st_size)
+            out["mtime"] = float(stt.st_mtime)
+        except Exception:
+            pass
+
+        out["ok"] = True
+        return out
+    except Exception as e:
+        out["error"] = str(e)
+        return out
+
+
+def _find_catalog_entry_for_path(catalog: List[Dict[str, Any]], p: Path) -> Optional[Dict[str, Any]]:
+    try:
+        p_abs = p.resolve()
+    except Exception:
+        p_abs = p
+    for d in catalog or []:
+        if not isinstance(d, dict):
+            continue
+        p2 = _resolve_dataset_path(d)
+        if not p2:
+            continue
+        try:
+            if p2.resolve() == p_abs:
+                return d
+        except Exception:
+            if str(p2) == str(p_abs):
+                return d
+    return None
+
+
+def _render_dataset_details(data_path_str: str) -> None:
+    """UI helper: show quick dataset facts + basic sanity checks."""
+    p = _resolve_dataset_path({"file_path": str(data_path_str or "")}) or Path(str(data_path_str or ""))
+    if not p:
+        st.error("Dataset path missing.")
+        return
+
+    if not p.exists():
+        st.error(f"Dataset not found: {p}")
+        return
+
+    # Try to enrich from catalog if possible
+    cat = _get_dataset_catalog()
+    entry = _find_catalog_entry_for_path(cat, p) if cat else None
+
+    try:
+        mtime = p.stat().st_mtime
+    except Exception:
+        mtime = 0.0
+
+    stats = _dataset_quick_stats(str(p), mtime)
+    if not stats.get("ok"):
+        st.error(f"Failed to read dataset: {stats.get('error','unknown error')}")
+        st.code(str(p), language=None)
+        return
+    # Top-line meta (production-friendly)
+    sym = str((entry or {}).get("symbol") or _infer_symbol_from_filename(p.name) or "").upper()
+    tf = str((entry or {}).get("timeframe") or stats.get("interval") or "unknown")
+    src = str((entry or {}).get("source") or "")
+    quote = str((entry or {}).get("quote") or "")
+    updated_at = str((entry or {}).get("updated_at") or "")
+
+    # Debug mode can be enabled via env var or ?debug=1 query param.
+    debug_ui = os.getenv("CE_DEBUG_UI", "0") in ("1", "true", "TRUE", "yes", "YES", "on", "ON")
+    try:
+        qp = getattr(st, "query_params", None)
+        if qp is not None:
+            dbg = str(qp.get("debug", "0")).lower()
+        else:
+            dbg = str(st.experimental_get_query_params().get("debug", ["0"])[0]).lower()
+        if dbg in ("1", "true", "yes", "on"):
+            debug_ui = True
+    except Exception:
+        pass
+
+    # Basic quality checks (fast)
+    issues: List[str] = []
+    if not bool(stats.get("monotonic", True)):
+        issues.append("Timestamps are **not** monotonic increasing.")
+    dupes = int(stats.get("dupes", 0) or 0)
+    if dupes:
+        issues.append(f"Found **{dupes:,}** duplicate timestamps.")
+    gap_segments = int(stats.get("gap_segments", 0) or 0)
+    missing_est = int(stats.get("missing_est", 0) or 0)
+    if gap_segments:
+        issues.append(f"Detected **{gap_segments:,}** gap segments (≈ **{missing_est:,}** missing bars est.).")
+
+    # Minimal production view
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Symbol", sym or "?")
+    c2.metric("Timeframe", tf or "?")
+    c3.metric("Source", (f"{src}".upper() + (f" / {quote}" if quote else "")).strip() or "?")
+    c4.metric("Updated", (updated_at.split("T")[0] if "T" in updated_at else updated_at) or "?")
+
+    st.caption("Range (UTC)")
+    st.write(f"{stats.get('start_dt','?')} → {stats.get('end_dt','?')}")
+
+    st.caption("Data scan")
+    if issues:
+        st.warning(f"Data scan found {len(issues)} issue(s).")
+    else:
+        st.success("Data scan: OK.")
+
+    with st.expander("What the data scan checked", expanded=False):
+        st.markdown(
+            f"- {'✅' if bool(stats.get('monotonic', True)) else '⚠️'} **Monotonic timestamps**\n"
+            f"- {'✅' if int(dupes or 0) == 0 else '⚠️'} **Duplicate timestamps**: {int(dupes or 0):,}\n"
+            f"- {'✅' if int(gap_segments or 0) == 0 else '⚠️'} **Gaps**: {int(gap_segments or 0):,} segment(s) (≈ {int(missing_est or 0):,} missing bars est.)\n"
+        )
+        if issues:
+            st.markdown("**Findings:**")
+            for msg in issues:
+                st.markdown(f"- {msg}")
+        st.caption("Fast scan for UI feedback. Deeper validation lives in the dataset library/ingest checks.")
+
+    # Debug-only details (paths + raw catalog + deep validate)
+    if debug_ui:
+        st.caption("Debug")
+        meta_cols = st.columns(2)
+        meta_cols[0].metric("Rows", f"{int(stats.get('rows',0)):,}")
+        meta_cols[1].metric("Size", _human_bytes(int(stats.get("size_bytes", 0) or 0)))
+
+        st.caption("File")
+        try:
+            rel = str(p.resolve().relative_to(REPO_ROOT)) if REPO_ROOT in p.resolve().parents else str(p)
+        except Exception:
+            rel = str(p)
+        st.code(rel, language=None)
+
+        if entry:
+            extra = {}
+            for k in ("pair", "source", "quote", "updated_at", "start_dt", "end_dt"):
+                if k in entry and entry.get(k) not in (None, "", "?"):
+                    extra[k] = entry.get(k)
+            if extra:
+                st.caption("Catalog")
+                st.json(extra)
+
+        with st.expander("Deep validate (slower)", expanded=False):
+            st.caption("Runs a fuller set of checks similar to `library_validate.py`.")
+            if st.button("Run deep validate", key=f"deep_validate:{str(p)}"):
+                try:
+                    # Robust import even if app is not located in repo root.
+                    try:
+                        import library_validate as lv  # type: ignore
+                    except ModuleNotFoundError:
+                        import importlib.util
+                        lv_path = REPO_ROOT / "library_validate.py"
+                        spec = importlib.util.spec_from_file_location("library_validate", str(lv_path))
+                        if spec is None or spec.loader is None:
+                            raise ModuleNotFoundError(f"Couldn't load {lv_path}")
+                        lv = importlib.util.module_from_spec(spec)  # type: ignore
+                        spec.loader.exec_module(lv)  # type: ignore
+
+                    df_full = lv.load_df(p)
+                    df_can = lv.canonicalize(df_full)
+                    msgs = lv.validate_df(df_can)
+
+                    if not msgs:
+                        st.success("Deep validate: no issues found ✅")
+                    else:
+                        for mm in msgs:
+                            st.warning(str(mm))
+                except Exception as e:
+                    st.error(f"Deep validate failed: {e}")
 def _sort_filter_catalog(
     catalog: List[Dict[str, Any]],
     query: str,
@@ -8817,12 +9274,109 @@ with st.sidebar:
     if nxt and nxt in run_names:
         st.session_state["selected_run"] = nxt
 
+    # Apply any pending "use as baseline" preset BEFORE sidebar widgets are instantiated.
+    _preset = st.session_state.pop("ui.preset_from_baseline", None)
+    if isinstance(_preset, dict) and _preset:
+        # Switch to new run (must happen before the 'Open existing run' selectbox is created).
+        st.session_state["ui.open_run_force_new"] = True
+        st.session_state["ui.section"] = "1) Build & Run"
+        st.session_state["new.step"] = 1
+
+        # Dataset defaults
+        try:
+            _catalog = _get_dataset_catalog()
+        except Exception:
+            _catalog = []
+        _ds_path = str(_preset.get("dataset_path") or _preset.get("data_path") or "")
+        _ds_id = str(_preset.get("dataset_id") or "").strip()
+        if (not _ds_id) and _ds_path:
+            try:
+                _ds_id = _match_catalog_id_by_path(_catalog, _ds_path)
+            except Exception:
+                _ds_id = ""
+
+        _by_id = {str(d.get("id")): d for d in (_catalog or []) if isinstance(d, dict) and str(d.get("id") or "").strip()}
+
+        if _ds_id:
+            st.session_state["sidebar.dataset_id"] = _ds_id
+            st.session_state["sidebar.dataset_id_prev"] = _ds_id
+            st.session_state["new.data_id"] = _ds_id
+            st.session_state["new.data_candidate_id"] = _ds_id
+
+        # Resolve path (prefer catalog; fallback to raw path)
+        _p = None
+        try:
+            _entry = _by_id.get(str(_ds_id), {}) if _ds_id else {}
+            _p = _resolve_dataset_path(_entry) if isinstance(_entry, dict) else None
+        except Exception:
+            _p = None
+        if _p is None and _ds_path:
+            try:
+                _p = Path(_ds_path).expanduser()
+            except Exception:
+                _p = None
+
+        if _p is not None and hasattr(_p, "exists") and _p.exists():
+            st.session_state["new.data_path"] = str(_p)
+            st.session_state["new.data_candidate_path"] = str(_p)
+        elif _ds_path:
+            st.session_state["new.data_path"] = str(_ds_path)
+            st.session_state["new.data_candidate_path"] = str(_ds_path)
+
+        # Backtest window defaults
+        _mode_raw = str(_preset.get("range_mode") or _preset.get("data_range_mode") or "Full history")
+        _mode_ui = "Custom dates" if _mode_raw.startswith("Custom") else "Full history"
+        st.session_state["sidebar.data_range_mode"] = _mode_ui
+        st.session_state["new.data_range_mode"] = _mode_ui
+
+        _s = _preset.get("start") or _preset.get("data_range_start")
+        _e = _preset.get("end") or _preset.get("data_range_end")
+        if _mode_ui == "Custom dates" and _s and _e:
+            try:
+                d0 = pd.to_datetime(_s, utc=True, errors="coerce").date()
+                d1 = pd.to_datetime(_e, utc=True, errors="coerce").date()
+                if d0 and d1:
+                    if d0 > d1:
+                        d0, d1 = d1, d0
+                    st.session_state["sidebar.data_range_dates"] = (d0, d1)
+                    st.session_state["new.data_range_dates"] = (d0, d1)
+                    st.session_state["new.data_range_start"] = str(pd.Timestamp(d0).tz_localize("UTC").isoformat())
+                    st.session_state["new.data_range_end"] = str(pd.Timestamp(d1).tz_localize("UTC").isoformat())
+            except Exception:
+                pass
+        else:
+            st.session_state["new.data_range_start"] = None
+            st.session_state["new.data_range_end"] = None
+            st.session_state.pop("new.data_range_dates", None)
+            st.session_state.pop("sidebar.data_range_dates", None)
+
+    # Allow one-shot programmatic jump to '(new run)' without mutating widget key mid-run.
+
+
+    force_new = bool(st.session_state.pop("ui.open_run_force_new", False))
+
+
+    _open_idx = 0 if force_new else (1 + run_names.index(st.session_state["selected_run"]) if st.session_state["selected_run"] in run_names else 0)
+
+
     open_existing = st.selectbox(
+
+
         "Open existing run",
+
+
         options=["(new run)"] + run_names,
-        index=(1 + run_names.index(st.session_state["selected_run"]) if st.session_state["selected_run"] in run_names else 0),
+
+
+        index=_open_idx,
+
+
         format_func=lambda nm: (nm if nm == "(new run)" else (nm + ("  (incomplete)" if not run_is_complete.get(nm, False) else ""))),
+
+
         key="ui.open_run",
+
+
     )
 
     if open_existing != "(new run)":
@@ -8834,12 +9388,165 @@ with st.sidebar:
     st.divider()
     st.header("App")
 
-    st.session_state.setdefault("ui.debug", False)
-    st.checkbox(
-        "Debug (show commands & logs)",
-        key="ui.debug",
-        help="Off by default to keep the UI clean. Turn on to see raw subprocess logs and full commands.",
-    )
+    # Debug controls are hidden in the public UI.
+    # Enable debug features via CE_DEBUG_UI=1 or ?debug=1 (see debug_ui global).
+    st.session_state["ui.debug"] = bool(debug_ui)
+    # ------------------------------------------------------------
+    # Baseline + Dataset (public workflow loop)
+    # ------------------------------------------------------------
+    st.markdown("**Baseline**")
+    payload = st.session_state.get("builder.payload")
+    if isinstance(payload, dict) and payload:
+        src_cfg = str(((payload.get("source") or {}).get("config_id")) or "").strip()
+        src_run = str(((payload.get("source") or {}).get("run_name")) or "").strip()
+        lbl = f"`{src_cfg}`" if src_cfg else "`(unknown)`"
+        if src_run:
+            st.caption(f"Loaded: {lbl}  ·  from {src_run}")
+        else:
+            st.caption(f"Loaded: {lbl}")
+
+        b1, b2 = st.columns([0.62, 0.38], gap="small")
+        with b1:
+            if st.button("Open Strategy Builder", key="sidebar.open_builder", use_container_width=True):
+                st.session_state["ui.open_run_force_new"] = True
+                st.session_state["ui.section_next"] = "1) Build & Run"
+                st.session_state["new.step"] = 1
+                st.session_state["builder.pending_apply"] = True
+                st.rerun()
+        with b2:
+            if st.button("Clear", key="sidebar.clear_baseline", use_container_width=True):
+                st.session_state.pop("builder.payload", None)
+                st.session_state.pop("builder.pending_apply", None)
+                st.rerun()
+    else:
+        st.caption("No baseline loaded yet. Use **Use as baseline** from a Build sheet.")
+
+    st.markdown("---")
+    st.markdown("**Dataset**")
+
+    catalog = _get_dataset_catalog()
+    by_id = {str(d.get("id")): d for d in catalog if isinstance(d, dict) and str(d.get("id") or "").strip()}
+
+    if "sidebar.dataset_id" not in st.session_state:
+        _default_path = None
+        try:
+            if isinstance(payload, dict):
+                _default_path = ((payload.get("dataset") or {}).get("path_abs")) or ((payload.get("dataset") or {}).get("path")) or None
+        except Exception:
+            _default_path = None
+        try:
+            if not _default_path and open_existing != "(new run)":
+                _meta = _read_json(run_dirs[st.session_state.get("selected_run")] / "batch_meta.json")
+                _default_path = str(_meta.get("data_path") or _meta.get("data") or "")
+        except Exception:
+            pass
+        try:
+            if not _default_path:
+                _default_path = st.session_state.get("new.data_path")
+        except Exception:
+            pass
+        _default_id = _match_catalog_id_by_path(catalog, _default_path) if _default_path else ""
+        if _default_id and _default_id in by_id:
+            st.session_state["sidebar.dataset_id"] = _default_id
+        elif by_id:
+            st.session_state["sidebar.dataset_id"] = list(by_id.keys())[0]
+        else:
+            st.session_state["sidebar.dataset_id"] = ""
+
+    def _sidebar_apply_dataset_selection():
+        ds_id = str(st.session_state.get("sidebar.dataset_id") or "")
+        entry = by_id.get(ds_id, {}) if ds_id else {}
+        p = _resolve_dataset_path(entry) if isinstance(entry, dict) else None
+        if p is not None and p.exists():
+            st.session_state["new.data_candidate_id"] = ds_id
+            st.session_state["new.data_candidate_path"] = str(p)
+            st.session_state["new.data_id"] = ds_id
+            st.session_state["new.data_path"] = str(p)
+        prev = str(st.session_state.get("sidebar.dataset_id_prev") or "")
+        if prev != ds_id:
+            st.session_state["sidebar.dataset_id_prev"] = ds_id
+            st.session_state["sidebar.data_range_mode"] = "Full history"
+            st.session_state.pop("sidebar.data_range_dates", None)
+            st.session_state["new.data_range_mode"] = "Full history"
+            st.session_state["new.data_range_start"] = None
+            st.session_state["new.data_range_end"] = None
+            st.session_state.pop("new.data_range_dates", None)
+
+    ds_ids = list(by_id.keys())
+    if ds_ids:
+        st.selectbox(
+            "Dataset",
+            options=ds_ids,
+            key="sidebar.dataset_id",
+            format_func=lambda _id: _dataset_option_label(by_id.get(_id, {})),
+            help="Click and type to search. Defaults to the dataset used by the run you're inspecting.",
+            on_change=_sidebar_apply_dataset_selection,
+        )
+        _sidebar_apply_dataset_selection()
+    else:
+        st.warning("No datasets found in the library.")
+
+    # Backtest date slice (mirrors Data step)
+    ds_id = str(st.session_state.get("sidebar.dataset_id") or "")
+    entry = by_id.get(ds_id, {}) if ds_id else {}
+    bounds_start, bounds_end = _entry_bounds_iso(entry) if isinstance(entry, dict) else (None, None)
+
+    def _safe_to_date(_x):
+        try:
+            _ts = pd.to_datetime(_x, utc=True, errors="coerce")
+            if _ts is pd.NaT:
+                return None
+            return _ts.date()
+        except Exception:
+            return None
+
+    if bounds_start and bounds_end:
+        min_d = _safe_to_date(bounds_start)
+        max_d = _safe_to_date(bounds_end)
+        if min_d and max_d and min_d > max_d:
+            min_d, max_d = max_d, min_d
+
+        st.session_state.setdefault("sidebar.data_range_mode", "Full history")
+        mode = st.radio(
+            "Backtest window",
+            options=["Full history", "Custom dates"],
+            key="sidebar.data_range_mode",
+            horizontal=True,
+        )
+        st.session_state["new.data_range_mode"] = mode
+
+        if mode == "Custom dates" and min_d and max_d:
+            v0, v1 = (min_d, max_d)
+            cur = st.session_state.get("sidebar.data_range_dates")
+            if isinstance(cur, (list, tuple)) and len(cur) == 2 and cur[0] and cur[1]:
+                v0, v1 = cur[0], cur[1]
+            if v0 < min_d:
+                v0 = min_d
+            if v1 > max_d:
+                v1 = max_d
+            if v0 > v1:
+                v0, v1 = v1, v0
+
+            dr = st.date_input(
+                "Date range",
+                value=(v0, v1),
+                min_value=min_d,
+                max_value=max_d,
+                key="sidebar.data_range_dates",
+            )
+            if isinstance(dr, (list, tuple)) and len(dr) == 2:
+                d0, d1 = dr[0], dr[1]
+                st.session_state["new.data_range_start"] = str(pd.Timestamp(d0).tz_localize("UTC").isoformat())
+                st.session_state["new.data_range_end"] = str(pd.Timestamp(d1).tz_localize("UTC").isoformat())
+                st.session_state["new.data_range_dates"] = (d0, d1)
+        else:
+            st.session_state["new.data_range_start"] = None
+            st.session_state["new.data_range_end"] = None
+            st.session_state.pop("new.data_range_dates", None)
+    else:
+        st.session_state["new.data_range_mode"] = "Full history"
+        st.session_state["new.data_range_start"] = None
+        st.session_state["new.data_range_end"] = None
 
 
     # Keep stage keys for internal routing ("Next →" buttons, etc.)
@@ -9291,6 +9998,30 @@ if open_existing == "(new run)":
         st.caption("Module: DCA/Swing (spot, long-only).")
 
         _render_plan_blueprint_import_ui()
+
+
+        # Apply baseline payload from Results (best-effort; runs once)
+        if bool(st.session_state.get("builder.pending_apply", False)):
+            payload = st.session_state.get("builder.payload") or {}
+            bp = {}
+            try:
+                bp = (payload.get("params") or {}) if isinstance(payload, dict) else {}
+            except Exception:
+                bp = {}
+            if isinstance(bp, dict) and bp:
+                res = _apply_dca_plan_blueprint(bp)
+                if isinstance(res, (tuple, list)) and len(res) == 2:
+                    ok, msg = bool(res[0]), str(res[1])
+                else:
+                    ok, msg = False, "Blueprint apply returned no status."
+                st.session_state["builder.pending_apply"] = False
+                st.session_state["builder.last_apply_msg"] = msg
+                if ok:
+                    st.info("Baseline loaded from Results. You can tweak it here before running tests.")
+                else:
+                    st.warning(f"Could not fully apply baseline: {msg}")
+            else:
+                st.session_state["builder.pending_apply"] = False
 
         baseline_params = build_dca_baseline_params()
         st.session_state["new.baseline_params"] = baseline_params
@@ -10506,20 +11237,19 @@ with st.container(border=True):
             _grid_p = str(meta.get("grid", "?"))
             _tmpl = str(meta.get("template", "?"))
 
-            data_short = Path(_data_p).name if _data_p not in ("", "?", "None") else "?"
-            grid_short = Path(_grid_p).name if _grid_p not in ("", "?", "None") else "?"
-            tmpl_short = _tmpl if _tmpl not in ("", "?", "None") else "?"
+            # User-facing summary: keep it dead simple.
+            # - Show dataset name without extension (BTC instead of BTC.parquet)
+            # - Hide grid/template details (still available under Run details expander)
+            data_name = Path(_data_p).name if _data_p not in ("", "?", "None") else "?"
+            # Strip common data extensions (including optional .gz)
+            data_short = re.sub(r"(\.(parquet|csv|feather|pqt|pq))(\.gz)?$", "", data_name, flags=re.IGNORECASE)
+            if not data_short:
+                data_short = data_name or "?"
 
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                st.caption("Data")
-                st.write(f"`{data_short}`")
-            with c2:
-                st.caption("Grid")
-                st.write(f"`{grid_short}`")
-            with c3:
-                st.caption("Template")
-                st.write(f"`{tmpl_short}`")
+            st.caption("Data")
+            with st.expander(f"📊 {data_short}", expanded=False):
+                _render_dataset_details(_data_p)
+
         except Exception:
             st.caption("Run metadata found, but failed to render a compact summary.")
     else:
@@ -10533,50 +11263,52 @@ frames = load_batch_frames(run_dir)
 survivors, survivor_source = pick_survivors(frames)
 
 
-with st.expander("Run details (paths & debug)", expanded=False):
-    if meta:
-        try:
-            st.caption("Full paths (for debugging / reproducibility)")
-            st.code(f"Data: {meta.get('data','?')}", language=None)
-            st.code(f"Grid: {meta.get('grid','?')}", language=None)
-            st.code(f"Template: {meta.get('template','?')}", language=None)
-        except Exception:
-            pass
-    else:
-        st.caption("No batch_meta.json found for this run.")
+if debug_ui:
+    with st.expander("Run details (paths & debug)", expanded=False):
+        if meta:
+            try:
+                st.caption("Full paths (for debugging / reproducibility)")
+                st.code(f"Data: {meta.get('data','?')}", language=None)
+                st.code(f"Grid: {meta.get('grid','?')}", language=None)
+                st.code(f"Template: {meta.get('template','?')}", language=None)
+            except Exception:
+                pass
+        else:
+            st.caption("No batch_meta.json found for this run.")
 
-    st.divider()
-    st.markdown("**Baseline anchor (debug)**")
-    _bid = st.session_state.get("baseline_config_id")
-    st.write(f"baseline_config_id: `{_bid}`" if _bid else "baseline_config_id: (none)")
-    if _bid:
-        hits = {}
-        try:
-            for k in ["full_passed", "sweep_passed", "full_all", "sweep_all", "ranked"]:
-                dfk = frames.get(k) if isinstance(frames, dict) else None
-                hits[k] = bool(
-                    dfk is not None
-                    and (not dfk.empty)
-                    and ("config_id" in dfk.columns)
-                    and (dfk["config_id"].astype(str) == str(_bid)).any()
-                )
-        except Exception:
-            pass
-        try:
-            hits["survivors_set"] = bool(
-                survivors is not None
-                and (not survivors.empty)
-                and ("config_id" in survivors.columns)
-                and (survivors["config_id"].astype(str) == str(_bid)).any()
-            )
-        except Exception:
-            pass
-        st.json(hits)
+        st.divider()
+        if debug_ui:
+            st.markdown("**Baseline anchor (debug)**")
+            _bid = st.session_state.get("baseline_config_id")
+            st.write(f"baseline_config_id: `{_bid}`" if _bid else "baseline_config_id: (none)")
+            if _bid:
+                hits = {}
+                try:
+                    for k in ["full_passed", "sweep_passed", "full_all", "sweep_all", "ranked"]:
+                        dfk = frames.get(k) if isinstance(frames, dict) else None
+                        hits[k] = bool(
+                            dfk is not None
+                            and (not dfk.empty)
+                            and ("config_id" in dfk.columns)
+                            and (dfk["config_id"].astype(str) == str(_bid)).any()
+                        )
+                except Exception:
+                    pass
+                try:
+                    hits["survivors_set"] = bool(
+                        survivors is not None
+                        and (not survivors.empty)
+                        and ("config_id" in survivors.columns)
+                        and (survivors["config_id"].astype(str) == str(_bid)).any()
+                    )
+                except Exception:
+                    pass
+                st.json(hits)
 
 
-if survivors.empty:
-    st.warning("No results found in this run folder (or everything is empty).")
-    st.stop()
+        if survivors.empty:
+            st.warning("No results found in this run folder (or everything is empty).")
+            st.stop()
 
 # Ranked frame (if present) gives score columns
 ranked = frames.get("ranked")
@@ -15938,7 +16670,72 @@ if stage_pick == "grand":
                                 st.caption("All robustness checks are complete for this run.")
 
                     st.divider()
-                    st.markdown("##### Build sheet")
+                    bsL, bsR = st.columns([0.72, 0.28], gap="small", vertical_alignment="center")
+                    with bsL:
+                        st.markdown("##### Build sheet")
+                    with bsR:
+                        if st.button("Use as baseline", key=f"use_baseline.{pick}", use_container_width=True):
+                            # Prefer resolved normalized config (stable shape for rehydration)
+                            try:
+                                cfg_map = {r.get("config_id"): r.get("normalized") for r in _load_jsonl(run_dir / "configs_resolved.jsonl")}
+                                cfg_norm = cfg_map.get(str(pick), {}) or {}
+                            except Exception:
+                                cfg_norm = {}
+
+                            # Dataset defaults from this run
+                            try:
+                                meta = _read_json(run_dir / "batch_meta.json") if (run_dir / "batch_meta.json").exists() else {}
+                            except Exception:
+                                meta = {}
+                            ds_path = str(meta.get("data_path") or meta.get("data") or "")
+                            ds_mode = str(meta.get("data_range_mode") or "Full history")
+                            ds_start = meta.get("data_range_start")
+                            ds_end = meta.get("data_range_end")
+
+                            st.session_state["builder.payload"] = {
+                                "v": 1,
+                                "source": {"run_name": str(run_dir.name), "config_id": str(pick)},
+                                "dataset": {"path_abs": ds_path, "range_mode": ds_mode, "start": ds_start, "end": ds_end},
+                                "template": "strategies.dca_swing:Strategy",
+                                "params": cfg_norm,
+                            }
+                            st.session_state["builder.pending_apply"] = True
+
+
+                            # Defer sidebar widget state changes to the next rerun (must happen before widgets are created).
+
+                            try:
+
+                                catalog = _get_dataset_catalog()
+
+                                ds_id = _match_catalog_id_by_path(catalog, ds_path) if ds_path else ""
+
+                            except Exception:
+
+                                ds_id = ""
+
+
+                            st.session_state["ui.preset_from_baseline"] = {
+
+                                "open_new_run": True,
+
+                                "dataset_path": ds_path,
+
+                                "dataset_id": ds_id,
+
+                                "range_mode": ds_mode,
+
+                                "start": ds_start,
+
+                                "end": ds_end,
+
+                            }
+
+
+                            st.session_state["ui.post_toast"] = "Baseline loaded. Change dataset in the sidebar (optional), tweak, then run tests."
+
+                            st.rerun()
+
                     st.caption("A mechanics-first summary of what this strategy does (not advice).")
 
                     # Locate artifacts for selected config (replay cache first, then top-k artifacts)
@@ -16282,16 +17079,51 @@ if stage_pick == "grand":
                                 st.markdown(f"**#{int(rr_sel.get('rank', 0) or 0)}**" if rr_sel.get('rank') else "")
                                 st.caption(f"Rank band: **{grade}** (relative to this run)")
                     
-                            # Summary for this check (relative)
-                            st.markdown(
-                                _ff_score_strip_html([
-                                    ("Filters passed", f"{checks_passed}/{checks_total}" if checks_total else "—", float(checks_ratio or 0.0)),
-                                    ("Diagnostics score", f"{int(round((confidence or 0.0) * 100))}/100", float(confidence or 0.0)),
-                                ]),
-                                unsafe_allow_html=True,
-                            )
-                            # Three-panel layout: config | characteristics | diagnostics
-                            c1, c2, c3 = st.columns([0.38, 0.34, 0.28])
+                            # Hero strip (fills width): relative checks + at-a-glance outcomes
+                    
+                            sL, sR = st.columns([0.56, 0.44], gap="small")
+                    
+                            with sL:
+                    
+                                st.markdown(
+                    
+                                    _ff_score_strip_html([
+                    
+                                        ("Filters passed", f"{checks_passed}/{checks_total}" if checks_total else "—", float(checks_ratio or 0.0)),
+                    
+                                        ("Diagnostics score", f"{int(round((confidence or 0.0) * 100))}/100", float(confidence or 0.0)),
+                    
+                                    ]),
+                    
+                                    unsafe_allow_html=True,
+                    
+                                )
+                    
+                            with sR:
+                    
+                                wr_txt = f"{win_rate * 100:.0f}%" if math.isfinite(float(win_rate)) else "—"
+                    
+                                pf_txt = (f"{pf:.2f}" if (pf is not None and math.isfinite(float(pf)) and pf != float('inf')) else ("∞" if pf == float('inf') else "—"))
+                    
+                                st.markdown(
+                    
+                                    _ff_grid2_html([
+                    
+                                        ("Batch return", _fmt_pct(batch_ret)),
+                    
+                                        ("Max drawdown", _fmt_pct(batch_dd)),
+                    
+                                        ("Trades", f"{trade_count}"),
+                    
+                                        ("Win rate", wr_txt),
+                    
+                                    ]),
+                    
+                                    unsafe_allow_html=True,
+                    
+                                )
+# Three-panel layout: config | characteristics | diagnostics
+                            c1, c2, c3 = st.columns([0.40, 0.30, 0.30], gap="small")
 
 
                             with c1:
@@ -16387,45 +17219,25 @@ if stage_pick == "grand":
                                     {"title": "Risk controls", "desc": risk_desc, "chips": risk_chips},
                                     {"title": "Exits", "desc": exit_desc, "chips": exit_chips},
                                 ]
-                                st.markdown(_ff_workflow_html(steps), unsafe_allow_html=True)
+                                st.markdown(_ff_workflow_grid_html(steps), unsafe_allow_html=True)
 
-                                # Decision logic (readable, not JSON)
-                                try:
-                                    show_logic = bool(entry_logic) and (int(n_regime) > 0 or int(n_clauses) > 0)
-                                except Exception:
-                                    show_logic = bool(entry_logic)
-
-                                if show_logic:
-                                    with st.expander("Entry logic (details)", expanded=False):
-                                        if str(buy_mode).strip().lower() == "signal":
-                                            st.caption("Buys can fire on any day while the gate is true, but they are spaced by your cooldown (max buy frequency).")
-                                        else:
-                                            st.caption("Scheduled buy attempts are skipped unless the gate is satisfied.")
-                                        reg = (entry_logic or {}).get("regime") or []
-                                        clauses = (entry_logic or {}).get("clauses") or []
-
-                                        if reg:
-                                            st.markdown("**Regime (must all be true)**")
-                                            for c in reg:
-                                                if isinstance(c, dict):
-                                                    st.markdown(f"- `{_human_condition(c)}`")
-
-                                        if not clauses:
-                                            st.markdown("**Triggers**")
-                                            st.caption("No trigger clauses: once regime is true, buys follow schedule.")
-                                        else:
-                                            st.markdown("**Triggers (any one group can fire)**")
-                                            for i, cl in enumerate(clauses, 1):
-                                                st.markdown(f"*Group {i}*")
-                                                if not cl:
-                                                    st.markdown("- `(always)`")
-                                                else:
-                                                    for c in cl:
-                                                        if isinstance(c, dict):
-                                                            st.markdown(f"- `{_human_condition(c)}`")
-
-                                        if st.checkbox("Show raw entry_logic fields", value=False, key=f"wf_raw_logic_{cid_sel}"):
-                                            st.code(json.dumps(entry_logic, indent=2, ensure_ascii=False), language="json")
+                            with c2:
+                                st.markdown("**Behavior (what it tends to do)**")
+                                tL, tR = st.columns(2, gap="small")
+                                with tL:
+                                    left = [
+                                        ("Trade frequency", f"{trades_per_month:.2f}/mo" if math.isfinite(float(trades_per_month)) else "—", float(activity_score)),
+                                        ("Median hold", f"{med_hold_days:.2f} days" if math.isfinite(float(med_hold_days)) else "—", float(patience_score)),
+                                        ("Adds per entry", f"{adds_per_entry:.2f}" if math.isfinite(float(adds_per_entry)) else "—", float(dca_score)),
+                                    ]
+                                    st.markdown(_ff_readouts_html(left), unsafe_allow_html=True)
+                                with tR:
+                                    right = [
+                                        ("Drawdown", _fmt_pct(batch_dd) if math.isfinite(float(batch_dd)) else "—", float(toughness_score)),
+                                        ("RS stability (p10)", _fmt_pct(rs_p10) if math.isfinite(float(rs_p10)) else "—", float(consistency_score)),
+                                        ("WF stability (p10)", _fmt_pct(wf_p10) if math.isfinite(float(wf_p10)) else "—", float(general_score)),
+                                    ]
+                                    st.markdown(_ff_readouts_html(right), unsafe_allow_html=True)
 
                                 # Raw config mapping (power users)
                                 if st.checkbox("Show raw fields used", value=False, key=f"wf_raw_fields_{cid_sel}"):
@@ -16445,36 +17257,21 @@ if stage_pick == "grand":
                                         "reserve_frac_of_proceeds": float(reserve_frac_of_proceeds or 0.0),
                                     }
                                     st.code(json.dumps(raw, indent=2, ensure_ascii=False), language="json")
-                            with c2:
-                                st.markdown("**Behavior (what it tends to do)**")
-                                tL, tR = st.columns(2, gap="small")
-                                with tL:
-                                    left = [
-                                        ("Trade frequency", f"{trades_per_month:.2f}/mo" if math.isfinite(float(trades_per_month)) else "—", float(activity_score)),
-                                        ("Median hold", f"{med_hold_days:.2f} days" if math.isfinite(float(med_hold_days)) else "—", float(patience_score)),
-                                        ("Adds per entry", f"{adds_per_entry:.2f}" if math.isfinite(float(adds_per_entry)) else "—", float(dca_score)),
-                                    ]
-                                    st.markdown(_ff_readouts_html(left), unsafe_allow_html=True)
-                                with tR:
-                                    right = [
-                                        ("Drawdown", _fmt_pct(batch_dd) if math.isfinite(float(batch_dd)) else "—", float(toughness_score)),
-                                        ("RS stability (p10)", _fmt_pct(rs_p10) if math.isfinite(float(rs_p10)) else "—", float(consistency_score)),
-                                        ("WF stability (p10)", _fmt_pct(wf_p10) if math.isfinite(float(wf_p10)) else "—", float(general_score)),
-                                    ]
-                                    st.markdown(_ff_readouts_html(right), unsafe_allow_html=True)
+
 
                             with c3:
                                 st.markdown("**Outcomes (in this run)**")
                                 st.markdown(
                                     _ff_grid2_html([
                                         ("Stability score", f"{int(round(score_pct * 100))}th pct" if (score_pct is not None and math.isfinite(float(score_pct))) else "—"),
-                                        ("Max drawdown", _fmt_pct(batch_dd)),
                                         ("Batch return", _fmt_pct(batch_ret)),
+                                        ("Max drawdown", _fmt_pct(batch_dd)),
                                         ("Trades", f"{trade_count}"),
+                                        ("Win rate", wr_txt),
+                                        ("Profit factor", pf_txt),
                                     ]),
                                     unsafe_allow_html=True,
                                 )
-
                                 with st.expander("Stress test summary", expanded=False):
                                     if math.isfinite(float(rs_p10)):
                                         fr = "—" if rs_fail is None else f"{rs_fail * 100:.0f}%"
@@ -16490,20 +17287,199 @@ if stage_pick == "grand":
                                     else:
                                         st.caption("WF: missing")
 
+
+                                # Gate logic is shown below as a full-width section (under the Build sheet stats).
+
+
+                                # (We avoid rendering it cramped in the Outcomes column.)
+
+
+
+                                # Constraint highlight
+                                st.markdown(_ff_callout_html("Constraint hit", str(top_reason)), unsafe_allow_html=True)
+
                                 # Trade outcome stats (compact)
                                 wr_txt = f"{win_rate * 100:.0f}%" if math.isfinite(float(win_rate)) else "—"
                                 pf_txt = (f"{pf:.2f}" if (pf is not None and math.isfinite(float(pf)) and pf != float('inf')) else ("∞" if pf == float('inf') else "—"))
                                 hold_txt = f"{med_hold_days:.2f} d" if math.isfinite(float(med_hold_days)) else "—"
-                                st.caption(f"Outcomes: win {wr_txt} · PF {pf_txt} · median hold {hold_txt}")
-                            # Constraint highlight
-                            st.markdown(_ff_callout_html("Constraint hit", str(top_reason)), unsafe_allow_html=True)
                     
-                            with st.expander("Show full configuration", expanded=False):
-                                st.json(params if isinstance(params, dict) else cfg_obj)
+                            # Gate logic section (full width)
+                            with st.expander("Gate logic", expanded=False):
                     
-                            
-                    st.divider()
+                                _gate_tabs = ["Gate logic"]
+                    
+                                if debug_ui:
+                    
+                                    _gate_tabs.append("Full configuration")
+                    
+                                _gate_tab_objs = st.tabs(_gate_tabs)
 
+                    
+                                with _gate_tab_objs[0]:
+                    
+                                    # Visual + Explainer layout (matches the baseline builder page)
+                    
+                                    try:
+                    
+                                        _show_logic = bool(entry_logic) and (int(n_regime) > 0 or int(n_clauses) > 0)
+                    
+                                    except Exception:
+                    
+                                        _show_logic = bool(entry_logic)
+
+                    
+                                    if not _show_logic:
+                    
+                                        st.caption("No gate logic configured for this strategy.")
+                    
+                                    else:
+                    
+                                        _df_feat_local = None
+
+                    
+                                        # Prefer the exact run tape (df_feat.parquet) so we can show live gate status + frequency snapshots,
+                    
+                                        # even when the user hasn't loaded a dataset in the builder UI.
+                    
+                                        feat_path = None
+                    
+                                        try:
+                    
+                                            feat_path = run_dir / "df_feat.parquet"  # type: ignore[name-defined]
+                    
+                                        except Exception:
+                    
+                                            feat_path = None
+
+                    
+                                        if feat_path is not None and hasattr(feat_path, "exists") and feat_path.exists():
+                    
+                                            # Load only columns used by the gate (plus dt/close), so this stays cheap.
+                    
+                                            need_cols = set(["dt", "close"])
+                    
+                                            try:
+                    
+                                                for c in (entry_logic.get("regime") or []):
+                    
+                                                    if isinstance(c, dict):
+                    
+                                                        for k in ("indicator", "feature", "lhs", "ref_indicator", "rhs", "rhs_indicator"):
+                    
+                                                            v = c.get(k)
+                    
+                                                            if isinstance(v, str) and v.strip():
+                    
+                                                                need_cols.add(v.strip())
+                    
+                                                for cl in (entry_logic.get("clauses") or []):
+                    
+                                                    for c in (cl or []):
+                    
+                                                        if isinstance(c, dict):
+                    
+                                                            for k in ("indicator", "feature", "lhs", "ref_indicator", "rhs", "rhs_indicator"):
+                    
+                                                                v = c.get(k)
+                    
+                                                                if isinstance(v, str) and v.strip():
+                    
+                                                                    need_cols.add(v.strip())
+                    
+                                            except Exception:
+                    
+                                                pass
+
+                    
+                                            cols = sorted(need_cols)
+                    
+                                            try:
+                    
+                                                _df_feat_local = pd.read_parquet(feat_path, columns=cols)
+                    
+                                            except Exception:
+                    
+                                                try:
+                    
+                                                    _df_feat_local = pd.read_parquet(feat_path)
+                    
+                                                except Exception:
+                    
+                                                    _df_feat_local = None
+                    
+                                        else:
+                    
+                                            # Fallback: if a df_feat is already in memory (some sections load it), reuse it.
+                    
+                                            try:
+                    
+                                                _df_feat_local = df_feat  # type: ignore[name-defined]
+                    
+                                            except Exception:
+                    
+                                                _df_feat_local = None
+
+                    
+                                        snap = {}
+                    
+                                        try:
+                    
+                                            # Match the baseline builder's behavior: snapshots are computed on the train slice (default 70%),
+                    
+                                            # and are frequency-only (not performance).
+                    
+                                            snap = _entry_logic_snapshot(_df_feat_local, entry_logic or {}, train_frac=0.70, snap_window_pct=0.02, snap_min_bars=1, snap_max_bars=200, snap_max_dots=120)
+                    
+                                        except Exception:
+                    
+                                            snap = {"ok": False}
+
+                    
+                                        # Stacked layout: flowchart on top, explainer underneath
+                                        st.markdown("##### Gate logic (visual)")
+                                        st.markdown(_gate_logic_tree_html(entry_logic or {}, snap), unsafe_allow_html=True)
+                                    
+                                        st.markdown("##### Explainer")
+                                        explain_mode = st.selectbox(
+                                            "Explain mode",
+                                            ["Basic", "Beginner", "Deep"],
+                                            index=1,
+                                            key=f"bs_gate_explain_mode_{cid_sel}",
+                                        )
+                                        try:
+                                            _render_gate_plain_english_report(
+                                                df_feat=_df_feat_local,
+                                                entry_logic=entry_logic or {},
+                                                snap=snap,
+                                                deposit_freq=str(deposit_freq),
+                                                deposit_amt=float(deposit_amt),
+                                                buy_mode=str(buy_mode),
+                                                buy_freq=str(buy_freq),
+                                                buy_amt=float(buy_amt),
+                                                max_buys_per_gate=int(max_buys_per_gate),
+                                                max_alloc_pct=float(max_alloc_pct),
+                                                sl_ui=float(sl_pct),
+                                                tp_ui=float(tp_pct),
+                                                tp_sell_frac=float(tp_sell_fraction),
+                                                reserve_frac=float(reserve_frac_of_proceeds or 0.0),
+                                                trail_ui=float(trail_pct),
+                                                max_hold=int(max_hold_bars),
+                                                explain_mode=str(explain_mode),
+                                            )
+                                        except Exception as e:
+                                            st.warning(f"Explainer unavailable: {e}")
+                                    
+                                        if debug_ui and st.checkbox("Show raw entry_logic fields", value=False, key=f"wf_raw_logic_{cid_sel}"):
+                                            st.code(json.dumps(entry_logic, indent=2, ensure_ascii=False), language="json")
+
+                    
+                                if debug_ui and len(_gate_tab_objs) > 1:
+                    
+                                    with _gate_tab_objs[1]:
+                    
+                                        st.json(params if isinstance(params, dict) else cfg_obj)
+
+                    st.divider()
                     _tabs_base = ['Batch scan', 'Start-date test', 'Time-split test', 'Receipts', 'Exports']
                     _tab_containers = st.tabs(_tabs_base)
                     _tabs = list(_tabs_base)
