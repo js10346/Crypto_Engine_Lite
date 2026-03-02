@@ -9280,7 +9280,8 @@ with st.sidebar:
         # Switch to new run (must happen before the 'Open existing run' selectbox is created).
         st.session_state["ui.open_run_force_new"] = True
         st.session_state["ui.section"] = "1) Build & Run"
-        st.session_state["new.step"] = 1
+        st.session_state["new.step"] = 0
+        st.toast("Carried strategy loaded. Confirm dataset/window then Next →")
 
         # Dataset defaults
         try:
@@ -9354,7 +9355,8 @@ with st.sidebar:
 
 
     force_new = bool(st.session_state.pop("ui.open_run_force_new", False))
-
+    if force_new:
+        st.session_state["ui.open_run"] = "(new run)"
 
     _open_idx = 0 if force_new else (1 + run_names.index(st.session_state["selected_run"]) if st.session_state["selected_run"] in run_names else 0)
 
@@ -9409,9 +9411,10 @@ with st.sidebar:
         with b1:
             if st.button("Open Strategy Builder", key="sidebar.open_builder", use_container_width=True):
                 st.session_state["ui.open_run_force_new"] = True
-                st.session_state["ui.section_next"] = "1) Build & Run"
-                st.session_state["new.step"] = 1
+                st.session_state["ui.section"] = "1) Build & Run"
+                st.session_state["new.step"] = 0
                 st.session_state["builder.pending_apply"] = True
+                st.session_state["ui.post_toast"] = "Carried strategy loaded. Confirm dataset/window then Next →"
                 st.rerun()
         with b2:
             if st.button("Clear", key="sidebar.clear_baseline", use_container_width=True):
@@ -9578,6 +9581,31 @@ with st.sidebar:
 # =============================================================================
 
 if open_existing == "(new run)":
+    # ...existing code...
+    do_run = st.session_state.get("do_run", False)
+    if do_run:
+        try:
+            # ...existing run pipeline...
+            st.session_state["new.step"] = 0
+
+            # ...existing reroute/rerun...
+        except Exception as e:
+            st.error(str(e))
+            st.stop()
+    # ...existing code...
+    # This section is only the "Build & Run" half of the MVP UI.
+    if str(st.session_state.get("ui.section", "1) Build & Run")).startswith("2)"):
+        st.info("Results require an existing run. Switch to **Build & Run** to create one.")
+        st.stop()
+    # ...existing code...
+    if do_run:
+        pass
+
+    # after success/reset:
+    if "new.step" not in st.session_state:
+        st.session_state["new.step"] = 0
+
+    # ...existing code...
     # This section is only the "Build & Run" half of the MVP UI.
     if str(st.session_state.get("ui.section", "1) Build & Run")).startswith("2)"):
         st.info("Results require an existing run. Switch to **Build & Run** to create one.")
@@ -9585,6 +9613,7 @@ if open_existing == "(new run)":
     st.subheader("Create a new run")
 
     # Step state
+    # (redundant check below but safe)
     if "new.step" not in st.session_state:
         st.session_state["new.step"] = 0  # 0=data,1=plan,2=grid,3=batch
 
@@ -9986,6 +10015,8 @@ if open_existing == "(new run)":
 
         colL, colR = st.columns(2)
         with colL:
+            pass
+        with colR:
             if st.button("Next →", type="primary", disabled=("new.data_path" not in st.session_state)):
                 st.session_state["new.step"] = 1
                 st.rerun()
@@ -10017,7 +10048,7 @@ if open_existing == "(new run)":
                 st.session_state["builder.pending_apply"] = False
                 st.session_state["builder.last_apply_msg"] = msg
                 if ok:
-                    st.info("Baseline loaded from Results. You can tweak it here before running tests.")
+                    st.info("Carried strategy loaded and ready to tweak.")
                 else:
                     st.warning(f"Could not fully apply baseline: {msg}")
             else:
@@ -10037,14 +10068,10 @@ if open_existing == "(new run)":
                 st.session_state["new.step"] = 0
                 st.rerun()
         with colR:
-            if st.button("Next →", type="primary"):
+            if st.button("Next: Variations →", type="primary"):
                 st.session_state["new.step"] = 2
                 st.rerun()
 
-    # -------------------------------------------------------------------------
-    # Step 2: Variations (grid)
-    # -------------------------------------------------------------------------
-    
     # -------------------------------------------------------------------------
     # Step 2: Variations (grid)
     # -------------------------------------------------------------------------
@@ -16732,7 +16759,7 @@ if stage_pick == "grand":
                             }
 
 
-                            st.session_state["ui.post_toast"] = "Baseline loaded. Change dataset in the sidebar (optional), tweak, then run tests."
+                            st.session_state["ui.post_toast"] = "Carried strategy loaded. Confirm dataset/window then Next →"
 
                             st.rerun()
 
