@@ -1494,148 +1494,110 @@ def _apply_builder_entry_logic_to_ui(ss: dict, entry_logic: dict):
     ss["new.logic.clause_ids"] = clause_ids
 
 def _apply_dca_plan_blueprint(bp: Dict[str, Any]) -> Tuple[bool, str]:
-    """Best-effort: apply a pasted plan blueprint into Streamlit session state.
+    """Best-effort: apply a plan blueprint (nested or flat) into Streamlit session state.
 
-    This intentionally prioritizes *mechanics* fields and ignores unknown keys.
+    This handles both the flat "blueprint" format (from copy/paste) and the nested
+    "normalized" format found in resolved run configs.
     """
     if not isinstance(bp, dict):
-        return False, "Blueprint must be a JSON object (top-level dictionary)."
+        return False, "Blueprint must be a JSON object (dictionary)."
+
+    ss = st.session_state
+    # Nested lookups: prefer 'params' sub-dict if it exists (common in run configs).
+    inner = bp.get("params", {}) if isinstance(bp.get("params"), dict) else {}
 
     def _pick(*keys, default=None):
         for k in keys:
+            if k in inner:
+                return inner[k]
             if k in bp:
                 return bp[k]
         return default
 
-    # Cadence / cash-in
-    dep_freq = str(_pick("deposit_freq", "deposit_frequency", default="weekly") or "weekly").lower()
-    buy_freq = str(_pick("buy_freq", "buy_frequency", default="weekly") or "weekly").lower()
-    dep_freq = dep_freq if dep_freq in {"none", "daily", "weekly", "monthly"} else "weekly"
-    buy_freq = buy_freq if buy_freq in {"none", "daily", "weekly", "monthly"} else "weekly"
+    def _to_float(x, default=0.0):
+        try:
+            return float(x) if x is not None else float(default)
+        except Exception:
+            return float(default)
 
-    st.session_state["new.deposit_freq"] = dep_freq
-    st.session_state["new.buy_freq"] = buy_freq
+    def _to_int(x, default=0):
+        try:
+            return int(float(x)) if x is not None else int(default)
+        except Exception:
+            return int(default)
 
-    # Buy mode (scheduled vs signal-driven)
-    bm = str(_pick("buy_mode", "buy_trigger_mode", default="scheduled") or "scheduled").strip().lower()
-    if bm not in {"scheduled", "signal"}:
-        bm = "scheduled"
-    st.session_state["new.buy_mode"] = bm
-    try:
-        st.session_state["new.max_buys_per_gate"] = int(float(_pick("max_buys_per_gate", default=0) or 0))
-    except Exception:
-        st.session_state["new.max_buys_per_gate"] = 0
+    # 1. Cadence / Funding
+    dep_freq = str(_pick("deposit_freq", "deposit_frequency", default="weekly") or "weekly").lower().strip()
+    buy_freq = str(_pick("buy_freq", "buy_frequency", default="weekly") or "weekly").lower().strip()
+    ss["new.deposit_freq"] = dep_freq if dep_freq in {"none", "daily", "weekly", "monthly"} else "weekly"
+    ss["new.buy_freq"] = buy_freq if buy_freq in {"none", "daily", "weekly", "monthly"} else "weekly"
+    ss["new.deposit_amount"] = _to_float(_pick("deposit_amount_usd", "deposit_amount"), 50.0)
+    ss["new.buy_amount"] = _to_float(_pick("buy_amount_usd", "buy_amount"), 50.0)
 
+    # 2. Buy Mode
+    bm = str(_pick("buy_mode", "buy_trigger_mode", default="scheduled") or "scheduled").lower().strip()
+    ss["new.buy_mode"] = bm if bm in {"scheduled", "signal"} else "scheduled"
+    ss["new.max_buys_per_gate"] = _to_int(_pick("max_buys_per_gate"), 0)
 
-    try:
-        # Normalize legacy / friendly inputs (keep imports resilient).
-        if isinstance(bp, dict):
-            bf = bp.get("buy_filter")
-            if isinstance(bf, str):
-                _bf_label_to_key = {
-                    "Always buy (no filter)": "none",
-                    "Buy dips below EMA": "below_ema",
-                    "RSI oversold": "rsi_oversold",
-                    "Momentum (MACD bullish)": "macd_bullish",
-                    "Bollinger z low": "bb_z_low",
-                    "Trend strength (ADX)": "adx_trend",
-                    "Donchian pullback": "donch_pullback",
-                }
-                if bf in _bf_label_to_key:
-                    bp = dict(bp)
-                    bp["buy_filter"] = _bf_label_to_key[bf]
+    # 3. Entry Gate Mode & Logic
+    em = str(_pick("entry_mode", default="simple") or "simple").lower().strip()
+    entry_logic = _pick("entry_logic")
+    
+    # Auto-detect builder mode if complex logic is provided even if entry_mode says simple
+    has_complex_logic = isinstance(entry_logic, dict) and (entry_logic.get("regime") or entry_logic.get("clauses"))
+    wants_builder = em.startswith("b") or ("builder" in em) or ("logic" in em) or has_complex_logic
 
-            em = bp.get("entry_mode")
-            if isinstance(em, str):
-                _em_norm = {
-                    "logic_builder": "builder",
-                    "logic": "builder",
-                    "builder": "builder",
-                    "simple": "simple",
-                }.get(em.strip().lower(), em)
-                if _em_norm != em:
-                    bp = dict(bp)
-                    bp["entry_mode"] = _em_norm
-
-        st.session_state["new.deposit_amount"] = float(_pick("deposit_amount_usd", "deposit_amount", default=50.0) or 0.0)
-    except Exception:
-        pass
-    try:
-        st.session_state["new.buy_amount"] = float(_pick("buy_amount_usd", "buy_amount", default=50.0) or 0.0)
-    except Exception:
-        pass
-
-    # Entry mode
-    em = str(_pick("entry_mode", default="simple") or "simple").lower()
-    wants_builder = em.startswith("b") or ("builder" in em) or ("logic" in em)
-
-    entry_logic = _pick("entry_logic", default=None)
-    if wants_builder and isinstance(entry_logic, dict) and (entry_logic.get("regime") or entry_logic.get("clauses")):
-        st.session_state["new.entry_mode"] = "Logic builder (regime + triggers)"
-        st.session_state["new.blueprint_entry_logic"] = entry_logic
+    if wants_builder and has_complex_logic:
+        ss["new.entry_mode"] = "Logic builder (regime + triggers)"
+        ss["new.blueprint_entry_logic"] = entry_logic
+        try:
+            _apply_builder_entry_logic_to_ui(ss, entry_logic)
+        except Exception as e:
+            st.warning(f"Error applying builder logic: {e}")
     else:
-        st.session_state["new.entry_mode"] = "Simple (one filter)"
-        st.session_state["new.blueprint_entry_logic"] = None
+        ss["new.entry_mode"] = "Simple (one filter)"
+        ss["new.blueprint_entry_logic"] = None
+        try:
+            _clear_builder_gate_ui_state(ss)
+        except Exception:
+            pass
 
-    # Simple filter (TradingView-style)
-    bf = _pick("buy_filter", default=None)
-    if isinstance(bf, str) and bf.strip():
-        st.session_state["new.buy_filter"] = bf.strip()
+    # 5. Simple Filter
+    bf = str(_pick("buy_filter", default="none") or "none").strip()
+    # Normalize human labels to keys if needed
+    _bf_map = {
+        "Always buy (no filter)": "none",
+        "Buy dips below EMA": "below_ema",
+        "RSI oversold": "rsi_oversold", "rsi_below": "rsi_below",
+        "Momentum (MACD bullish)": "macd_bullish", "macd_bull": "macd_bull",
+        "Bollinger z low": "bb_z_low", "bb_z_below": "bb_z_below",
+        "Trend strength (ADX)": "adx_trend", "adx_above": "adx_above",
+        "Donchian pullback": "donch_pullback", "donch_pos_below": "donch_pos_below",
+    }
+    ss["new.buy_filter"] = _bf_map.get(bf, bf)
 
-    # Filter knobs
-    for k_src, k_state in [
-        ("ema_len", "new.ema_len"),
-        ("rsi_thr", "new.rsi_thr"),
-        ("macd_hist_thr", "new.macd_hist_thr"),
-        ("bb_z_thr", "new.bb_z_thr"),
-        ("adx_thr", "new.adx_thr"),
-        ("donch_pos_thr", "new.donch_pos_thr"),
-    ]:
-        if k_src in bp:
-            try:
-                st.session_state[k_state] = float(bp[k_src]) if k_src != "ema_len" else int(bp[k_src])
-            except Exception:
-                pass
+    # 6. Filter Knobs
+    ss["new.ema_len"] = _to_int(_pick("ema_len"), 200)
+    ss["new.rsi_thr"] = _to_float(_pick("rsi_thr"), 30.0)
+    ss["new.macd_hist_thr"] = _to_float(_pick("macd_hist_thr"), 0.0)
+    ss["new.bb_z_thr"] = _to_float(_pick("bb_z_thr"), -1.0)
+    ss["new.adx_thr"] = _to_float(_pick("adx_thr"), 20.0)
+    ss["new.donch_pos_thr"] = _to_float(_pick("donch_pos_thr"), 0.2)
 
-    # Allocation + exits
-    try:
-        st.session_state["new.max_alloc_pct"] = float(_pick("max_alloc_pct", default=1.0) or 1.0)
-    except Exception:
-        pass
+    # 7. Allocation & Reserves
+    ss["new.max_alloc_pct"] = _to_float(_pick("max_alloc_pct"), 1.0)
+    ss["new.reserve_frac"] = _to_float(_pick("reserve_frac_of_proceeds", "reserve_frac"), 0.0)
+    ss["new.tp_sell_frac"] = _to_float(_pick("tp_sell_fraction", "tp_sell_frac"), 1.0)
 
-    # Optional cash reserve + partial TP selling (if exposed/used)
-    try:
-        _rf = _pick("reserve_frac_of_proceeds", "reserve_frac", default=None)
-        if _rf is not None:
-            st.session_state["new.reserve_frac"] = max(0.0, min(1.0, float(_rf)))
-    except Exception:
-        pass
-    try:
-        _tsf = _pick("tp_sell_fraction", "take_profit_sell_fraction", default=None)
-        if _tsf is not None:
-            st.session_state["new.tp_sell_frac"] = max(0.0, min(1.0, float(_tsf)))
-    except Exception:
-        pass
-
-
-    try:
-        st.session_state["new.sl_pct_ui"] = float(_pick("stop_loss_pct", "sl_pct", default=0.0) or 0.0)
-    except Exception:
-        pass
-    try:
-        st.session_state["new.tp_pct_ui"] = float(_pick("take_profit_pct", "tp_pct", default=0.0) or 0.0)
-    except Exception:
-        pass
-    try:
-        st.session_state["new.max_hold_bars"] = int(_pick("time_stop_bars", "max_hold_bars", default=0) or 0)
-    except Exception:
-        pass
-    try:
-        st.session_state["new.trail_pct_ui"] = float(_pick("trailing_stop_pct", "trail_pct", default=0.0) or 0.0)
-    except Exception:
-        pass
+    # 8. Exits (UI space)
+    ss["new.sl_pct_ui"] = _to_float(_pick("stop_loss_pct", "sl_pct"), 0.0)
+    ss["new.tp_pct_ui"] = _to_float(_pick("take_profit_pct", "tp_pct"), 0.0)
+    ss["new.max_hold_bars"] = _to_int(_pick("time_stop_bars", "max_hold_bars"), 0)
+    ss["new.trail_pct_ui"] = _to_float(_pick("trailing_stop_pct", "trail_pct"), 0.0)
 
     return True, "Blueprint applied."
+
+
 
 def _blueprint_spec_text() -> str:
     """Human-readable spec for the portable plan blueprint (v1).
@@ -1836,72 +1798,6 @@ def _collect_dca_plan_state():
     return bp
 
 
-def _apply_dca_plan_blueprint(bp: dict) -> None:
-    """Apply a plan blueprint into Streamlit session state (mechanics-only)."""
-    if not isinstance(bp, dict):
-        return
-
-    ss = st.session_state
-
-    def _to_float(x, default=0.0):
-        try:
-            if x is None:
-                return float(default)
-            return float(x)
-        except Exception:
-            return float(default)
-
-    def _to_int(x, default=0):
-        try:
-            if x is None:
-                return int(default)
-            return int(float(x))
-        except Exception:
-            return int(default)
-
-    # Core
-    ss["new.deposit_freq"] = bp.get("deposit_freq", ss.get("new.deposit_freq", "weekly"))
-    ss["new.deposit_amount"] = _to_float(bp.get("deposit_amount_usd", ss.get("new.deposit_amount", 50.0)), ss.get("new.deposit_amount", 50.0))
-    ss["new.buy_freq"] = bp.get("buy_freq", ss.get("new.buy_freq", "weekly"))
-    ss["new.buy_amount"] = _to_float(bp.get("buy_amount_usd", ss.get("new.buy_amount", 50.0)), ss.get("new.buy_amount", 50.0))
-    ss["new.buy_mode"] = str(bp.get("buy_mode", ss.get("new.buy_mode", "scheduled")) or "scheduled").lower().strip()
-    ss["new.max_buys_per_gate"] = _to_int(bp.get("max_buys_per_gate", ss.get("new.max_buys_per_gate", 0)), ss.get("new.max_buys_per_gate", 0))
-
-    # Entry mode: store the UI label (the radio uses labels)
-    entry_mode = str(bp.get("entry_mode", "simple")).lower().strip()
-    ss["new.entry_mode"] = "Logic builder (regime + triggers)" if entry_mode == "builder" else "Simple (one filter)"
-
-    # Simple filter id (stored directly)
-    ss["new.buy_filter"] = bp.get("buy_filter", ss.get("new.buy_filter", "none"))
-
-    # Shared thresholds
-    ss["new.ema_len"] = _to_int(bp.get("ema_len", ss.get("new.ema_len", 200)), ss.get("new.ema_len", 200))
-    ss["new.rsi_thr"] = _to_float(bp.get("rsi_thr", ss.get("new.rsi_thr", 30.0)), ss.get("new.rsi_thr", 30.0))
-    ss["new.macd_hist_thr"] = _to_float(bp.get("macd_hist_thr", ss.get("new.macd_hist_thr", 0.0)), ss.get("new.macd_hist_thr", 0.0))
-    ss["new.bb_z_thr"] = _to_float(bp.get("bb_z_thr", ss.get("new.bb_z_thr", -1.0)), ss.get("new.bb_z_thr", -1.0))
-    ss["new.adx_thr"] = _to_float(bp.get("adx_thr", ss.get("new.adx_thr", 20.0)), ss.get("new.adx_thr", 20.0))
-    ss["new.donch_pos_thr"] = _to_float(bp.get("donch_pos_thr", ss.get("new.donch_pos_thr", 0.2)), ss.get("new.donch_pos_thr", 0.2))
-
-    # Allocation / misc
-    ss["new.max_alloc_pct"] = _to_float(bp.get("max_alloc_pct", ss.get("new.max_alloc_pct", 1.0)), ss.get("new.max_alloc_pct", 1.0))
-    ss["new.reserve_frac"] = _to_float(bp.get("reserve_frac_of_proceeds", bp.get("reserve_frac", ss.get("new.reserve_frac", 0.0))), ss.get("new.reserve_frac", 0.0))
-    ss["new.tp_sell_frac"] = _to_float(bp.get("tp_sell_fraction", ss.get("new.tp_sell_frac", 1.0)), ss.get("new.tp_sell_frac", 1.0))
-
-    # Exits (UI space)
-    ss["new.sl_pct_ui"] = _to_float(bp.get("stop_loss_pct", ss.get("new.sl_pct_ui", 0.0)), ss.get("new.sl_pct_ui", 0.0))
-    ss["new.tp_pct_ui"] = _to_float(bp.get("take_profit_pct", ss.get("new.tp_pct_ui", 0.0)), ss.get("new.tp_pct_ui", 0.0))
-    ss["new.max_hold_bars"] = _to_int(bp.get("time_stop_bars", ss.get("new.max_hold_bars", 0)), ss.get("new.max_hold_bars", 0))
-    ss["new.trail_pct_ui"] = _to_float(bp.get("trailing_stop_pct", ss.get("new.trail_pct_ui", 0.0)), ss.get("new.trail_pct_ui", 0.0))
-    # Builder logic: reflect into the Logic Builder UI widget keys (so checklist + preview match)
-    entry_logic = bp.get("entry_logic") or {"regime": [], "clauses": []}
-    ss["new.blueprint_entry_logic"] = entry_logic
-    try:
-        if entry_mode == "builder":
-            _apply_builder_entry_logic_to_ui(ss, entry_logic)
-        else:
-            _clear_builder_gate_ui_state(ss)
-    except Exception:
-        pass
 def _render_plan_blueprint_import_ui() -> None:
     with st.expander("Plan blueprint (copy/paste)", expanded=False):
         st.caption("Portable JSON you can copy, edit, and paste back in. Mechanics-only (not recommendations).")
@@ -7406,6 +7302,37 @@ def _render_skill_build_header(slot, *, df_feat: Optional[pd.DataFrame]) -> None
 def build_dca_baseline_params() -> Dict[str, Any]:
     st.subheader("Baseline Plan")
 
+    # Ensure session state is initialized with defaults to avoid "index/value + key" conflict.
+    # This is critical when Strategy Builder is loaded via "Use as baseline".
+    _defaults = {
+        "new.deposit_freq": "weekly",
+        "new.deposit_amount": 50.0,
+        "new.buy_mode": "scheduled",
+        "new.buy_freq": "weekly",
+        "new.buy_amount": 50.0,
+        "new.max_buys_per_gate": 0,
+        "new.entry_mode": "Simple (one filter)",
+        "new.buy_filter": "none",
+        "new.ema_len": 200,
+        "new.rsi_thr": 40.0,
+        "new.bb_z_thr": -1.0,
+        "new.macd_hist_thr": 0.0,
+        "new.adx_thr": 20.0,
+        "new.donch_pos_thr": 0.20,
+        "new.max_alloc_pct": 1.0,
+        "new.sl_pct_ui": 0.0,
+        "new.tp_pct_ui": 0.0,
+        "new.tp_sell_frac": 1.0,
+        "new.reserve_frac": 0.0,
+        "new.max_hold_bars": 0,
+        "new.trail_pct_ui": 0.0,
+        "new.gate_snap_pct": 2.0,
+        "new.gate_snap_max_bars": 200,
+    }
+    for k, v in _defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
     # Render a "build card" header placeholder (filled after controls are read).
     header_slot = st.empty()
 
@@ -7535,13 +7462,11 @@ def build_dca_baseline_params() -> Dict[str, Any]:
                 deposit_freq = st.selectbox(
                     "Deposit frequency",
                     options=["none", "daily", "weekly", "monthly"],
-                    index=2,
                     key="new.deposit_freq",
                 )
                 deposit_amount = st.number_input(
                     "Deposit amount (USD)",
                     min_value=0.0,
-                    value=50.0,
                     step=10.0,
                     key="new.deposit_amount",
                 )
@@ -7587,13 +7512,11 @@ def build_dca_baseline_params() -> Dict[str, Any]:
                 buy_freq = st.selectbox(
                     freq_label,
                     options=["daily", "weekly", "monthly"],
-                    index=1,
                     key="new.buy_freq",
                 )
                 buy_amount = st.number_input(
                     "Buy amount (USD)",
                     min_value=0.0,
-                    value=50.0,
                     step=10.0,
                     key="new.buy_amount",
                 )
@@ -7602,7 +7525,6 @@ def build_dca_baseline_params() -> Dict[str, Any]:
                     st.number_input(
                         "Max buys per signal window (0 = unlimited)",
                         min_value=0,
-                        value=int(st.session_state.get("new.max_buys_per_gate", 0) or 0),
                         step=1,
                         key="new.max_buys_per_gate",
                     )
@@ -7643,7 +7565,6 @@ def build_dca_baseline_params() -> Dict[str, Any]:
                 entry_mode = st.radio(
                     "Entry logic mode",
                     options=["Simple (one filter)", "Logic builder (regime + triggers)"],
-                    index=0,
                     horizontal=True,
                     key="new.entry_mode",
                 )
@@ -7739,24 +7660,23 @@ def build_dca_baseline_params() -> Dict[str, Any]:
                             "adx_above",
                             "donch_pos_below",
                         ],
-                        index=0,
                         key="new.buy_filter",
                         format_func=lambda v: FILTER_LABELS.get(v, v),
                     )
                     st.caption(FILTER_DESC.get(buy_filter, ""))
 
                     if buy_filter == "below_ema":
-                        ema_len = int(st.selectbox("EMA length", options=[10, 20, 50, 100, 200], index=4, key="new.ema_len"))
+                        ema_len = int(st.selectbox("EMA length", options=[10, 20, 50, 100, 200], key="new.ema_len"))
                     elif buy_filter == "rsi_below":
-                        rsi_thr = float(st.slider("RSI threshold (buy when RSI ≤ threshold)", 5.0, 80.0, 40.0, 1.0, key="new.rsi_thr"))
+                        rsi_thr = float(st.slider("RSI threshold (buy when RSI ≤ threshold)", 5.0, 80.0, step=1.0, key="new.rsi_thr"))
                     elif buy_filter == "bb_z_below":
-                        bb_z_thr = float(st.slider("Bollinger z-score threshold (buy when z ≤ threshold)", -3.0, 0.0, -1.0, 0.1, key="new.bb_z_thr"))
+                        bb_z_thr = float(st.slider("Bollinger z-score threshold (buy when z ≤ threshold)", -3.0, 0.0, step=0.1, key="new.bb_z_thr"))
                     elif buy_filter == "macd_bull":
-                        macd_hist_thr = float(st.number_input("MACD histogram threshold (hist ≥ threshold)", value=0.0, step=0.1, key="new.macd_hist_thr"))
+                        macd_hist_thr = float(st.number_input("MACD histogram threshold (hist ≥ threshold)", step=0.1, key="new.macd_hist_thr"))
                     elif buy_filter == "adx_above":
-                        adx_thr = float(st.slider("ADX threshold (buy when ADX ≥ threshold)", 5.0, 60.0, 20.0, 1.0, key="new.adx_thr"))
+                        adx_thr = float(st.slider("ADX threshold (buy when ADX ≥ threshold)", 5.0, 60.0, step=1.0, key="new.adx_thr"))
                     elif buy_filter == "donch_pos_below":
-                        donch_pos_thr = float(st.slider("Donchian position threshold (pos ≤ threshold)", 0.0, 1.0, 0.20, 0.05, key="new.donch_pos_thr"))
+                        donch_pos_thr = float(st.slider("Donchian position threshold (pos ≤ threshold)", 0.0, 1.0, step=0.05, key="new.donch_pos_thr"))
 
                     entry_logic = _simple_filter_to_entry_logic(
                         buy_filter,
@@ -7970,11 +7890,9 @@ def build_dca_baseline_params() -> Dict[str, Any]:
                         pass
                     
                     # Gate snapshot settings (window size for Early/Mid/Late dot bars)
-                    snap_pct_ui = float(st.session_state.get('new.gate_snap_pct', 2.0) or 2.0)
-                    snap_max_bars = int(st.session_state.get('new.gate_snap_max_bars', 200) or 200)
                     with st.expander('Gate snapshot settings', expanded=False):
-                        snap_pct_ui = float(st.slider('Snapshot window (% of train)', min_value=1.0, max_value=5.0, value=float(snap_pct_ui), step=0.5, key='new.gate_snap_pct'))
-                        snap_max_bars = int(st.slider('Max bars per snapshot window', min_value=30, max_value=500, value=int(snap_max_bars), step=10, key='new.gate_snap_max_bars'))
+                        snap_pct_ui = float(st.slider('Snapshot window (% of train)', min_value=1.0, max_value=5.0, step=0.5, key='new.gate_snap_pct'))
+                        snap_max_bars = int(st.slider('Max bars per snapshot window', min_value=30, max_value=500, step=10, key='new.gate_snap_max_bars'))
                     snap_max_bars = int(max(30, min(500, snap_max_bars)))
                     
                     try:
@@ -8281,7 +8199,6 @@ def build_dca_baseline_params() -> Dict[str, Any]:
                         "Max allocation (fraction of equity)",
                         min_value=0.05,
                         max_value=1.00,
-                        value=1.00,
                         step=0.05,
                         key="new.max_alloc_pct",
                     )
@@ -8314,22 +8231,22 @@ def build_dca_baseline_params() -> Dict[str, Any]:
                 exp_trail = (focus == "trailing")
 
                 with st.expander("Stop loss", expanded=exp_sl):
-                    sl_ui = float(st.slider("Stop loss (%) (0 disables)", 0.0, 95.0, 0.0, 0.25, key="new.sl_pct_ui"))
+                    sl_ui = float(st.slider("Stop loss (%) (0 disables)", 0.0, 95.0, step=0.25, key="new.sl_pct_ui"))
 
                 with st.expander("Take profit", expanded=exp_tp):
-                    tp_ui = float(st.slider("Take profit (%) (0 disables)", 0.0, 500.0, 0.0, 0.5, key="new.tp_pct_ui"))
+                    tp_ui = float(st.slider("Take profit (%) (0 disables)", 0.0, 500.0, step=0.5, key="new.tp_pct_ui"))
                     if tp_ui > 0:
-                        tp_sell_fraction = float(st.slider("On take profit: sell fraction of position", 0.0, 1.0, 1.0, 0.05, key="new.tp_sell_frac"))
-                        reserve_frac = float(st.slider("Reserve fraction of TP proceeds (keep as cash)", 0.0, 1.0, 0.0, 0.05, key="new.reserve_frac"))
+                        tp_sell_fraction = float(st.slider("On take profit: sell fraction of position", 0.0, 1.0, step=0.05, key="new.tp_sell_frac"))
+                        reserve_frac = float(st.slider("Reserve fraction of TP proceeds (keep as cash)", 0.0, 1.0, step=0.05, key="new.reserve_frac"))
                     else:
                         tp_sell_fraction = 1.0
                         reserve_frac = 0.0
 
                 with st.expander("Time stop", expanded=exp_time):
-                    max_hold_bars = int(st.number_input("Max holding period (bars) (0 disables)", min_value=0, value=0, step=5, key="new.max_hold_bars"))
+                    max_hold_bars = int(st.number_input("Max holding period (bars) (0 disables)", min_value=0, step=5, key="new.max_hold_bars"))
 
                 with st.expander("Trailing stop", expanded=exp_trail):
-                    trail_ui = float(st.slider("Trailing stop (%) from peak (0 disables)", 0.0, 95.0, 0.0, 0.25, key="new.trail_pct_ui"))
+                    trail_ui = float(st.slider("Trailing stop (%) from peak (0 disables)", 0.0, 95.0, step=0.25, key="new.trail_pct_ui"))
 
                 # Scale captions (if ATR exists)
                 try:
@@ -9267,7 +9184,9 @@ with st.sidebar:
             if run_is_complete.get(nm):
                 picked = nm
                 break
-        st.session_state["selected_run"] = picked or (run_names[0] if run_names else "")
+        _init_val = picked or (run_names[0] if run_names else "")
+        st.session_state["selected_run"] = _init_val
+        st.session_state["selected_run_prev"] = _init_val
 
     # Programmatic selection handoff (must happen BEFORE the widget is created)
     nxt = st.session_state.pop("ui.open_run_next", None)
@@ -9352,37 +9271,36 @@ with st.sidebar:
             st.session_state.pop("sidebar.data_range_dates", None)
 
     # Allow one-shot programmatic jump to '(new run)' without mutating widget key mid-run.
-
-
     force_new = bool(st.session_state.pop("ui.open_run_force_new", False))
     if force_new:
         st.session_state["ui.open_run"] = "(new run)"
+    else:
+        # Sync from external changes to selected_run (e.g. from Results section)
+        _curr_sel = st.session_state.get("selected_run")
+        _prev_sel = st.session_state.get("selected_run_prev")
+        if _curr_sel != _prev_sel:
+            # Something else changed selected_run. Update our widget.
+            if _curr_sel and _curr_sel in run_names:
+                st.session_state["ui.open_run"] = _curr_sel
+            st.session_state["selected_run_prev"] = _curr_sel
 
-    _open_idx = 0 if force_new else (1 + run_names.index(st.session_state["selected_run"]) if st.session_state["selected_run"] in run_names else 0)
-
+        # Initial default if still missing (first load of the sidebar/app)
+        if "ui.open_run" not in st.session_state:
+            if _curr_sel and _curr_sel in run_names:
+                st.session_state["ui.open_run"] = _curr_sel
+            else:
+                st.session_state["ui.open_run"] = "(new run)"
 
     open_existing = st.selectbox(
-
-
         "Open existing run",
-
-
         options=["(new run)"] + run_names,
-
-
-        index=_open_idx,
-
-
         format_func=lambda nm: (nm if nm == "(new run)" else (nm + ("  (incomplete)" if not run_is_complete.get(nm, False) else ""))),
-
-
         key="ui.open_run",
-
-
     )
 
     if open_existing != "(new run)":
         st.session_state["selected_run"] = open_existing
+        st.session_state["selected_run_prev"] = open_existing
     else:
         # Selecting "(new run)" should always drop you into the Build & Run flow.
         st.session_state["ui.section"] = "1) Build & Run"
@@ -9706,7 +9624,6 @@ if open_existing == "(new run)":
                 view = st.selectbox(
                     "View",
                     ["All", "Favorites", "Recent"],
-                    index=0,
                     key="new.data_view",
                     help="Favorites and Recent are stored for this session only (v1).",
                 )
@@ -9762,6 +9679,10 @@ if open_existing == "(new run)":
                     cur = str(st.session_state.get("new.data_candidate_id") or "")
                     if not cur or cur not in ids:
                         cur = committed_id if committed_id in ids else ids[0]
+                    
+                    # Sync session state so we don't need 'index' in selectbox
+                    st.session_state["new.data_candidate_id"] = cur
+
                     icon_col, sel_col = st.columns([0.07, 0.93], vertical_alignment="center")
                     with icon_col:
                         _icon_ph = st.empty()
@@ -9769,7 +9690,6 @@ if open_existing == "(new run)":
                         sel = st.selectbox(
                             "Dataset",
                             ids,
-                            index=ids.index(cur),
                             format_func=lambda _id: _dataset_option_label(by_id.get(_id, {})),
                             key="new.data_candidate_id",
                             help="Click and type to search inside the dropdown. Or use 'Search coins' / 'Browse all coins' above.",
