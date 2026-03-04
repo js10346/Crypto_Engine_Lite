@@ -14,6 +14,7 @@ import sys
 import time
 import threading
 import queue
+import concurrent.futures
 from collections import deque, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, date
@@ -25,6 +26,20 @@ import numpy as np
 import streamlit as st
 import streamlit.components.v1 as components
 com = components
+
+# --- Shared Icon Memory Cache (Thread-Safe Bytes) ---
+@st.cache_resource
+def _get_icon_cache() -> Dict[str, bytes]:
+    """Returns a persistent dictionary for icon bytes."""
+    return {}
+
+@st.cache_resource
+def _get_icon_lock() -> threading.Lock:
+    """Returns a persistent lock for thread-safe cache access."""
+    return threading.Lock()
+
+_ICON_BYTE_CACHE = _get_icon_cache()
+_ICON_LOCK = _get_icon_lock()
 
 # ----------------------------
 # Debug UI toggle (env or ?debug=1)
@@ -2305,72 +2320,103 @@ def _dataset_option_label(d: Dict[str, Any]) -> str:
 
 
 # --- Coin icons (optional) ----------------------------------------------------
-# We can't render images inside Streamlit selectbox options, so we show the icon
-# next to the picker + in the "Browse all coins" panel.
 try:
     import requests as _requests  # type: ignore
 except Exception:  # pragma: no cover
     _requests = None
 
 _ICON_URL_TEMPLATES = [
-    # spothq cryptocurrency-icons (32px, color)
+    "https://bin.bnbstatic.com/static/assets/logos/{sym_upper}.png",
+    "https://assets.coincap.io/assets/icons/{sym}@2x.png",
+    "https://raw.githubusercontent.com/ErikThiart/cryptocurrency-icons/master/128/{sym}.png",
+    "https://raw.githubusercontent.com/spothq/cryptocurrency-icons/master/128/color/{sym}.png",
     "https://raw.githubusercontent.com/spothq/cryptocurrency-icons/master/32/color/{sym}.png",
-    # fallback: 64px in case some aren't present at 32 (rare)
-    "https://raw.githubusercontent.com/spothq/cryptocurrency-icons/master/64/color/{sym}.png",
+    "https://cryptoicons.org/api/color/{sym}/128",
 ]
 
-
 def _local_icon_path(symbol: str) -> Optional[Path]:
-    sym = (symbol or "").strip().lower()
-    if not sym:
-        return None
-    # Allow users to drop icons here if they want fully offline rendering
-    icon_dir = DATA_DIR / "icons"
-    for ext in ("png", "jpg", "jpeg", "webp"):
-        p = icon_dir / f"{sym}.{ext}"
-        if p.exists():
-            return p
+    """Checks for local icon files in both data/icons and tools/icons."""
+    s_key = (symbol or "").strip().lower()
+    if not s_key: return None
+    for root in (DATA_DIR / "icons", REPO_ROOT / "tools" / "icons"):
+        if not root.exists(): continue
+        for ext in ("png", "jpg", "jpeg", "webp"):
+            p = root / f"{s_key}.{ext}"
+            if p.exists(): return p
     return None
 
+# --- Shared Icon Memory Cache helper functions ---
 
-@st.cache_data(show_spinner=False)
-def _coin_icon_bytes(symbol: str) -> Optional[bytes]:
-    sym = (symbol or "").strip().lower()
-    if not sym:
-        return None
+def _coin_icon_bytes(symbol: str, allow_network: bool = True) -> Optional[bytes]:
+    """Returns raw bytes for a coin icon. Non-blocking if allow_network=False."""
+    s_key = (symbol or "").strip().lower()
+    if not s_key: return None
 
-    lp = _local_icon_path(sym)
-    if lp is not None:
-        try:
-            return lp.read_bytes()
-        except Exception:
-            return None
+    # Handle common symbol aliases (e.g. TON is often under 'toncoin')
+    s_keys = [s_key]
+    if s_key == "ton": s_keys = ["toncoin", "ton"] # Prioritize toncoin for TON
+    elif s_key == "toncoin": s_keys = ["ton", "toncoin"]
 
-    if _requests is None:
-        return None
+    # 1. Memory Cache (Instant)
+    with _ICON_LOCK:
+        for k in s_keys:
+            if k in _ICON_BYTE_CACHE:
+                return _ICON_BYTE_CACHE[k]
 
-    # Remote best-effort: if it fails, we fall back to a monogram.
-    for tpl in _ICON_URL_TEMPLATES:
-        url = tpl.format(sym=sym)
-        try:
-            resp = _requests.get(url, timeout=2.0)
-            if resp is not None and getattr(resp, "ok", False) and resp.content:
-                return resp.content
-        except Exception:
-            continue
+    # 2. Local Disk (Fast)
+    for k in s_keys:
+        lp = _local_icon_path(k)
+        if lp and lp.exists():
+            try:
+                b = lp.read_bytes()
+                if b:
+                    with _ICON_LOCK: _ICON_BYTE_CACHE[k] = b
+                    return b
+            except Exception: pass
+
+    # 3. Network fallback
+    if not allow_network or _requests is None: return None
+
+    # Use a real User-Agent to avoid being blocked by GitHub/CDN
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
+    
+    # Try all aliases across all templates
+    for k in s_keys:
+        for tpl in _ICON_URL_TEMPLATES:
+            url = tpl.format(sym=k, sym_upper=k.upper())
+            try:
+                resp = _requests.get(url, timeout=3.0, headers=headers)
+                if resp is not None and getattr(resp, "ok", False) and resp.content:
+                    # Validate that it's actually an image
+                    if len(resp.content) > 100:
+                        with _ICON_LOCK:
+                            _ICON_BYTE_CACHE[k] = resp.content
+                            # Also cache under the primary key if it was an alias
+                            if k != s_key: _ICON_BYTE_CACHE[s_key] = resp.content
+                        return resp.content
+            except Exception: continue
     return None
 
+def _prefetch_icons_background(syms: List[str]) -> None:
+    """Warms up the byte cache using a thread pool for speed."""
+    if not syms: return
+    try:
+        # Use 5 threads to avoid spamming but keep it fast
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            # We use a list to force the execution of the generator
+            list(executor.map(lambda s: _coin_icon_bytes(s, allow_network=True), syms))
+    except Exception:
+        pass
 
 def _render_coin_icon(symbol: str, size: int = 22) -> None:
-    b = _coin_icon_bytes(symbol)
+    """Renders a coin icon using standard st.image (blocking allowed for priority coin)."""
+    b = _coin_icon_bytes(symbol, allow_network=True)
     if b:
         try:
             st.image(b, width=size)
             return
-        except Exception:
-            pass
+        except Exception: pass
 
-    # Fallback: simple monogram badge
     s = (symbol or "").strip().upper()
     label = (s[:3] if s else "?")
     st.markdown(
@@ -2385,9 +2431,92 @@ def _render_coin_icon(symbol: str, size: int = 22) -> None:
         unsafe_allow_html=True,
     )
 
+def _render_coin_browser(all_syms: List[str], by_id: Dict[str, Dict[str, Any]]) -> None:
+    """Renders the coin browser using standard columns and buttons for reliable logo display."""
+    with st.expander("Browse all coins", expanded=False):
+        if "data.catalog_full" not in st.session_state:
+            st.info("Still scanning your library...")
+            return
+
+        _show_all = st.checkbox("Show all coin icons", value=False, key="data.show_all_icons_v8")
+        _to_show = all_syms if _show_all else [s for s in all_syms if s in ["BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "DOGE", "LINK"]][:10]
+        if not _to_show and all_syms:
+            _to_show = all_syms[:10]
+
+        # Cache check for visual feedback
+        n_cached = 0
+        with _ICON_LOCK:
+            n_cached = sum(1 for s in _to_show if s.lower() in _ICON_BYTE_CACHE)
+        
+        # Trigger background prefetch for the current view if needed
+        is_loading = False
+        if n_cached < len(_to_show):
+            # We track if we've already started a prefetch for this specific set of icons in this session
+            # to avoid spawning thousands of threads during the rerun loop.
+            _prefetch_key = f"prefetch_{hash(tuple(_to_show))}"
+            if not st.session_state.get(_prefetch_key):
+                is_loading = True
+                st.session_state[_prefetch_key] = True
+                try:
+                    threading.Thread(target=_prefetch_icons_background, args=(_to_show,), daemon=True).start()
+                except Exception: pass
+
+        if _show_all:
+            if n_cached < len(_to_show):
+                st.caption(f"⏳ Loading icons... ({n_cached}/{len(_to_show)} ready)")
+            else:
+                st.caption(f"🚀 {len(_to_show)} icons ready in memory.")
+
+        # Standard Streamlit Grid (10 columns)
+        # Using a container to keep the layout stable
+        grid_container = st.container()
+        with grid_container:
+            cols = st.columns(10)
+            for i, sym in enumerate(_to_show):
+                with cols[i % 10]:
+                    # Instant check (non-blocking)
+                    b = _coin_icon_bytes(sym, allow_network=False)
+                    if b:
+                        try:
+                            st.image(b, width=24)
+                        except Exception:
+                            # Fallback to monogram
+                            s = (sym or "").strip().upper()
+                            st.markdown(f"<div style='width:24px;height:24px;border-radius:50%;background:#EEF2FF;color:#3730A3;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:800;'>{s[:3]}</div>", unsafe_allow_html=True)
+                    else:
+                        # Placeholder monogram while loading
+                        s = (sym or "").strip().upper()
+                        st.markdown(f"<div style='width:24px;height:24px;border-radius:50%;background:#EEF2FF;color:#3730A3;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:800;'>{s[:3]}</div>", unsafe_allow_html=True)
+
+                    if st.button(sym, key=f"btn_browse_{sym}", use_container_width=True):
+                        st.session_state["new.data_view"] = "All"
+                        st.session_state["new.data_search_pending"] = sym
+                        target_id = next((did for did, dd in by_id.items() if str(dd.get("symbol") or "").upper() == sym.upper()), None)
+                        if target_id:
+                            st.session_state["new.data_candidate_id"] = target_id
+                            # Crucial: set the prev value too so the change-detection logic doesn't override us
+                            st.session_state["new.data_candidate_id_prev"] = target_id
+                            
+                            # AUTO-COMMIT on click
+                            entry = by_id.get(target_id, {})
+                            cand_path = _resolve_dataset_path(entry)
+                            if cand_path and cand_path.exists():
+                                st.session_state["new.data_id"] = str(target_id)
+                                st.session_state["new.data_path"] = str(cand_path)
+                        st.rerun()
+
+        # If we are still loading, wait a moment and rerun ONLY if we made progress
+        if n_cached < len(_to_show):
+            time.sleep(1.0)
+            new_n = 0
+            with _ICON_LOCK:
+                new_n = sum(1 for s in _to_show if s.lower() in _ICON_BYTE_CACHE)
+            if new_n > n_cached:
+                st.rerun()
+            elif is_loading: # Initial rerun to start the "pop-in"
+                st.rerun()
 
 def _catalog_paths() -> List[Path]:
-
     return [
         DATA_DIR / "datasets" / "catalog.json",
         DATA_DIR / "catalog.json",
@@ -2395,70 +2524,78 @@ def _catalog_paths() -> List[Path]:
     ]
 
 
-def _build_fallback_catalog() -> List[Dict[str, Any]]:
-    """Fallback: scan ./data for csv/parquet datasets when no catalog is present."""
+@st.cache_data(show_spinner=False)
+def _build_fallback_catalog_cached() -> List[Dict[str, Any]]:
+    """Fallback: scan ./data for datasets (shallow scan preferred)."""
     out: List[Dict[str, Any]] = []
     seen: set = set()
-
-    # Prefer a dedicated datasets folder if it exists
     roots = []
-    if (DATA_DIR / "datasets").exists():
-        roots.append(DATA_DIR / "datasets")
+    if (DATA_DIR / "datasets" / "spot_1d").exists(): roots.append(DATA_DIR / "datasets" / "spot_1d")
+    elif (DATA_DIR / "datasets").exists(): roots.append(DATA_DIR / "datasets")
     roots.append(DATA_DIR)
 
     for root in roots:
         try:
-            for p in root.rglob("*"):
-                if not p.is_file():
-                    continue
-                if p.name.lower() in {"catalog.json", "datasets_catalog.json"}:
-                    continue
-                if p.suffix.lower() not in {".csv", ".parquet", ".pq"}:
-                    continue
+            for p in root.glob("*.parquet"):
                 rel = str(p.relative_to(REPO_ROOT)) if REPO_ROOT in p.parents else str(p)
-                if rel in seen:
-                    continue
+                if rel in seen: continue
                 seen.add(rel)
-
                 sym = _infer_symbol_from_filename(p.name)
-                entry = {
-                    "id": f"{sym}_{p.suffix.lower().lstrip('.')}:{rel}",
-                    "symbol": sym,
-                    "name": "",
-                    "timeframe": "1D",
-                    "file_path": rel,
-                }
-                out.append(entry)
-        except Exception:
-            continue
-
-    # Ensure sample dataset still shows up if present
-    sample_csv = DATA_DIR / "eth_daily_2023_to_now.csv"
-    if sample_csv.exists():
-        rel = str(sample_csv.relative_to(REPO_ROOT)) if REPO_ROOT in sample_csv.parents else str(sample_csv)
-        entry = {
-            "id": "ETH_csv:sample",
-            "symbol": "ETH",
-            "name": "Sample",
-            "timeframe": "1D",
-            "file_path": rel,
-        }
-        out.insert(0, entry)
-
+                out.append({"id": f"{sym}_pq:{rel}", "symbol": sym, "timeframe": "1D", "file_path": rel})
+        except Exception: continue
+    if not out:
+        for root in roots:
+            try:
+                for p in root.rglob("*.parquet"):
+                    rel = str(p.relative_to(REPO_ROOT)) if REPO_ROOT in p.parents else str(p)
+                    if rel in seen: continue
+                    seen.add(rel)
+                    sym = _infer_symbol_from_filename(p.name)
+                    out.append({"id": f"{sym}_pq:{rel}", "symbol": sym, "timeframe": "1D", "file_path": rel})
+            except Exception: continue
     return out
 
 
-def _get_dataset_catalog() -> List[Dict[str, Any]]:
-    # Try explicit catalog files first
+def _get_dataset_catalog(priority_id: Optional[str] = None, priority_path: Optional[str] = None, mode: str = "auto") -> List[Dict[str, Any]]:
+    """Fast catalog loading with prioritize mode."""
+    if mode == "auto" and "data.catalog_full" in st.session_state:
+        return st.session_state["data.catalog_full"]
+
+    # 1. Try explicit catalog files first
     for cp in _catalog_paths():
         try:
             if cp.exists():
-                return _read_catalog_cached(str(cp), cp.stat().st_mtime)
-        except Exception:
-            pass
-    return _build_fallback_catalog()
+                cat = _read_catalog_cached(str(cp), cp.stat().st_mtime)
+                if cat:
+                    st.session_state["data.catalog_full"] = cat
+                    return cat
+        except Exception: pass
 
+    # 2. Minimal mode: just find the priority coin or BTC
+    if mode == "minimal" or "data.catalog_minimal" not in st.session_state:
+        mini = []
+        p_path = priority_path or st.session_state.get("new.data_path") or st.session_state.get("new.data_candidate_path")
+        if p_path and Path(p_path).exists():
+            p = Path(p_path)
+            sym = _infer_symbol_from_filename(p.name)
+            mini.append({"id": f"{sym}_pq:{str(p_path)}", "symbol": sym, "timeframe": "1D", "file_path": str(p_path)})
+        else:
+            # Quick check for BTC
+            for btc_path in [DATA_DIR / "datasets" / "spot_1d" / "BTC.parquet", DATA_DIR / "BTC.parquet"]:
+                if btc_path.exists():
+                    rel = str(btc_path.relative_to(REPO_ROOT)) if REPO_ROOT in btc_path.parents else str(btc_path)
+                    mini.append({"id": f"BTC_pq:{rel}", "symbol": "BTC", "timeframe": "1D", "file_path": rel})
+                    break
+        if mini:
+            st.session_state["data.catalog_minimal"] = mini
+            if "data.catalog_full" not in st.session_state:
+                st.session_state["data.needs_discovery"] = True
+            return mini
 
+    # 3. Fallback to cached scan
+    full = _build_fallback_catalog_cached()
+    st.session_state["data.catalog_full"] = full
+    return full
 
 
 def _human_bytes(n: int) -> str:
@@ -7270,30 +7407,30 @@ def _render_skill_build_header(slot, *, df_feat: Optional[pd.DataFrame]) -> None
             st.markdown("##### Gate logic (visual)")
             st.markdown(_gate_logic_tree_html(eff_logic, snap), unsafe_allow_html=True)
 
-            st.markdown("##### Gate logic (plain English)")
-            explain_mode = st.selectbox("Explain mode", ["Basic", "Beginner", "Deep"], index=1, key="new.gate_explain_mode")
-            try:
-                _render_gate_plain_english_report(
-                    df_feat=df_feat,
-                    entry_logic=eff_logic,
-                    snap=snap,
-                    deposit_freq=deposit_freq,
-                    deposit_amt=deposit_amt,
-                    buy_mode=buy_mode,
-                    buy_freq=buy_freq,
-                    buy_amt=buy_amt,
-                    max_buys_per_gate=max_buys_per_gate,
-                    max_alloc_pct=max_alloc_pct,
-                    sl_ui=sl_ui,
-                    tp_ui=tp_ui,
-                    tp_sell_frac=tp_sell_frac,
-                    reserve_frac=reserve_frac,
-                    trail_ui=trail_ui,
-                    max_hold=max_hold,
-                    explain_mode=explain_mode,
-                )
-            except Exception as _e:
-                st.caption(f"Could not render plain-English gate explanation: {_e}")
+            with st.expander("Gate logic (plain English)", expanded=False):
+                explain_mode = st.selectbox("Explain mode", ["Basic", "Beginner", "Deep"], index=1, key="new.gate_explain_mode")
+                try:
+                    _render_gate_plain_english_report(
+                        df_feat=df_feat,
+                        entry_logic=eff_logic,
+                        snap=snap,
+                        deposit_freq=deposit_freq,
+                        deposit_amt=deposit_amt,
+                        buy_mode=buy_mode,
+                        buy_freq=buy_freq,
+                        buy_amt=buy_amt,
+                        max_buys_per_gate=max_buys_per_gate,
+                        max_alloc_pct=max_alloc_pct,
+                        sl_ui=sl_ui,
+                        tp_ui=tp_ui,
+                        tp_sell_frac=tp_sell_frac,
+                        reserve_frac=reserve_frac,
+                        trail_ui=trail_ui,
+                        max_hold=max_hold,
+                        explain_mode=explain_mode,
+                    )
+                except Exception as _e:
+                    st.caption(f"Could not render plain-English gate explanation: {_e}")
 
     
 
@@ -7303,7 +7440,7 @@ def build_dca_baseline_params() -> Dict[str, Any]:
     st.subheader("Baseline Plan")
 
     # Ensure session state is initialized with defaults to avoid "index/value + key" conflict.
-    # This is critical when Strategy Builder is loaded via "Use as baseline".
+    # This is critical when Strategy Builder is loaded via "🚀 Use for New Run".
     _defaults = {
         "new.deposit_freq": "weekly",
         "new.deposit_amount": 50.0,
@@ -9193,7 +9330,7 @@ with st.sidebar:
     if nxt and nxt in run_names:
         st.session_state["selected_run"] = nxt
 
-    # Apply any pending "use as baseline" preset BEFORE sidebar widgets are instantiated.
+    # Apply any pending "🚀 Use for New Run" preset BEFORE sidebar widgets are instantiated.
     _preset = st.session_state.pop("ui.preset_from_baseline", None)
     if isinstance(_preset, dict) and _preset:
         # Switch to new run (must happen before the 'Open existing run' selectbox is created).
@@ -9340,7 +9477,7 @@ with st.sidebar:
                 st.session_state.pop("builder.pending_apply", None)
                 st.rerun()
     else:
-        st.caption("No baseline loaded yet. Use **Use as baseline** from a Build sheet.")
+        st.caption("No baseline loaded yet. Use **🚀 Use for New Run** from a Build sheet.")
 
     st.markdown("---")
     st.markdown("**Dataset**")
@@ -9540,7 +9677,21 @@ if open_existing == "(new run)":
     step = max(0, min(step, len(NEW_STEPS) - 1))
 
     st.progress((step + 1) / len(NEW_STEPS))
-    st.write(f"**{NEW_STEPS[step]}**")
+    _hdr1, _hdr2 = st.columns([0.6, 0.4], vertical_alignment="center")
+    with _hdr1:
+        st.write(f"**{NEW_STEPS[step]}**")
+    with _hdr2:
+        # Visible tag for selected coin (Step 1-4)
+        data_id = st.session_state.get("new.data_id")
+        if data_id:
+            _t_sym = str(data_id).split(":")[0]
+            st.markdown(
+                f'<div style="text-align:right;">'
+                f'<span style="background:#F3F4F6; color:#374151; padding:4px 12px; border-radius:16px; '
+                f'font-size:13px; font-weight:700; border:1px solid #D1D5DB;">'
+                f'🎯 Target: {_t_sym}</span></div>',
+                unsafe_allow_html=True
+            )
 
     # Shared: staging dir for temp files
     tmp_dir = TMP_DIR
@@ -9552,7 +9703,9 @@ if open_existing == "(new run)":
     if step == 0:
         st.write("Choose the market data you want to test against (spot, daily OHLCV).")
 
-        catalog = _get_dataset_catalog()
+        # Initial fast/priority catalog (Always start minimal to keep UI responsive)
+        is_fresh_load = "data.catalog_full" not in st.session_state
+        catalog = _get_dataset_catalog(mode="minimal" if is_fresh_load else "auto")
 
         # Lightweight, session-only personalization (v1)
         use_counts = st.session_state.get("data.use_counts", {}) if isinstance(st.session_state.get("data.use_counts", {}), dict) else {}
@@ -9606,20 +9759,8 @@ if open_existing == "(new run)":
                 all_syms = sorted({str(d.get("symbol") or "").upper() for d in by_id.values() if str(d.get("symbol") or "").strip()})
                 if all_syms:
                     st.caption(f"Available coins: **{len(all_syms):,}**. Tip: type a symbol above, or open **Browse all coins**.")
-                    with st.expander("Browse all coins", expanded=False):
-                        cols = st.columns(10)
-                        for i, sym in enumerate(all_syms):
-                            col = cols[i % len(cols)]
-                            with col:
-                                _render_coin_icon(sym, size=20)
-                                if st.button(sym, key=f"browse_coin_{sym}", use_container_width=True):
-                                    # Ensure the chosen coin is visible and selected
-                                    st.session_state["new.data_view"] = "All"
-                                    st.session_state["new.data_search_pending"] = sym
-                                    target_id = next((did for did, dd in by_id.items() if str(dd.get("symbol") or "").upper() == sym), None)
-                                    if target_id:
-                                        st.session_state["new.data_candidate_id"] = target_id
-                                    st.rerun()
+                    # Use the non-blocking fragment
+                    _render_coin_browser(all_syms, by_id)
 
                 view = st.selectbox(
                     "View",
@@ -9627,6 +9768,7 @@ if open_existing == "(new run)":
                     key="new.data_view",
                     help="Favorites and Recent are stored for this session only (v1).",
                 )
+
 
                 sort_opts = ["Alphabetical", "Longest history", "Newest added", "Most used"]
                 default_sort = "Most used" if len(use_counts) > 0 else "Alphabetical"
@@ -9694,21 +9836,36 @@ if open_existing == "(new run)":
                             key="new.data_candidate_id",
                             help="Click and type to search inside the dropdown. Or use 'Search coins' / 'Browse all coins' above.",
                         )
+                    
+                    # AUTO-COMMIT logic
+                    _new_id = str(sel)
+                    _entry = by_id.get(_new_id, {})
+                    _new_path = _resolve_dataset_path(_entry)
+                    if _new_path and _new_path.exists():
+                        st.session_state["new.data_candidate_path"] = str(_new_path)
+                        # Commit if changed
+                        if str(st.session_state.get("new.data_id")) != _new_id:
+                            st.session_state["new.data_id"] = _new_id
+                            st.session_state["new.data_path"] = str(_new_path)
+                            # Update recent/counts
+                            try:
+                                rl = [x for x in recent_list if x != _new_id]
+                                rl.insert(0, _new_id)
+                                st.session_state["data.recent"] = rl[:10]
+                                counts = use_counts if isinstance(use_counts, dict) else {}
+                                counts[_new_id] = int(counts.get(_new_id, 0)) + 1
+                                st.session_state["data.use_counts"] = counts
+                            except Exception: pass
+                    else:
+                        st.session_state.pop("new.data_candidate_path", None)
+                        st.warning("Dataset file not found on disk.")
+
                     try:
                         _sym_for_icon = str(by_id.get(str(sel), {}).get("symbol") or "").upper()
                     except Exception:
                         _sym_for_icon = ""
                     with _icon_ph.container():
                         _render_coin_icon(_sym_for_icon, size=24)
-
-                    entry = by_id.get(str(sel), {})
-                    cand_path = _resolve_dataset_path(entry)
-                    if cand_path is not None and cand_path.exists():
-                        st.session_state["new.data_candidate_path"] = str(cand_path)
-                    else:
-                        st.session_state.pop("new.data_candidate_path", None)
-                        st.warning("Dataset file not found on disk.")
-
 
                     # Backtest date range (affects all later steps + the final run)
                     try:
@@ -9817,41 +9974,13 @@ if open_existing == "(new run)":
 
                     # Favorites toggle (session only)
                     is_fav = str(sel) in fav_set
-                    colA, colB = st.columns([1, 1])
-                    with colA:
-                        if st.button("★ Favorited" if is_fav else "☆ Add to favorites", key="fav_toggle_btn"):
-                            if is_fav:
-                                fav_set.discard(str(sel))
-                            else:
-                                fav_set.add(str(sel))
-                            st.session_state["data.favorites"] = sorted(fav_set)
-                            st.rerun()
-                    with colB:
-                        # Commit selection for this run
-                        use_disabled = ("new.data_candidate_path" not in st.session_state)
-                        committed_here = (str(st.session_state.get("new.data_id") or "") == str(sel)) and ("new.data_path" in st.session_state)
-                        use_label = "Selected ✓" if committed_here else "Use this dataset"
-                        if st.button(use_label, type="primary", disabled=use_disabled or committed_here, key="use_dataset_btn"):
-                            p = Path(str(st.session_state.get("new.data_candidate_path")))
-                            st.session_state["new.data_id"] = str(sel)
-                            st.session_state["new.data_path"] = str(p)
-
-                            # Track recent + most-used (session only)
-                            try:
-                                # recent
-                                rl = [x for x in recent_list if x != str(sel)]
-                                rl.insert(0, str(sel))
-                                st.session_state["data.recent"] = rl[:10]
-                                # use counts
-                                counts = use_counts if isinstance(use_counts, dict) else {}
-                                counts[str(sel)] = int(counts.get(str(sel), 0)) + 1
-                                st.session_state["data.use_counts"] = counts
-                            except Exception:
-                                pass
-                            st.rerun()
-
-                    if str(st.session_state.get("new.data_id") or "") == str(sel) and "new.data_path" in st.session_state:
-                        st.success("This dataset is selected for the current run.")
+                    if st.button("★ Favorited" if is_fav else "☆ Add to favorites", key="fav_toggle_btn", use_container_width=True):
+                        if is_fav:
+                            fav_set.discard(str(sel))
+                        else:
+                            fav_set.add(str(sel))
+                        st.session_state["data.favorites"] = sorted(fav_set)
+                        st.rerun()
 
             with right:
                 sel_id = str(st.session_state.get("new.data_candidate_id") or "")
@@ -9939,6 +10068,34 @@ if open_existing == "(new run)":
         with colR:
             if st.button("Next →", type="primary", disabled=("new.data_path" not in st.session_state)):
                 st.session_state["new.step"] = 1
+                st.rerun()
+
+        # Automatic Discovery Pass (deferred until after page load)
+        if st.session_state.get("data.needs_discovery") and not st.session_state.get("data.catalog_full"):
+            if "data.discovery_pass_count" not in st.session_state:
+                st.session_state["data.discovery_pass_count"] = 0
+            
+            if st.session_state["data.discovery_pass_count"] == 0:
+                # FIRST pass: Mark that we've seen it, then let it finish. 
+                # (We don't rerun here, because that would stop the render).
+                st.session_state["data.discovery_pass_count"] = 1
+                # Trigger a rerun at the VERY end of the page to start Pass 2.
+            else:
+                # SECOND pass: Run the heavy discovery
+                with st.status("Discovering local library...", expanded=False) as status:
+                    st.write("Scanning data directory for coins...")
+                    full_cat = _get_dataset_catalog(mode="full")
+                    
+                    # SILENT: Pre-fetch icons in the background so they are ready when 'Show all' is clicked
+                    try:
+                        all_syms = list(set(str(d.get("symbol") or "").upper() for d in full_cat if str(d.get("symbol") or "").strip()))
+                        threading.Thread(target=_prefetch_icons_background, args=(all_syms,), daemon=True).start()
+                    except Exception:
+                        pass
+
+                    st.session_state.pop("data.needs_discovery", None)
+                    st.session_state.pop("data.discovery_pass_count", None)
+                    status.update(label=f"Discovery complete! Found {len(full_cat)} datasets.", state="complete")
                 st.rerun()
     # -------------------------------------------------------------------------
     # Step 1: Plan
@@ -16621,7 +16778,7 @@ if stage_pick == "grand":
                     with bsL:
                         st.markdown("##### Build sheet")
                     with bsR:
-                        if st.button("Use as baseline", key=f"use_baseline.{pick}", use_container_width=True):
+                        if st.button("🚀 Use for New Run", key=f"use_baseline.{pick}", use_container_width=True, type="primary"):
                             # Prefer resolved normalized config (stable shape for rehydration)
                             try:
                                 cfg_map = {r.get("config_id"): r.get("normalized") for r in _load_jsonl(run_dir / "configs_resolved.jsonl")}
@@ -18344,3 +18501,4 @@ if stage_pick == "grand":
                                         st.caption(f"Missing: {fname}")
                         else:
                             st.caption("Run folder not available in this context.")
+if st.session_state.get("data.discovery_pass_count") == 1: st.rerun()
