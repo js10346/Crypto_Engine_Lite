@@ -1,4 +1,4 @@
-
+﻿
 from __future__ import annotations
 
 import json
@@ -27,6 +27,17 @@ import streamlit as st
 import streamlit.components.v1 as components
 com = components
 
+# --- REPO ROOT SETUP (Must be early for internal imports) ---
+REPO_ROOT = Path(__file__).resolve().parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+# Internal imports
+try:
+    from lab.metrics import METRICS
+except ImportError:
+    METRICS = {}
+
 # --- Shared Icon Memory Cache (Thread-Safe Bytes) ---
 @st.cache_resource
 def _get_icon_cache() -> Dict[str, bytes]:
@@ -50,16 +61,23 @@ def _debug_ui_enabled() -> bool:
     except Exception:
         env = False
     try:
-        qp = st.query_params
-        # Streamlit query params behave like a dict; accept ?debug=1 (or true/yes/on)
-        qv = str((qp.get("debug") if hasattr(qp, "get") else "") or "").strip().lower()
+        # Check query params safely
+        try:
+            qp = getattr(st, "query_params", {})
+            qv = str(qp.get("debug", "")).strip().lower()
+        except Exception:
+            # Fallback for older streamlit versions
+            try:
+                qp = st.experimental_get_query_params()
+                qv = str(qp.get("debug", [""])[0]).strip().lower()
+            except Exception:
+                qv = ""
         if qv in ("1", "true", "yes", "on"):
             return True
     except Exception:
         pass
     return env
 
-# Backwards-compatible global used in a few sections (e.g., Run details debug panels)
 debug_ui = _debug_ui_enabled()
 
 
@@ -301,12 +319,105 @@ except Exception:  # pragma: no cover
 # Visual system (Sprint 6)
 # =============================================================================
 
-PASS_COLOR = "#00C853"   # vibrant green
-WARN_COLOR = "#FFD600"   # bright amber
-FAIL_COLOR = "#FF1744"   # vivid red
+def _hex_rgba(hex_color: str, alpha: float) -> str:
+    """Helper for theme properties to convert hex to rgba."""
+    try:
+        h = (hex_color or "").lstrip("#")
+        if len(h) != 6: return f"rgba(128,128,128,{alpha})"
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        return f"rgba({r},{g},{b},{alpha})"
+    except Exception: return f"rgba(128,128,128,{alpha})"
+
+@dataclass
+class Theme:
+    name: str
+    is_dark: bool
+    bg_main: str
+    bg_side: str
+    text_main: str
+    text_muted: str
+    card_bg: str
+    card_border: str
+    accent: str
+    popover_bg: str = "#FFFFFF"
+    expander_bg: str = "rgba(49, 51, 63, 0.05)"
+    
+    # Status colors
+    pass_color: str = "#00C853"
+    warn_color: str = "#FFD600"
+    fail_color: str = "#FF1744"
+    neutral_color: str = "#9E9E9E"
+    accent_blue: str = "#2979FF"
+    accent_orange: str = "#FF6D00"
+
+    @property
+    def pass_bg(self) -> str: return _hex_rgba(self.pass_color, 0.15)
+    @property
+    def fail_bg(self) -> str: return _hex_rgba(self.fail_color, 0.15)
+    @property
+    def warn_bg(self) -> str: return _hex_rgba(self.warn_color, 0.15)
+
+    def get_plotly_layout(self) -> Dict[str, Any]:
+        template = "plotly_dark" if self.is_dark else "plotly_white"
+        grid_color = "rgba(255,255,255,0.10)" if self.is_dark else "rgba(49,51,63,0.08)"
+        return dict(
+            template=template,
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            font=dict(family="Inter, sans-serif", size=13, color=self.text_main),
+            xaxis=dict(showgrid=True, gridcolor=grid_color, zeroline=False),
+            yaxis=dict(showgrid=True, gridcolor=grid_color, zeroline=False),
+        )
+
+def get_theme() -> Theme:
+    """Returns the currently active theme based on user selection."""
+    raw = st.session_state.get("ui.theme", "Dark (Classic)")
+    is_dark = "Dark" in str(raw)
+    
+    if is_dark:
+        return Theme(
+            name="Dark",
+            is_dark=True,
+            bg_main="#0e1117",
+            bg_side="#161b22",
+            text_main="#E6EDF3",
+            text_muted="#8B949E",
+            card_bg="rgba(30, 30, 30, 0.85)",
+            card_border="rgba(255, 255, 255, 0.10)",
+            accent="#2979FF",
+            popover_bg="#1e252e",
+            expander_bg="rgba(255, 255, 255, 0.05)",
+            pass_color="#00C853",
+            warn_color="#FFD600",
+            fail_color="#FF5252",
+        )
+    else:
+        return Theme(
+            name="Light",
+            is_dark=False,
+            bg_main="#FFFFFF",
+            bg_side="#F0F2F6",
+            text_main="#31333F",
+            text_muted="#5F6368",
+            card_bg="rgba(255, 255, 255, 0.90)",
+            card_border="rgba(49, 51, 63, 0.12)",
+            accent="#2979FF",
+            popover_bg="#FFFFFF",
+            expander_bg="rgba(49, 51, 63, 0.05)",
+            pass_color="#00C853",
+            warn_color="#FFB300",
+            fail_color="#FF5252",
+        )
+
+# Backward compatibility (global-ish access)
+_T = None # Will be set during injection
+
+PASS_COLOR = "#00C853"
+WARN_COLOR = "#FFD600"
+FAIL_COLOR = "#FF1744"
 NEUTRAL_COLOR = "#9E9E9E"
-ACCENT_BLUE = "#2979FF"  # electric blue
-ACCENT_ORANGE = "#FF6D00"  # vivid orange (used for tolerance markers)
+ACCENT_BLUE = "#2979FF"
+ACCENT_ORANGE = "#FF6D00"
 
 VERDICT_COLORS = {
     "PASS": PASS_COLOR,
@@ -315,73 +426,8 @@ VERDICT_COLORS = {
     "UNMEASURED": NEUTRAL_COLOR,
 }
 
-def _style_fig(fig, title: str | None = None):
-    """Lightly standardize Plotly figures.
-
-    If USE_STREAMLIT_PLOTLY_THEME is True, we avoid forcing a Plotly template/font so Streamlit's
-    theme controls the look. We still manage margins/legend placement to prevent collisions.
-    """
-    if fig is None:
-        return fig
-
-    def _bold_title(t: str | None) -> str | None:
-        if t is None:
-            return None
-        s = str(t)
-        # Avoid double-wrapping bold tags
-        if "<b>" in s.lower():
-            return s
-        return f"<b>{s}</b>"
-
-    _title = _bold_title(title)
-
-    if USE_STREAMLIT_PLOTLY_THEME:
-        fig.update_layout(
-            title=dict(text=_title, x=0.0, xanchor="left", y=0.98, yanchor="top") if _title else None,
-            margin=dict(l=60, r=24, t=90 if _title else 60, b=56),
-            legend=dict(orientation="h", yanchor="bottom", y=1.05, xanchor="right", x=1.0),
-        )
-        fig.update_xaxes(automargin=True, title_standoff=10)
-        fig.update_yaxes(automargin=True, title_standoff=10)
-        return fig
-
-    # Fallback: fully self-styled Plotly (used when theme=None)
-    fig.update_layout(
-        template="plotly_white",
-        font=dict(family="Inter, sans-serif", size=13, color="#1f2937"),
-        title=dict(text=_title, font=dict(size=18, color="#111827"), x=0.0, xanchor="left", y=0.98),
-        margin=dict(l=60, r=24, t=85, b=56),
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.03,
-            xanchor="right",
-            x=1.0,
-            font=dict(size=12, color="#374151"),
-        ),
-        paper_bgcolor="white",
-        plot_bgcolor="white",
-    )
-
-    fig.update_xaxes(
-        showgrid=True,
-        gridcolor="rgba(0,0,0,0.06)",
-        zeroline=False,
-        automargin=True,
-        title_standoff=10,
-        tickfont=dict(size=12, color="#374151"),
-        titlefont=dict(size=13, color="#374151"),
-    )
-    fig.update_yaxes(
-        showgrid=True,
-        gridcolor="rgba(0,0,0,0.06)",
-        zeroline=False,
-        automargin=True,
-        title_standoff=10,
-        tickfont=dict(size=12, color="#374151"),
-        titlefont=dict(size=13, color="#374151"),
-    )
-    return fig
+def _verdict_color(v: str) -> str:
+    return VERDICT_COLORS.get(str(v or "").upper(), NEUTRAL_COLOR)
 
 
 
@@ -507,86 +553,58 @@ def _rs_zone_width(tol: float) -> float:
 
 
 def _rs_add_bands(fig, tol: float, near: float, y_min=None, y_max=None):
-    """Add PASS/WARN/FAIL horizontal bands to a Plotly figure.
-
-    IMPORTANT: Do **not** use absurd y0/y1 like +/-1e9. Shapes affect Plotly autorange,
-    which can explode the axis into "1000000000%" territory. We instead bound the bands
-    to the data range (+padding) and return the range so callers can lock y-axis.
-
-    Returns:
-        (y0, y1) range used for the bands.
-    """
+    """Add PASS/WARN/FAIL horizontal bands to a Plotly figure."""
     near = abs(float(near))
     tol = float(tol)
+    qc = _hex_rgba(_T.text_main, 0.45)
 
     vals = []
     for v in (y_min, y_max, tol, tol + near):
         try:
             fv = float(v)
-        except Exception:
-            continue
-        if fv == fv and fv not in (float('inf'), float('-inf')):
-            vals.append(fv)
+            if fv == fv and fv not in (float('inf'), float('-inf')):
+                vals.append(fv)
+        except Exception: continue
 
     if len(vals) >= 2:
-        ymin = min(vals)
-        ymax = max(vals)
+        ymin, ymax = min(vals), max(vals)
     else:
-        # Fallback range in fractional return space
-        ymin = tol - 0.01
-        ymax = tol + 0.01
+        ymin, ymax = tol - 0.01, tol + 0.01
 
     span = max(1e-9, ymax - ymin)
-    pad = max(span * 0.20, near * 2.0, 0.002)  # ~0.2% min pad
-
-    y0 = min(ymin, tol) - pad
-    y1 = max(ymax, tol + near) + pad
+    pad = max(span * 0.20, near * 2.0, 0.002)
+    y0, y1 = min(ymin, tol) - pad, max(ymax, tol + near) + pad
 
     # FAIL (below cutoff)
-    fig.add_hrect(y0=y0, y1=tol, fillcolor=FAIL_COLOR, opacity=0.08, line_width=0, layer="below")
+    fig.add_hrect(y0=y0, y1=tol, fillcolor=_T.fail_color, opacity=0.08, line_width=0, layer="below")
     # WARN (near cutoff)
-    fig.add_hrect(y0=tol, y1=tol + near, fillcolor=WARN_COLOR, opacity=0.08, line_width=0, layer="below")
+    fig.add_hrect(y0=tol, y1=tol + near, fillcolor=_T.warn_color, opacity=0.08, line_width=0, layer="below")
     # PASS (above cutoff)
-    fig.add_hrect(y0=tol + near, y1=y1, fillcolor=PASS_COLOR, opacity=0.06, line_width=0, layer="below")
+    fig.add_hrect(y0=tol + near, y1=y1, fillcolor=_T.pass_color, opacity=0.06, line_width=0, layer="below")
 
     return (y0, y1)
 
 
 def _rs_violin_fig(rs_returns: pd.Series, tol: float, near: float):
+    """Violin plot for rolling starts returns with theme support."""
+    if go is None: return None
     vals = pd.to_numeric(rs_returns, errors="coerce").dropna()
     fig = go.Figure()
 
-    # Single violin = density shape + embedded box (median/IQR) for instant read.
-    fig.add_trace(
-        go.Violin(
-            y=vals,
-            box_visible=True,
-            meanline_visible=False,
-            points=False,
-            line_color=ACCENT_BLUE,
-            fillcolor="rgba(41,121,255,0.18)",
-        )
-    )
+    fig.add_trace(go.Violin(
+        y=vals, name="Returns", box_visible=True, meanline_visible=False,
+        points=False, line_color=ACCENT_BLUE, fillcolor="rgba(41,121,255,0.18)"
+    ))
+    
     y0, y1 = _rs_add_bands(fig, tol=tol, near=near, y_min=float(vals.min()) if len(vals) else None, y_max=float(vals.max()) if len(vals) else None)
 
-    # Quantile lines (no annotations to keep it clean)
     if len(vals) > 0:
-        p10 = float(vals.quantile(0.10))
-        p50 = float(vals.quantile(0.50))
-        p90 = float(vals.quantile(0.90))
-        fig.add_hline(y=p10, line_dash="dot", line_color="#666", opacity=0.45)
-        fig.add_hline(y=p50, line_dash="solid", line_color="#666", opacity=0.55)
-        fig.add_hline(y=p90, line_dash="dot", line_color="#666", opacity=0.45)
+        qc = _hex_rgba(_T.text_main, 0.45)
+        for p, d in zip(vals.quantile([0.1, 0.5, 0.9]), ["dot", "solid", "dot"]):
+            fig.add_hline(y=float(p), line_dash=d, line_color=qc, opacity=0.5)
 
-    # Disappoint cutoff line + label
-    fig.add_hline(
-        y=tol,
-        line_dash="dash",
-        line_color=ACCENT_ORANGE,
-        opacity=0.9,
-        annotation_text="disappoint cutoff",
-        annotation_position="top left",
-    )
+    fig.add_hline(y=tol, line_dash="dash", line_color=ACCENT_ORANGE, opacity=0.9,
+                 annotation_text="disappoint cutoff", annotation_position="top left")
 
     fig.update_yaxes(range=[y0, y1], tickformat=".1%")
     _style_fig(fig, title="Rolling starts: return distribution")
@@ -868,6 +886,179 @@ PY = sys.executable
 
 st.set_page_config(page_title="Spot Strategy Stress Lab", layout="wide")
 
+# --- Visual Theme Selector (TOP LEVEL) ---
+with st.sidebar:
+    _themes = ["Dark (Classic)", "Light (Clean)"]
+    if "ui.theme" not in st.session_state:
+        st.session_state["ui.theme"] = _themes[0]
+    st.selectbox("Visual Theme", _themes, key="ui.theme")
+    st.divider()
+
+# --- Visual Style Injection (Theme Aware) ---
+_T = get_theme()
+
+# Plotly trace colors (theme-aware) - for low-level graph objects if needed
+_trace_text = _T.text_main
+_trace_bg = _T.card_bg
+_trace_border = _T.card_border
+_trace_muted = _T.text_muted
+
+st.markdown(
+    f"""
+<style>
+    :root {{
+        --ff-bg-main: {_T.bg_main};
+        --ff-bg-side: {_T.bg_side};
+        --ff-text-main: {_T.text_main};
+        --ff-card-bg: {_T.card_bg};
+        --ff-card-border: {_T.card_border};
+
+        /* Foundry Extensions */
+        --ff-bg-alt: {_T.bg_side};
+        --ff-text-muted: {_T.text_muted};
+        --ff-pass-bg: {_T.pass_bg};
+        --ff-pass-text: {_T.pass_color};
+        --ff-fail-bg: {_T.fail_bg};
+        --ff-fail-text: {_T.fail_color};
+        --ff-warn-bg: {_T.warn_bg};
+        --ff-warn-text: {_T.warn_color};
+
+        --ff-grad-econ: linear-gradient(135deg, rgba(0, 200, 83, 0.15), rgba(0, 200, 83, 0.03));
+        --ff-grad-trigger: linear-gradient(135deg, rgba(155, 89, 182, 0.15), rgba(41, 121, 255, 0.04));
+        --ff-grad-gate: linear-gradient(135deg, rgba(41, 121, 255, 0.15), rgba(26, 188, 156, 0.03));
+        --ff-grad-alloc: linear-gradient(135deg, rgba(255, 179, 0, 0.15), rgba(255, 179, 0, 0.03));
+        --ff-grad-risk: linear-gradient(135deg, rgba(255, 82, 82, 0.14), rgba(255, 82, 82, 0.03));
+        
+        /* Force Streamlit Framework Variables */
+        --background-color: {_T.bg_main} !important;
+        --secondary-background-color: {_T.bg_side} !important;
+        --text-color: {_T.text_main} !important;
+        --primary-color: {_T.accent} !important;
+    }}
+
+    /* Global Body Overrides */
+    html, body, [data-testid="stAppViewContainer"], .main {{
+        background-color: var(--ff-bg-main) !important;
+        color: var(--ff-text-main) !important;
+    }}
+    [data-testid="stSidebar"], .sidebar-content {{
+        background-color: var(--ff-bg-side) !important;
+    }}
+    [data-testid="stHeader"] {{
+        background-color: var(--ff-bg-main) !important;
+    }}
+
+    /* Component-specific Text (Scoped to avoid UI breaking) */
+    .stMarkdown p, .stMarkdown span, .stMarkdown label, .stMarkdown div {{
+        color: var(--ff-text-main);
+    }}
+
+    /* Widget specific: dropdowns, buttons, inputs */
+    div[data-baseweb="select"] > div, 
+    div[data-baseweb="base-input"],
+    input, textarea,
+    button[kind="secondary"] {{
+        background-color: var(--ff-bg-side) !important;
+        color: var(--ff-text-main) !important;
+        border: 1px solid var(--ff-card-border) !important;
+    }}
+
+    /* Portals (The dropdown lists) - FIXED: Use Theme popover_bg */
+    div[data-baseweb="popover"], ul[data-baseweb="menu"] {{
+        background-color: {_T.popover_bg} !important;
+        border: 1px solid var(--ff-card-border) !important;
+    }}
+    li[data-baseweb="option"] {{
+        background-color: transparent !important;
+        color: var(--ff-text-main) !important;
+    }}
+    li[data-baseweb="option"]:hover {{
+        background-color: var(--ff-card-bg) !important;
+    }}
+
+    /* Expander Headers - FIXED: Explicitly target and color */
+    [data-testid="stExpander"] summary {{
+        background-color: {_T.expander_bg} !important;
+        border-radius: 4px;
+        color: var(--ff-text-main) !important;
+    }}
+    [data-testid="stExpander"] summary:hover {{
+        background-color: var(--ff-card-bg) !important;
+    }}
+    [data-testid="stExpander"] summary p {{
+        color: var(--ff-text-main) !important;
+    }}
+    [data-testid="stExpander"] summary svg {{
+        fill: var(--ff-text-main) !important;
+    }}
+
+    /* 4. FOUNDRY COMPONENT CLASSES */
+    .js-plotly-plot .legendtitletext {{ display: none !important; }}
+    .js-plotly-plot .legendtitle {{ display: none !important; }}
+
+    .ff-summary-strip {{ display:flex; flex-wrap:wrap; gap:10px; align-items:flex-end; margin: 6px 0 6px 0; }}
+    .ff-summary-stat {{ border:1px solid var(--ff-card-border); border-radius:12px; padding:8px 10px; background: var(--ff-card-bg); min-width: 140px; }}
+    .ff-summary-stat .label {{ font-size:0.74rem; color: var(--ff-text-muted); margin-bottom:2px; }}
+    .ff-summary-stat .value {{ font-size:1.05rem; font-weight:650; color: var(--ff-text-main); line-height:1.05; }}
+    .ff-summary-chip {{ display:inline-block; padding:4px 10px; border-radius:999px; border:1px solid var(--ff-card-border); font-size:0.82rem; background: var(--ff-bg-alt); white-space:nowrap; color: var(--ff-text-main); }}
+
+    .ff-badge {{ display:inline-flex; align-items:center; gap:8px; padding:4px 10px; border-radius:999px; border:1px solid var(--ff-card-border); background: var(--ff-bg-alt); font-size:0.80rem; font-weight:650; white-space:nowrap; color: var(--ff-text-main); }}
+    .ff-badge.pass {{ background: var(--ff-pass-bg); color: var(--ff-pass-text) !important; }}
+    .ff-badge.fail {{ background: var(--ff-fail-bg); color: var(--ff-fail-text) !important; }}
+    .ff-badge.warn {{ background: var(--ff-warn-bg); color: var(--ff-warn-text) !important; }}
+
+    .ff-kpi {{ flex: 1 1 180px; border:1px solid var(--ff-card-border); border-radius:14px; padding:8px 10px; background: var(--ff-card-bg); color: var(--ff-text-main); }}
+    .ff-kpi .label {{ font-size:0.74rem; opacity:0.70; margin-bottom:2px; color: var(--ff-text-muted); }}
+    .ff-kpi .value {{ font-size:1.05rem; font-weight:650; line-height:1.05; }}
+
+    .ff-score {{ flex: 1 1 260px; border:1px solid var(--ff-card-border); border-radius:14px; padding:8px 10px; background: var(--ff-card-bg); color: var(--ff-text-main); }}
+    .ff-step {{ display:flex; gap:10px; align-items:flex-start; border:1px solid var(--ff-card-border); border-radius:14px; padding:10px 10px; background: var(--ff-card-bg); color: var(--ff-text-main); }}
+
+    .ff-skill-card {{ border:1px solid var(--ff-card-border); border-radius:18px; padding:10px 12px; background: var(--ff-card-bg); box-shadow: 0 1px 10px rgba(0,0,0,0.10); min-height: 86px; color: var(--ff-text-main); }}
+    .ff-skill-econ {{ background: var(--ff-grad-econ) !important; }}
+    .ff-skill-trigger {{ background: var(--ff-grad-trigger) !important; }}
+    .ff-skill-gate {{ background: var(--ff-grad-gate) !important; }}
+    .ff-skill-alloc {{ background: var(--ff-grad-alloc) !important; }}
+    .ff-skill-risk {{ background: var(--ff-grad-risk) !important; }}
+
+    .ff-gate-tree-wrap {{ border:1px solid var(--ff-card-border); border-radius:14px; padding:10px 12px; background: var(--ff-card-bg); margin-top: 8px; color: var(--ff-text-main); }}
+    .ff-gate-box {{ border:1px solid var(--ff-card-border); border-radius:14px; padding:10px; background: var(--ff-bg-alt); color: var(--ff-text-main); }}
+    .ff-gate-box.regime {{ background: var(--ff-grad-econ); }}
+    .ff-gate-box.triggers {{ background: var(--ff-grad-trigger); }}
+    .ff-gate-box.result {{ background: var(--ff-grad-gate); }}
+
+    /* Build Sheet Modules */
+    .ff-module {{
+        border: 1px solid var(--ff-card-border);
+        border-radius: 12px;
+        padding: 12px;
+        margin-bottom: 12px;
+        background: var(--ff-card-bg);
+    }}
+    .ff-module.active {{
+        border-color: var(--primary-color);
+        box-shadow: 0 0 0 1px var(--primary-color);
+    }}
+    .ff-module-econ {{ border-left: 4px solid #00C853; }}
+    .ff-module-trigger {{ border-left: 4px solid #9C27B0; }}
+    .ff-module-gate {{ border-left: 4px solid #2979FF; }}
+    .ff-module-alloc {{ border-left: 4px solid #FFAB00; }}
+    .ff-module-risk {{ border-left: 4px solid #FF5252; }}
+
+    .ff-build-summary {{
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin-top: 10px;
+        padding: 8px;
+        background: var(--ff-bg-alt);
+        border-radius: 8px;
+    }}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
 # One-shot toast messages (set before rerun)
 try:
     _t = st.session_state.pop("ui.post_toast", None)
@@ -876,176 +1067,129 @@ try:
 except Exception:
     pass
 
-st.markdown(
-    """
-<style>
-/* Hide Plotly legend titles to avoid JS showing 'undefined' */
-.js-plotly-plot .legendtitletext { display: none !important; }
-.js-plotly-plot .legendtitle { display: none !important; }
-
-
-/* Summary strip (slider → summary strip → charts) */
-.ff-summary-strip { display:flex; flex-wrap:wrap; gap:10px; align-items:flex-end; margin: 6px 0 6px 0; }
-.ff-summary-stat { border:1px solid rgba(49,51,63,0.18); border-radius:12px; padding:8px 10px; background: rgba(255,255,255,0.60); min-width: 140px; }
-.ff-summary-stat .label { font-size:0.74rem; color: rgba(49,51,63,0.70); margin-bottom:2px; }
-.ff-summary-stat .value { font-size:1.05rem; font-weight:650; color: rgba(17,24,39,0.92); line-height:1.05; }
-.ff-summary-stat.big .value { font-size:1.35rem; }
-.ff-summary-chip { display:inline-block; padding:4px 10px; border-radius:999px; border:1px solid rgba(49,51,63,0.18);
-                   font-size:0.82rem; background: rgba(149,165,166,0.10); white-space:nowrap; }
-
-/* ===== Founder's Foundry polish kit (dossier + build sheet) ===== */
-.ff-badge-stack { display:flex; flex-direction:row; gap:8px; flex-wrap:wrap; justify-content:flex-end; align-items:center; }
-.ff-badge { display:inline-flex; align-items:center; gap:8px; padding:4px 10px; border-radius:999px;
-            border:1px solid rgba(49,51,63,0.18); background: rgba(149,165,166,0.10);
-            font-size:0.80rem; font-weight:650; white-space:nowrap; }
-.ff-badge.big { padding:6px 12px; font-size:0.95rem; }
-.ff-badge.pass { background: rgba(46, 204, 113, 0.16); }
-.ff-badge.fail { background: rgba(231, 76, 60, 0.16); }
-.ff-badge.warn { background: rgba(241, 196, 15, 0.18); }
-.ff-badge.neutral { background: rgba(149,165,166,0.10); }
-.ff-badge .k { opacity:0.75; font-weight:650; }
-
-.ff-chip-row { display:flex; flex-wrap:wrap; gap:8px; margin-top:6px; }
-.ff-chip { display:inline-block; padding:4px 10px; border-radius:999px; border:1px solid rgba(49,51,63,0.18);
-           font-size:0.82rem; background: rgba(149,165,166,0.10); white-space:nowrap; }
-
-.ff-kpi-strip { display:flex; flex-wrap:wrap; gap:10px; margin-top:10px; }
-.ff-kpi { flex: 1 1 180px; border:1px solid rgba(49,51,63,0.14); border-radius:14px; padding:8px 10px; background: rgba(255,255,255,0.55); }
-.ff-kpi .label { font-size:0.74rem; opacity:0.70; margin-bottom:2px; }
-.ff-kpi .value { font-size:1.05rem; font-weight:650; line-height:1.05; }
-.ff-kpi.big .value { font-size:1.35rem; }
-
-.ff-score-strip { display:flex; flex-wrap:wrap; gap:10px; margin: 8px 0 6px 0; }
-.ff-score { flex: 1 1 260px; border:1px solid rgba(49,51,63,0.14); border-radius:14px; padding:8px 10px; background: rgba(255,255,255,0.55); }
-.ff-score .top { display:flex; justify-content:space-between; gap:10px; align-items:baseline; }
-.ff-score .top .label { font-size:0.74rem; opacity:0.70; }
-.ff-score .top .value { font-size:0.90rem; font-weight:650; }
-.ff-bar { height:6px; border-radius:999px; background: rgba(49,51,63,0.10); overflow:hidden; margin-top:6px; }
-.ff-bar > div { height:100%; width: var(--pct, 0%); background: rgba(52, 152, 219, 0.70); }
-
-.ff-idrow { display:flex; align-items:center; gap:10px; margin-top:6px; }
-.ff-idrow code { padding:4px 8px; border-radius:10px; border:1px solid rgba(49,51,63,0.18); background: rgba(149,165,166,0.10); font-size:0.85rem; }
-.ff-idrow button { border-radius:10px; border:1px solid rgba(49,51,63,0.18); background: rgba(255,255,255,0.60);
-                  padding:4px 10px; font-size:0.82rem; cursor:pointer; }
-
-.ff-kv { display:flex; flex-direction:column; gap:8px; }
-.ff-kv-row { display:flex; gap:10px; align-items:baseline; }
-.ff-kv-row .k { min-width: 140px; font-weight:650; }
-.ff-kv-row .v { flex:1; }
-
-.ff-readouts { display:flex; flex-direction:column; gap:10px; }
-.ff-readout .label { font-size:0.78rem; opacity:0.72; }
-.ff-readout .value { font-size:0.95rem; font-weight:650; margin-top:1px; }
-
-.ff-grid2 { display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin-top:6px; }
-.ff-mini { border:1px solid rgba(49,51,63,0.14); border-radius:14px; padding:8px 10px; background: rgba(255,255,255,0.55); }
-.ff-mini .label { font-size:0.74rem; opacity:0.70; }
-.ff-mini .value { font-size:1.15rem; font-weight:750; margin-top:2px; }
-
-.ff-callout { border:1px solid rgba(49,51,63,0.14); border-radius:14px; padding:10px 12px; background: rgba(241,196,15,0.12); margin-top:10px; }
-.ff-callout .label { font-size:0.78rem; opacity:0.72; margin-bottom:2px; }
-.ff-callout .value { font-weight:750; }
-
-/* Workflow (build sheet) */
-.ff-workflow { display:flex; flex-direction:column; gap:10px; margin-top:6px; }
-.ff-workflow-grid { display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin-top:6px; }
-@media (max-width: 900px) { .ff-workflow-grid { grid-template-columns: 1fr; } }
-.ff-step { display:flex; gap:10px; align-items:flex-start; border:1px solid rgba(49,51,63,0.14);
-          border-radius:14px; padding:10px 10px; background: rgba(255,255,255,0.55); }
-
-.ff-step { display:flex; gap:10px; align-items:flex-start; border:1px solid rgba(49,51,63,0.14);
-          border-radius:14px; padding:10px 10px; background: rgba(255,255,255,0.55); }
-.ff-step .n { width:26px; height:26px; border-radius:999px; display:flex; align-items:center; justify-content:center;
-             font-weight:800; font-size:0.85rem; background: rgba(52,152,219,0.18); color: rgba(17,24,39,0.90); margin-top:2px; flex: 0 0 auto; }
-.ff-step .t { font-weight:800; }
-.ff-step .d { font-size:0.90rem; color: rgba(49,51,63,0.82); margin-top:2px; line-height:1.25; }
-.ff-step .meta { margin-top:4px; }
-
-
-/* ===== Skill Build UI (game-style) ===== */
-.ff-skill-row { display:flex; flex-wrap:wrap; gap:12px; align-items:stretch; margin: 8px 0 6px 0; }
-.ff-skill-card { border:1px solid rgba(49,51,63,0.18); border-radius:18px; padding:10px 12px;
-                 background: rgba(255,255,255,0.55); box-shadow: 0 1px 10px rgba(0,0,0,0.04);
-                 min-height: 86px; }
-.ff-skill-card .t { font-weight:800; font-size:0.95rem; line-height:1.05; }
-.ff-skill-card .s { font-size:0.80rem; opacity:0.78; margin-top:6px; line-height:1.2; }
-.ff-skill-card .k { font-size:0.74rem; opacity:0.70; margin-top:2px; }
-.ff-skill-card.off { opacity:0.55; }
-.ff-skill-card.active { border-color: rgba(52,152,219,0.85); box-shadow: 0 0 0 3px rgba(52,152,219,0.18); }
-.ff-skill-card.warn { border-color: rgba(241,196,15,0.85); box-shadow: 0 0 0 3px rgba(241,196,15,0.16); }
-
-.ff-skill-econ { background: linear-gradient(135deg, rgba(46,204,113,0.20), rgba(46,204,113,0.04)); }
-.ff-skill-trigger { background: linear-gradient(135deg, rgba(155,89,182,0.20), rgba(52,152,219,0.06)); }
-.ff-skill-gate { background: linear-gradient(135deg, rgba(52,152,219,0.20), rgba(26,188,156,0.05)); }
-.ff-skill-alloc { background: linear-gradient(135deg, rgba(241,196,15,0.22), rgba(241,196,15,0.05)); }
-.ff-skill-risk { background: linear-gradient(135deg, rgba(231,76,60,0.18), rgba(231,76,60,0.04)); }
-
-.ff-build-summary { margin-top: 6px; margin-bottom: 6px; }
-.ff-build-summary code { font-size: 0.85rem; }
-
-.ff-flow { border:1px solid rgba(49,51,63,0.12); border-radius:18px; padding:10px 12px; background: rgba(255,255,255,0.52); }
-.ff-flow .hdr { display:flex; justify-content:space-between; align-items:flex-end; gap:10px; flex-wrap:wrap; }
-.ff-flow .hdr .title { font-weight:850; }
-.ff-flow .hdr .sub { font-size:0.80rem; opacity:0.78; }
-.ff-flow-steps { margin-top: 10px; display:flex; flex-direction:column; gap:10px; }
-.ff-flow-step { display:flex; gap:10px; align-items:flex-start; }
-.ff-flow-dot { width:10px; height:10px; border-radius:50%; margin-top:6px; flex:0 0 auto; background: rgba(49,51,63,0.45); }
-.ff-flow-node { flex:1 1 auto; padding:8px 10px; border-radius:16px; border:1px solid rgba(49,51,63,0.16);
-               background: rgba(255,255,255,0.55); }
-.ff-flow-node .t { font-weight:800; }
-.ff-flow-node .d { font-size:0.86rem; opacity:0.80; margin-top:2px; line-height:1.25; }
-
-.ff-module { border:1px solid rgba(49,51,63,0.14); border-radius:18px; padding:10px 12px; background: rgba(255,255,255,0.44); margin-bottom:12px; }
-.ff-module.active { border-color: rgba(52,152,219,0.70); box-shadow: 0 0 0 3px rgba(52,152,219,0.12); }
-.ff-module .mod-hdr { display:flex; justify-content:space-between; align-items:flex-end; gap:10px; flex-wrap:wrap; }
-.ff-module .mod-hdr .left { font-weight:850; }
-.ff-module .mod-hdr .right { font-weight:750; }
-.ff-mini { font-size:0.80rem; opacity:0.78; }
-
-
-
-/* ===== Gate logic tree (visual) ===== */
-.ff-gate-tree-wrap { border:1px solid rgba(49,51,63,0.14); border-radius:14px; padding:10px 12px; background: rgba(255,255,255,0.55); margin-top: 8px; }
-.ff-gate-meta { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:10px; }
-.ff-gate-meta .ff-gate-chip { display:inline-flex; align-items:center; gap:6px; padding:4px 10px; border-radius:999px; border:1px solid rgba(49,51,63,0.18);
-                              font-size:0.82rem; background: rgba(149,165,166,0.10); white-space:nowrap; }
-.ff-gate-chip.on { background: rgba(46, 204, 113, 0.18); }
-.ff-gate-chip.off { background: rgba(231, 76, 60, 0.14); }
-.ff-gate-chip.info { background: rgba(52, 152, 219, 0.14); }
-.ff-gate-chip.warn { background: rgba(241, 196, 15, 0.18); }
-
-.ff-gate-tree { display:flex; gap:10px; flex-wrap:wrap; align-items:flex-start; }
-.ff-gate-join { display:flex; align-items:center; justify-content:center; font-weight:850; opacity:0.55; padding:0 4px; align-self:flex-start; margin-top:22px; }
-.ff-gate-box { flex: 1 1 260px; min-width: 240px; border:1px solid rgba(49,51,63,0.14); border-radius:14px; padding:10px; background: rgba(149,165,166,0.08); }
-.ff-gate-box .hdr { display:flex; justify-content:space-between; gap:10px; align-items:baseline; margin-bottom:6px; }
-.ff-gate-box .hdr .t { font-weight:800; }
-.ff-gate-box .hdr .k { font-size:0.82rem; opacity:0.70; }
-.ff-gate-box .sub { font-size:0.82rem; opacity:0.75; margin-bottom:8px; }
-.ff-gate-conds { display:flex; flex-wrap:wrap; gap:6px; }
-.ff-gate-cond { display:inline-block; padding:3px 8px; border-radius:999px; border:1px solid rgba(49,51,63,0.16);
-                font-size:0.78rem; background: rgba(255,255,255,0.55); }
-.ff-gate-cond.dim { opacity:0.72; }
-
-.ff-gate-box.regime { background: rgba(46, 204, 113, 0.10); flex: 0 0 320px; }
-.ff-gate-box.triggers { background: rgba(155, 89, 182, 0.10); flex: 1 1 520px; }
-.ff-gate-box.result { background: rgba(52, 152, 219, 0.10); flex: 0 0 320px; }
-
-
-.ff-gate-box.result.on { background: rgba(46, 204, 113, 0.14); }
-.ff-gate-box.result.off { background: rgba(231, 76, 60, 0.12); }
-
-.ff-clause-grid { display:flex; flex-direction:column; gap:8px; }
-.ff-clause { border:1px dashed rgba(49,51,63,0.22); border-radius:12px; padding:8px; background: rgba(255,255,255,0.45); }
-.ff-clause.on { border-color: rgba(46, 204, 113, 0.70); box-shadow: 0 0 0 2px rgba(46, 204, 113, 0.14) inset; }
-.ff-clause .ct { font-weight:800; font-size:0.82rem; margin-bottom:6px; display:flex; justify-content:space-between; gap:10px; }
-.ff-clause .ct .mode { font-size:0.78rem; opacity:0.70; font-weight:650; }
-.ff-gate-foot { font-size:0.80rem; opacity:0.74; margin-top:8px; }
-</style>
-""",
-    unsafe_allow_html=True,
-)
 st.title("Spot Strategy Stress Lab")
 st.caption("Spot-only. Batch → Rolling Starts → Walkforward → Grand verdict.")
+
+# Remove redundant constants
+
+RANK_COLORS = { "INFO": ACCENT_BLUE, "WARN": WARN_COLOR, "FAIL": FAIL_COLOR, "UNMEASURED": NEUTRAL_COLOR }
+VERDICT_COLORS = { "PASS": PASS_COLOR, "WARN": WARN_COLOR, "FAIL": FAIL_COLOR, "UNMEASURED": NEUTRAL_COLOR }
+
+def _verdict_color(v: str) -> str:
+    return VERDICT_COLORS.get(str(v or "").upper(), NEUTRAL_COLOR)
+
+def _verdict_symbol(v: str) -> str:
+    vv = str(v or "").upper()
+    if vv == "PASS": return "circle"
+    if vv == "WARN": return "triangle-up"
+    if vv in {"FAIL", "UNMEASURED"}: return "x"
+    return "diamond"
+
+def _style_fig(fig, title: str | None = None):
+    """Standardize Plotly figures using current theme."""
+    if fig is None: return fig
+    layout = _T.get_plotly_layout()
+    fig.update_layout(
+        **layout,
+        margin=dict(l=60, r=24, t=90 if title else 60, b=56),
+        title=dict(text=f"<b>{title}</b>" if title else None, x=0, xanchor="left", font=dict(size=15))
+    )
+    return fig
+
+# Visual system helpers (moved up or made safer)
+def _hex_rgba(hex_color: str, alpha: float) -> str:
+    try:
+        h = (hex_color or "").lstrip("#")
+        if len(h) != 6: return f"rgba(128,128,128,{alpha})"
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        return f"rgba({r},{g},{b},{alpha})"
+    except Exception: return f"rgba(128,128,128,{alpha})"
+
+def _pct_rank(arr: np.ndarray, x: float) -> float:
+    try:
+        if arr is None: return float("nan")
+        a = np.asarray(arr, dtype=float)
+        a = a[np.isfinite(a)]
+        if a.size == 0 or x is None or not math.isfinite(float(x)): return float("nan")
+        return float(np.mean(a <= float(x)) * 100.0)
+    except Exception: return float("nan")
+
+def _stability_zone_label(pct: float) -> str:
+    if not math.isfinite(float(pct)): return ""
+    if pct >= 90.0: return "Elite"
+    if pct >= 80.0: return "Strong"
+    if pct >= 50.0: return "Typical"
+    return "Below typical"
+
+def _stability_percentile_bar_fig(you_pct: float, *, selected_pct: float | None = None, show_selected: bool = False, cutoff_pct: float | None = None) -> "go.Figure | None":
+    if go is None: return None
+    try:
+        typical_bg = _hex_rgba(_T.text_main, 0.12)
+        fig = go.Figure()
+        fig.add_shape(type="rect", x0=0, x1=80, y0=0, y1=1, line_width=0, fillcolor=typical_bg)
+        fig.add_shape(type="rect", x0=80, x1=90, y0=0, y1=1, line_width=0, fillcolor="rgba(41,121,255,0.10)")
+        fig.add_shape(type="rect", x0=90, x1=100, y0=0, y1=1, line_width=0, fillcolor="rgba(41,121,255,0.18)")
+        fig.add_annotation(x=40, y=0.5, text="Typical", showarrow=False, font=dict(size=12, color=_T.text_main))
+        fig.add_annotation(x=85, y=0.5, text="Strong", showarrow=False, font=dict(size=12, color=ACCENT_BLUE))
+        fig.add_annotation(x=95, y=0.5, text="Elite", showarrow=False, font=dict(size=12, color=ACCENT_BLUE))
+        def _add_marker(pct: float, label: str, color: str, symbol: str, width: int = 3):
+            if pct is None or not math.isfinite(float(pct)): return
+            x = float(min(max(float(pct), 0.0), 100.0))
+            fig.add_shape(type="line", x0=x, x1=x, y0=0, y1=1, line=dict(color=color, width=width))
+            fig.add_trace(go.Scatter(x=[x], y=[0.5], mode="markers", marker=dict(size=12, symbol=symbol, color=color, line=dict(width=2, color="white")), hovertemplate=f"{label}: P{float(pct):.0f}<extra></extra>", showlegend=False))
+            fig.add_annotation(x=x, y=1.12, yref="paper", text=f"{label} (P{float(pct):.0f})", showarrow=False, font=dict(size=12, color=color))
+        _add_marker(you_pct, "You", _T.text_main, "star", 4)
+        if cutoff_pct is not None: _add_marker(cutoff_pct, "Cutoff", WARN_COLOR, "x", 2)
+        if show_selected and selected_pct is not None: _add_marker(selected_pct, "Selected", ACCENT_ORANGE, "diamond", 3)
+        fig.update_xaxes(range=[0, 100], tickvals=[0, 50, 80, 90, 100], showgrid=False, zeroline=False)
+        fig.update_yaxes(visible=False, showgrid=False, zeroline=False)
+        fig.update_layout(height=140, margin=dict(l=20, r=20, t=50, b=10), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+        return fig
+    except Exception: return None
+
+def _dist_boxstrip_fig(a, b, c, d, e, title: str | None = None, *, digits: int = 1, zero_line: bool = False, zero_ref: bool = True):
+    if go is None: return None
+    tc, mc, sc = _T.text_main, _T.text_muted, _hex_rgba(_T.text_main, 0.35)
+    ls, lm = _hex_rgba(_T.text_main, 0.45), _hex_rgba(_T.text_main, 0.60)
+    if zero_line: bf, be, medc = _hex_rgba(PASS_COLOR if c >= 0 else FAIL_COLOR, 0.14), _hex_rgba(PASS_COLOR if c >= 0 else FAIL_COLOR, 0.32), _hex_rgba(PASS_COLOR if c >= 0 else FAIL_COLOR, 0.75)
+    else: bf, be, medc = _hex_rgba(_T.text_main, 0.12), _hex_rgba(_T.text_main, 0.35), _hex_rgba(_T.text_main, 0.70)
+    xmin, xmax = float(min(a, 0.0) if zero_ref else a), float(e)
+    if abs(xmax - xmin) < 1e-9: xmin, xmax = xmin - 0.5, xmax + 0.5
+    fig = go.Figure()
+    fig.add_shape(type="line", x0=a, x1=e, y0=0, y1=0, line=dict(width=2, color=ls))
+    for x in (a, e): fig.add_shape(type="line", x0=x, x1=x, y0=-0.12, y1=0.12, line=dict(width=2, color=ls))
+    fig.add_shape(type="rect", x0=b, x1=d, y0=-0.11, y1=0.11, line=dict(width=1.2, color=be), fillcolor=bf)
+    fig.add_shape(type="line", x0=c, x1=c, y0=-0.16, y1=0.16, line=dict(width=2.2, color=medc))
+    fig.add_trace(go.Scatter(x=[a, c, e], y=[0, 0, 0], mode="markers", marker=dict(size=7, color=lm), hovertemplate="Bad: %{customdata[0]}<br>Typical: %{customdata[1]}<br>Good: %{customdata[2]}<extra></extra>", customdata=[[_fmt_pct(a, digits), _fmt_pct(c, digits), _fmt_pct(e, digits)]]*3, showlegend=False))
+    bc, gc = (_hex_rgba(FAIL_COLOR, 0.80) if zero_line else mc), (_hex_rgba(PASS_COLOR, 0.80) if zero_line else mc)
+    fig.add_annotation(x=a, y=0.22, text="Bad", showarrow=False, font=dict(size=10, color=bc))
+    fig.add_annotation(x=e, y=0.22, text="Good", showarrow=False, font=dict(size=10, color=gc))
+    fig.add_annotation(x=c, y=0.32, text="Typical", showarrow=False, font=dict(size=10, color=mc))
+    if zero_ref: fig.add_annotation(x=0, y=0.32, text="0%", showarrow=False, font=dict(size=9, color=sc))
+    fig.update_layout(height=95, margin=dict(l=6, r=6, t=30, b=8), title=dict(text=title, x=0, font=dict(size=12, color=tc)), xaxis=dict(visible=False, range=[xmin, xmax]), yaxis=dict(visible=False, range=[-0.45, 0.45]), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+    return fig
+
+def _rs_add_bands(fig, tol: float):
+    if fig is None: return 0.0, 1.0
+    typical_bg = _hex_rgba(_T.text_main, 0.12)
+    fig.add_shape(type="rect", xref="paper", x0=0, x1=1, yref="y", y0=tol, y1=tol+0.05, fillcolor=typical_bg, line_width=0, layer="below")
+    fig.add_annotation(xref="paper", x=0.02, y=tol+0.025, text="Near miss", showarrow=False, font=dict(size=11, color=_T.text_main), xanchor="left")
+    return tol-0.1, tol+0.5 # dummy range
+
+def _rs_violin_fig(vals: pd.Series, tol: float):
+    if go is None: return None
+    qc = _hex_rgba(_T.text_main, 0.45)
+    fig = go.Figure()
+    fig.add_trace(go.Violin(y=vals, name="Returns", box_visible=True, meanline_visible=True, fillcolor="rgba(41,121,255,0.18)", line_color=ACCENT_BLUE))
+    if not vals.empty:
+        for p, d in zip(vals.quantile([0.1, 0.5, 0.9]), ["dot", "solid", "dot"]): fig.add_hline(y=float(p), line_dash=d, line_color=qc, opacity=0.5)
+    _style_fig(fig, title="Rolling starts: return distribution")
+    return fig
+
+def _fmt_pct(v, digits=1):
+    if v is None or not math.isfinite(float(v)): return "N/A"
+    return f"{float(v):.{digits}f}%"
+
 
 # =============================================================================
 # Small utilities
@@ -8235,10 +8379,10 @@ def build_dca_baseline_params() -> Dict[str, Any]:
                                                     strip_bits = _downsample_bool_bits(arr_list, max_dots=120)
                                                     strip_html = _gate_strip_html(strip_bits)
                                                     col.markdown(
-                                                        f"<div style='border:1px solid rgba(49,51,63,0.10); border-radius:12px; padding:10px 10px 8px 10px; background:rgba(255,255,255,0.45);'>"
-                                                        f"<div style='font-weight:650; font-size:0.86rem; margin-bottom:6px;'>{nm}</div>"
+                                                        f"<div style='border:1px solid var(--ff-card-border); border-radius:12px; padding:10px 10px 8px 10px; background:var(--ff-card-bg);'>"
+                                                        f"<div style='font-weight:650; font-size:0.86rem; margin-bottom:6px; color: var(--ff-text-main);'>{nm}</div>"
                                                         f"{strip_html}"
-                                                        f"<div style='font-size:0.78rem; opacity:0.72; margin-top:6px;'>{tn}/{nn} bars true ({pct:.1f}%)</div>"
+                                                        f"<div style='font-size:0.78rem; opacity:0.72; margin-top:6px; color: var(--ff-text-muted);'>{tn}/{nn} bars true ({pct:.1f}%)</div>"
                                                         f"</div>",
                                                         unsafe_allow_html=True,
                                                     )
@@ -11934,8 +12078,8 @@ if stage_pick == "batch":
                             marker=dict(
                                 size=18,
                                 symbol="star",
-                                color="rgba(17,24,39,0.95)",
-                                line=dict(width=2, color="rgba(255,255,255,0.95)"),
+                                color=_trace_text,
+                                line=dict(width=2, color=_trace_bg),
                             ),
                             hovertemplate="Your strategy (baseline)<br>config={}<br>dd={:.4f}<br>profit={:.2f}<extra></extra>".format(
                                 str(_bid), float(bx), float(by)
@@ -12919,8 +13063,8 @@ if stage_pick == "rs":
                             marker=dict(
                                 size=18,
                                 symbol="star",
-                                color="rgba(17,24,39,0.95)",
-                                line=dict(width=2, color="rgba(255,255,255,0.95)"),
+                                color=_trace_text,
+                                line=dict(width=2, color=_trace_bg),
                             ),
                             opacity=0.7 if filtered_out else 1.0,
                             hovertemplate=(
@@ -15584,7 +15728,7 @@ if stage_pick == "grand":
                                             x=_x_you,
                                             line_width=4,
                                             line_dash="solid",
-                                            line_color="#111827",
+                                            line_color=_trace_text,
                                         )
                                         fig_den.add_annotation(
                                             x=_x_you, xref="x",
@@ -15593,9 +15737,9 @@ if stage_pick == "grand":
                                             showarrow=False,
                                             xanchor="center",
                                             yanchor="bottom",
-                                            font=dict(size=11, color="rgba(255,255,255,0.98)"),
-                                            bgcolor="rgba(17,24,39,0.92)",
-                                            bordercolor="rgba(255,255,255,0.95)",
+                                            font=dict(size=11, color=_trace_text),
+                                            bgcolor=_trace_bg,
+                                            bordercolor=_trace_border,
                                             borderwidth=1,
                                             borderpad=4,
                                         )
@@ -15604,7 +15748,7 @@ if stage_pick == "grand":
                                             float(baseline_marker_x),
                                             "You" if not baseline_offscale else "You (off)",
                                             "solid",
-                                            "#111827",
+                                            _trace_text,
                                             "You",
                                             y_annot=1.20,
                                         )
@@ -17852,8 +17996,14 @@ if stage_pick == "grand":
                                                     show_when_ready=True,
 
                                                 )
-                                        fig_ev.update_layout(height=430, margin=dict(l=10, r=10, t=10, b=10), xaxis_title="Date", yaxis_title="Price",
-                                                            legend=dict(orientation="h", yanchor="bottom", y=1.10, xanchor="left", x=0, font=dict(size=12)))
+                                        _style_fig(fig_ev, title="Price + event timeline")
+                                        fig_ev.update_layout(
+                                            height=430, 
+                                            margin=dict(l=10, r=10, t=50, b=10),
+                                            xaxis_title="Date", 
+                                            yaxis_title="Price",
+                                            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, font=dict(size=12))
+                                        )
                                         _plotly(fig_ev, key=f"batch_ev_timeline_{pick}")
                                     else:
                                         st.info("Plotly is not available; cannot render event timeline chart.")
